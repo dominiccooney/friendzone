@@ -72,6 +72,41 @@ The request appears under the `reviewer` container in the UI and request log.
 The UI kill button rejects subsequent requests from that container until
 resumed.
 
+## GitHub policy
+
+GitHub reads (GET/HEAD/OPTIONS and `git-upload-pack`) flow through the
+proxy; writes are blocked with a note until the pending-request inbox
+exists. Other origins are logged and unpoliced.
+
+## MCP forwarding (read tools)
+
+Create `mcp-forwards.json` in the broker data directory:
+
+```json
+[
+  {
+    "name": "linear",
+    "url": "https://mcp.linear.app/mcp",
+    "bearer_env": "FZ_LINEAR_TOKEN",
+    "tools": ["list_issues", "get_issue", "list_comments"]
+  }
+]
+```
+
+Set the named env var to a bearer token (for Linear: an API key or OAuth
+token; the read-only endpoint `https://mcp.linear.app/mcp/readonly` is a
+good fit). Containers connect a streamable-HTTP MCP client to
+`http://HOST_IP:8082/mcp/linear`. Only `tools/list` (filtered to the
+allowlist) and allowlisted `tools/call` reach upstream; the token never
+enters the container.
+
+## Inference via the broker
+
+Set `FZ_ANTHROPIC_API_KEY` and/or `FZ_OPENAI_API_KEY` on the host. The
+proxy substitutes the real key into requests to `api.anthropic.com` /
+`api.openai.com`, so containers can run inference holding only a fake
+key. The substitution is pinned to those hosts.
+
 ## Current scope
 
 This slice does not yet validate proxy passwords or require new-container
