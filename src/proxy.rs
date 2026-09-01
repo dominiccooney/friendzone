@@ -71,7 +71,7 @@ impl HttpHandler for EventHandler {
     }
 }
 
-fn basic_username(value: &str) -> Option<String> {
+pub fn basic_username(value: &str) -> Option<String> {
     let encoded = value.strip_prefix("Basic ")?;
     let decoded = STANDARD.decode(encoded).ok()?;
     let value = String::from_utf8(decoded).ok()?;

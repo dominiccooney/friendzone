@@ -21,13 +21,18 @@ struct UiState {
 struct BootstrapState {
     cert: Arc<String>,
     binary: Arc<Vec<u8>>,
+    mcp: crate::mcp::McpState,
 }
 
 pub async fn serve_ui(addr: SocketAddr, state: AppState) -> Result<()> {
     serve(addr, ui_router(UiState { app: state }), "web UI").await
 }
 
-pub async fn serve_bootstrap(addr: SocketAddr, cert_pem: String) -> Result<()> {
+pub async fn serve_bootstrap(
+    addr: SocketAddr,
+    cert_pem: String,
+    mcp: crate::mcp::McpState,
+) -> Result<()> {
     let executable = std::env::current_exe().context("locate fz executable")?;
     let binary = tokio::fs::read(&executable)
         .await
@@ -37,6 +42,7 @@ pub async fn serve_bootstrap(addr: SocketAddr, cert_pem: String) -> Result<()> {
         bootstrap_router(BootstrapState {
             cert: Arc::new(cert_pem),
             binary: Arc::new(binary),
+            mcp,
         }),
         "bootstrap server",
     )
@@ -68,8 +74,31 @@ fn bootstrap_router(state: BootstrapState) -> Router {
     Router::new()
         .route("/bootstrap/ca.pem", get(certificate))
         .route("/bootstrap/fz", get(binary))
+        .route("/mcp/{name}", post(mcp_message))
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
+}
+
+/// Container-facing MCP endpoint (streamable HTTP, JSON responses).
+/// Identity comes from the same Basic credentials as the proxy.
+async fn mcp_message(
+    State(state): State<BootstrapState>,
+    Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(message): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let container = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::proxy::basic_username)
+        .unwrap_or_else(|| "unidentified".to_owned());
+    let response = crate::mcp::handle_message(&state.mcp, &name, &container, message).await;
+    if response.is_null() {
+        // Notification: no JSON-RPC response body.
+        StatusCode::ACCEPTED.into_response()
+    } else {
+        Json(response).into_response()
+    }
 }
 
 async fn index() -> Html<&'static str> {
@@ -150,6 +179,7 @@ mod tests {
         bootstrap_router(BootstrapState {
             cert: Arc::new("CERTIFICATE".into()),
             binary: Arc::new(vec![1, 2, 3]),
+            mcp: crate::mcp::McpState::new(crate::state::AppState::default(), Vec::new()),
         })
     }
 
