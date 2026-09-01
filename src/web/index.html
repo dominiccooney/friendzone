@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Friendzone</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="shield">◇</span> Friendzone</div>
+    <div class="broker-status"><span class="status-dot live"></span> Broker running</div>
+    <nav><button class="nav active" data-view="inbox">Inbox <kbd id="inbox-count">0</kbd></button><button class="nav" data-view="log">Log</button></nav>
+  </header>
+  <main>
+    <section id="inbox-view" class="view active">
+      <div class="page-heading"><div><h1>Inbox</h1><p>Containers are ordered by priority. Drag a section to reorder it.</p></div><button class="quiet" id="refresh">Refresh</button></div>
+      <div id="containers" class="containers"></div>
+    </section>
+    <section id="log-view" class="view">
+      <div class="page-heading"><div><h1>Request log</h1><p>Recent requests intercepted by the proxy.</p></div><div class="live"><span class="pulse"></span> Live</div></div>
+      <div class="filters"><input id="search" type="search" placeholder="Search method, URL, or container"><select id="container-filter"><option value="">All containers</option></select><select id="verdict-filter"><option value="">All verdicts</option><option>allowed</option><option>failed</option></select></div>
+      <div class="log-table"><div class="log-head"><span>Time</span><span>Container</span><span>Request</span><span>Verdict</span></div><div id="requests"></div></div>
+    </section>
+  </main>
+  <template id="empty-template"><div class="empty"><div class="empty-icon">✓</div><h2>Inbox zero</h2><p>Waiting requests will appear under their container.</p></div></template>
+  <script src="/app.js"></script>
+</body>
+</html>
