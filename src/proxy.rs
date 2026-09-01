@@ -36,11 +36,13 @@ impl HttpHandler for EventHandler {
         // Proxy credentials identify a container and must never reach the upstream host.
         req.headers_mut().remove(PROXY_AUTHORIZATION);
         let killed = self.state.is_killed(&container);
+        let decision = crate::policy::classify(&req);
+        let blocked = killed || decision == crate::policy::Decision::BlockWrite;
         self.state.record(
             container,
             req.method().to_string(),
             req.uri().to_string(),
-            if killed {
+            if blocked {
                 Verdict::Blocked
             } else {
                 Verdict::Allowed
@@ -50,6 +52,13 @@ impl HttpHandler for EventHandler {
             Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body(Body::from("container is killed"))
+                .expect("static blocked response")
+                .into()
+        } else if blocked {
+            let note = crate::policy::note(decision).unwrap_or("friendzone: blocked");
+            Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::from(note))
                 .expect("static blocked response")
                 .into()
         } else {

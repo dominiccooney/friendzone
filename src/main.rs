@@ -1,5 +1,6 @@
 mod ca;
 mod doctor;
+mod policy;
 mod proxy;
 mod proxy_server;
 mod setup;
