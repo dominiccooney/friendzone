@@ -102,10 +102,13 @@ enters the container.
 
 ## Inference via the broker
 
-Set `FZ_ANTHROPIC_API_KEY` and/or `FZ_OPENAI_API_KEY` on the host. The
-proxy substitutes the real key into requests to `api.anthropic.com` /
-`api.openai.com`, so containers can run inference holding only a fake
-key. The substitution is pinned to those hosts.
+Set `FZ_ANTHROPIC_API_KEY`, `FZ_OPENAI_API_KEY`, and/or
+`FZ_CLINE_API_KEY` on the host. The proxy substitutes the real key into
+requests to `api.anthropic.com` / `api.openai.com` / `api.cline.bot`,
+so containers can run inference holding only a fake key. The
+substitution replaces exactly the credential header and is pinned per
+host; all other headers (e.g. `anthropic-beta` feature flags,
+`anthropic-version`, `X-Task-ID`) pass through untouched.
 
 ## Current scope
 

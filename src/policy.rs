@@ -71,6 +71,14 @@ pub const INFERENCE_ROUTES: &[InferenceRoute] = &[
         prefix: "Bearer ",
         env: "FZ_OPENAI_API_KEY",
     },
+    // Cline: OpenAI-compatible, Bearer auth (cline/cline
+    // src/api/providers/cline.ts).
+    InferenceRoute {
+        host: "api.cline.bot",
+        header: "authorization",
+        prefix: "Bearer ",
+        env: "FZ_CLINE_API_KEY",
+    },
 ];
 
 pub fn inference_route(host: &str) -> Option<&'static InferenceRoute> {

@@ -131,6 +131,28 @@ mod tests {
     }
 
     #[test]
+    fn substitution_touches_only_the_credential_header() {
+        // Feature headers like Anthropic's beta flags must pass through:
+        // substitution replaces exactly one header, nothing else.
+        unsafe { std::env::set_var("FZ_CLINE_API_KEY", "cline-real") };
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("https://api.cline.bot/v1/chat/completions")
+            .header("authorization", "Bearer fake")
+            .header("anthropic-beta", "computer-use-2025-01-24")
+            .header("anthropic-version", "2023-06-01")
+            .header("x-task-id", "task-123")
+            .body(Body::empty())
+            .unwrap();
+        substitute_inference_key(&mut req);
+        assert_eq!(req.headers()["authorization"], "Bearer cline-real");
+        assert_eq!(req.headers()["anthropic-beta"], "computer-use-2025-01-24");
+        assert_eq!(req.headers()["anthropic-version"], "2023-06-01");
+        assert_eq!(req.headers()["x-task-id"], "task-123");
+        unsafe { std::env::remove_var("FZ_CLINE_API_KEY") };
+    }
+
+    #[test]
     fn proxy_identity_exposes_only_username() {
         assert_eq!(
             basic_username("Basic cmV2aWV3ZXI6c2VjcmV0"),
