@@ -1,9 +1,13 @@
 # Friendzone
 
-This first slice provides the `fz` binary, a local HTTPS-intercepting proxy,
-certificate bootstrap, request log, and web UI.
+The `fz` binary provides a local HTTPS-intercepting proxy with GitHub
+read/write policy, credential escrow with exact-fake substitution, MCP
+forwarding with host-side OAuth, certificate bootstrap, request log,
+and a web UI with settings.
 
 ## Run the broker
+
+One broker serves any number of containers:
 
 ```powershell
 cargo run -- broker --proxy-addr HOST_VNIC_IP:8080 --ui-addr 127.0.0.1:8081 --bootstrap-addr HOST_VNIC_IP:8082
@@ -12,6 +16,17 @@ cargo run -- broker --proxy-addr HOST_VNIC_IP:8080 --ui-addr 127.0.0.1:8081 --bo
 Open <http://127.0.0.1:8081>. The CA certificate and private key are created
 under the operating system's local application-data directory in
 `friendzone/`. The private key is never served by the bootstrap endpoint.
+
+## Containers
+
+Containers are dynamic; the launch command never names them. A container
+is identified by the username in its proxy credentials, and appears in
+the UI the moment it first connects. You can also add one ahead of time
+(Inbox → "Add container") so its section exists before the VM boots, and
+remove one after tearing down its VM (its log rows remain for audit).
+Kill/Resume stops a container's traffic reversibly; Remove forgets it.
+Give every container a distinct username — it is the unit of identity,
+logging, and the kill switch.
 
 ## Set up a guest
 
@@ -123,8 +138,18 @@ through untouched.
 
 ## Current scope
 
-This slice does not yet validate proxy passwords or require new-container
-acknowledgement, enforce rulesets, substitute credentials, retain logs on disk,
-parse GitHub semantics, forward MCP servers, provision Hyper-V/tart
-networking, or terminate connections already in progress when the kill
-switch is pressed.
+Working now: multi-container identity with dynamic add/remove and a
+reversible kill switch; GitHub read/write policy (reads flow, writes
+block with a note); credential escrow with exact-fake-match,
+host-pinned substitution and leak blocking; MCP forwarding of
+streamable-HTTP servers with tool allowlists and host-side OAuth
+(discovery, dynamic client registration, PKCE); guest bootstrap of the
+CA, `fz` binary, and fake credentials.
+
+Not yet: proxy password validation (the username is trusted labeling,
+not authentication), new-container acknowledgement gating, the
+pending-request inbox (GitHub writes 403 instead of queueing),
+rulesets, on-disk log retention, OS-secret-store credentials, OAuth
+token refresh, stdio MCP servers, Hyper-V/tart network provisioning
+(egress default-deny is the VM network's job), and terminating
+connections already in progress when the kill switch is pressed.

@@ -41,11 +41,34 @@ pub struct StateView {
     pub requests: Vec<RequestEvent>,
 }
 
+#[derive(Clone, Debug)]
+struct ContainerRecord {
+    created: DateTime<Utc>,
+    last_activity: DateTime<Utc>,
+}
+
 #[derive(Default)]
 struct StateData {
     requests: Vec<RequestEvent>,
     killed: HashSet<String>,
+    /// First-class container registry: containers appear on first
+    /// traffic or explicit add, and exist independently of the request
+    /// log's retention.
+    containers: HashMap<String, ContainerRecord>,
     connection_identities: HashMap<SocketAddr, (String, Instant)>,
+}
+
+impl StateData {
+    fn touch_container(&mut self, name: &str) {
+        let now = Utc::now();
+        self.containers
+            .entry(name.to_owned())
+            .and_modify(|record| record.last_activity = now)
+            .or_insert(ContainerRecord {
+                created: now,
+                last_activity: now,
+            });
+    }
 }
 
 #[derive(Clone, Default)]
@@ -54,6 +77,7 @@ pub struct AppState(Arc<RwLock<StateData>>);
 impl AppState {
     pub fn record(&self, container: String, method: String, url: String, verdict: Verdict) {
         let mut state = self.0.write().expect("state lock poisoned");
+        state.touch_container(&container);
         state.requests.push(RequestEvent {
             id: Uuid::new_v4(),
             at: Utc::now(),
@@ -74,6 +98,7 @@ impl AppState {
     ) -> String {
         let mut state = self.0.write().expect("state lock poisoned");
         if let Some(username) = presented_username {
+            state.touch_container(&username);
             state
                 .connection_identities
                 .insert(peer, (username.clone(), Instant::now()));
@@ -90,6 +115,24 @@ impl AppState {
                 .map(|(username, _)| username.clone())
                 .unwrap_or_else(|| peer.ip().to_string())
         }
+    }
+
+    /// Registers a container before any traffic, e.g. from the UI.
+    pub fn add_container(&self, name: &str) {
+        let mut state = self.0.write().expect("state lock poisoned");
+        state.touch_container(name);
+    }
+
+    /// Removes a container: registry entry, kill flag, and connection
+    /// identities go; log rows stay for audit. If it reconnects it is a
+    /// new container (and will re-appear live — kill first to stop it).
+    pub fn remove_container(&self, name: &str) {
+        let mut state = self.0.write().expect("state lock poisoned");
+        state.containers.remove(name);
+        state.killed.remove(name);
+        state
+            .connection_identities
+            .retain(|_, (identity, _)| identity != name);
     }
 
     pub fn is_killed(&self, container: &str) -> bool {
@@ -111,22 +154,23 @@ impl AppState {
 
     pub fn view(&self) -> StateView {
         let state = self.0.read().expect("state lock poisoned");
-        let mut grouped: HashMap<&str, Vec<&RequestEvent>> = HashMap::new();
+        let mut request_counts: HashMap<&str, usize> = HashMap::new();
         for event in &state.requests {
-            grouped.entry(&event.container).or_default().push(event);
+            *request_counts.entry(event.container.as_str()).or_default() += 1;
         }
-        let mut containers: Vec<_> = grouped
-            .into_iter()
-            .map(|(id, events)| ContainerView {
-                id: id.to_owned(),
-                name: id.to_owned(),
+        let mut containers: Vec<_> = state
+            .containers
+            .iter()
+            .map(|(id, record)| ContainerView {
+                id: id.clone(),
+                name: id.clone(),
                 state: if state.killed.contains(id) {
                     "killed"
                 } else {
                     "working"
                 },
-                last_activity: events.last().expect("nonempty group").at,
-                request_count: events.len(),
+                last_activity: record.last_activity,
+                request_count: request_counts.get(id.as_str()).copied().unwrap_or(0),
             })
             .collect();
         containers.sort_by_key(|container| std::cmp::Reverse(container.last_activity));
@@ -140,6 +184,25 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn containers_add_and_remove_dynamically() {
+        let state = AppState::default();
+        // Appear via explicit add and via traffic, independently.
+        state.add_container("reviewer");
+        state.record("triager".into(), "GET".into(), "https://x/".into(), Verdict::Allowed);
+        let view = state.view();
+        let names: Vec<&str> = view.containers.iter().map(|c| c.id.as_str()).collect();
+        assert!(names.contains(&"reviewer") && names.contains(&"triager"));
+        // Removal drops the container and clears its kill flag, but
+        // keeps its log rows for audit.
+        state.set_killed("triager".into(), true);
+        state.remove_container("triager");
+        let view = state.view();
+        assert!(!view.containers.iter().any(|c| c.id == "triager"));
+        assert!(view.requests.iter().any(|r| r.container == "triager"));
+        assert!(!state.is_killed("triager"));
+    }
 
     #[test]
     fn kill_state_is_reversible() {

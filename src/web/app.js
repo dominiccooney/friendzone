@@ -19,8 +19,13 @@ function renderContainers() {
     const killed = c.state === "killed";
     const section = document.createElement("section");
     section.className = "container"; section.draggable = true; section.dataset.id = c.id;
-    section.innerHTML = `<div class="container-head"><span class="status-dot ${killed?"":"live"}" style="${killed?"background:#999":""}"></span><div><div class="container-name">${esc(c.name)}</div><div class="meta">${c.request_count} requests · last traffic ${displayTime(c.last_activity)}</div></div><div class="actions"><span class="state ${killed?"killed":"working"}">${killed?"killed":"working"}</span><button class="stop ${killed?"resume":""}">${killed?"Resume":"Kill"}</button></div></div><div class="container-body">No decisions waiting</div>`;
+    section.innerHTML = `<div class="container-head"><span class="status-dot ${killed?"":"live"}" style="${killed?"background:#999":""}"></span><div><div class="container-name">${esc(c.name)}</div><div class="meta">${c.request_count} requests · last traffic ${displayTime(c.last_activity)}</div></div><div class="actions"><span class="state ${killed?"killed":"working"}">${killed?"killed":"working"}</span><button class="stop ${killed?"resume":""}">${killed?"Resume":"Kill"}</button><button class="quiet remove">Remove</button></div></div><div class="container-body">No decisions waiting</div>`;
     section.querySelector(".stop").onclick = () => setKilled(c.id, !killed).catch(console.error);
+    section.querySelector(".remove").onclick = async () => {
+      if (!confirm(`Remove container '${c.name}'? Kill it first if it is still running.`)) return;
+      await fetch(`/api/containers/${encodeURIComponent(c.id)}`, {method:"DELETE"});
+      refresh();
+    };
     section.addEventListener("dragstart", () => section.classList.add("dragging"));
     section.addEventListener("dragend", () => { section.classList.remove("dragging"); order=[...root.querySelectorAll(".container")].map(n=>n.dataset.id);localStorage.setItem("fz-order",JSON.stringify(order)); });
     root.append(section);
@@ -59,6 +64,13 @@ async function renderSettings() {
     setTimeout(renderSettings, 3000);
   });
 }
+
+$("#add-container").onsubmit = async (e) => {
+  e.preventDefault();
+  const r = await fetch("/api/containers",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name:$("#new-container-name").value})});
+  if (!r.ok) { alert(await r.text()); return; }
+  e.target.reset(); refresh();
+};
 
 $("#escrow-form").onsubmit = async (e) => {
   e.preventDefault();

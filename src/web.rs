@@ -88,6 +88,11 @@ fn ui_router(state: UiState) -> Router {
         .route("/app.css", get(css))
         .route("/app.js", get(js))
         .route("/api/state", get(api_state))
+        .route("/api/containers", post(add_container))
+        .route(
+            "/api/containers/{id}",
+            axum::routing::delete(remove_container),
+        )
         .route("/api/containers/{id}/kill", post(set_killed))
         .route("/api/escrow", get(list_escrow).post(add_escrow))
         .route("/api/escrow/{name}/secret", post(set_escrow_secret))
@@ -289,6 +294,39 @@ async fn js() -> impl IntoResponse {
 
 async fn api_state(State(state): State<UiState>) -> Json<StateView> {
     Json(state.app.view())
+}
+
+#[derive(Deserialize)]
+struct AddContainerRequest {
+    name: String,
+}
+
+/// Registers a container ahead of traffic so its proxy credentials and
+/// section exist before the VM boots.
+async fn add_container(
+    State(state): State<UiState>,
+    Json(request): Json<AddContainerRequest>,
+) -> impl IntoResponse {
+    let name = request.name.trim().to_owned();
+    if name.is_empty() || name.contains(':') || name.contains('@') {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "container names must be nonempty and contain no ':' or '@' (they become proxy usernames)",
+        )
+            .into_response();
+    }
+    state.app.add_container(&name);
+    StatusCode::CREATED.into_response()
+}
+
+/// Unregisters a container. Log rows remain for audit; a reconnecting
+/// guest re-appears as a new container.
+async fn remove_container(
+    State(state): State<UiState>,
+    Path(id): Path<String>,
+) -> StatusCode {
+    state.app.remove_container(&id);
+    StatusCode::NO_CONTENT
 }
 
 #[derive(Deserialize)]
