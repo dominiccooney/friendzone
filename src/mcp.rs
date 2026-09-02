@@ -24,6 +24,9 @@ pub struct ForwardConfig {
     pub url: String,
     /// Host env var holding the bearer token (API key or OAuth token).
     pub bearer_env: String,
+    /// OAuth scope to request, e.g. "read" for Linear read-only.
+    #[serde(default)]
+    pub scope: Option<String>,
     /// Tool allowlist; list-filtering and call-checking share it.
     pub tools: Vec<String>,
 }
@@ -74,14 +77,26 @@ impl Forward {
         }
     }
 
-    /// OAuth-stored token first (secret `mcp:{name}`), env fallback.
-    fn bearer(&self) -> Result<String> {
+    /// Bearer resolution: OAuth session (refreshed just-in-time when
+    /// near expiry) first, plain stored secret next, env var last.
+    async fn bearer(&self) -> Result<String> {
+        if let Some(record) = crate::oauth::TokenRecord::load(&self.settings, &self.config.name) {
+            if record.expires_soon() && record.refresh_token.is_some() {
+                match crate::oauth::refresh(&self.settings, &self.config.name).await {
+                    Ok(token) => return Ok(token),
+                    Err(error) => {
+                        tracing::warn!(%error, forward = %self.config.name, "token refresh failed");
+                    }
+                }
+            }
+            return Ok(record.access_token);
+        }
         if let Some(token) = self.settings.secret(&format!("mcp:{}", self.config.name)) {
             return Ok(token);
         }
         std::env::var(&self.config.bearer_env).with_context(|| {
             format!(
-                "MCP forward '{}': no stored token and env var {} not set (connect it in settings)",
+                "MCP forward '{}': no OAuth session, stored token, or env var {} (connect it in settings)",
                 self.config.name, self.config.bearer_env
             )
         })
@@ -115,7 +130,7 @@ impl Forward {
         let response = self
             .client
             .post(&self.config.url)
-            .bearer_auth(self.bearer()?)
+            .bearer_auth(self.bearer().await?)
             .header("Accept", "application/json, text/event-stream")
             .json(&init)
             .send()
@@ -145,12 +160,31 @@ impl Forward {
         message: Value,
         session_id: Option<&str>,
     ) -> Result<reqwest::Response> {
+        let response = self
+            .post_once(&message, session_id, self.bearer().await?)
+            .await?;
+        // Expired-token 401: refresh once and retry, so agents never
+        // see a reauth seam.
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && let Ok(token) = crate::oauth::refresh(&self.settings, &self.config.name).await
+        {
+            return self.post_once(&message, session_id, token).await;
+        }
+        Ok(response)
+    }
+
+    async fn post_once(
+        &self,
+        message: &Value,
+        session_id: Option<&str>,
+        bearer: String,
+    ) -> Result<reqwest::Response> {
         let mut request = self
             .client
             .post(&self.config.url)
-            .bearer_auth(self.bearer()?)
+            .bearer_auth(bearer)
             .header("Accept", "application/json, text/event-stream")
-            .json(&message);
+            .json(message);
         if let Some(id) = session_id.filter(|id| !id.is_empty()) {
             request = request.header("Mcp-Session-Id", id);
         }
@@ -322,6 +356,7 @@ mod tests {
                 name: "linear".into(),
                 url: "https://mcp.example.test/mcp".into(),
                 bearer_env: "FZ_TEST_UNSET".into(),
+                scope: None,
                 tools: vec!["list_issues".into(), "get_issue".into()],
             },
             settings,

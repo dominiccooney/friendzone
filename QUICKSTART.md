@@ -37,7 +37,8 @@ Open <http://127.0.0.1:8081>.
   broker generates the fake automatically.
 - **Settings → MCP forwards → Connect (OAuth)** — if you configured
   `mcp-forwards.json` (see below), click Connect; log in when the
-  browser opens. Done — the token stays on the host.
+  browser opens. Done — the session stays on the host and auto-refreshes
+  near expiry. Reauthorize/Disconnect from the same row.
 
 Optional, before starting: MCP forwards live in
 `%LOCALAPPDATA%\friendzone\mcp-forwards.json` (Windows) or
@@ -49,6 +50,7 @@ Optional, before starting: MCP forwards live in
     "name": "linear",
     "url": "https://mcp.linear.app/mcp",
     "bearer_env": "FZ_LINEAR_TOKEN",
+    "scope": "read",
     "tools": ["list_issues", "get_issue", "list_comments"]
   }
 ]

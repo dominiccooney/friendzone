@@ -48,12 +48,23 @@ async function renderSettings() {
     fetch("/api/guest-env").then(r=>r.text()),
   ]);
   $("#escrow-list").innerHTML = escrow.entries.map(e=>`<div class="log-row"><span>${esc(e.name)}</span><span>${esc(e.hosts.join(", "))}</span><span class="request">${esc(e.header)} · fake <code>${esc(e.fake)}</code></span><span>${e.connected?'<span class="verdict allowed">connected</span>':`<button class="quiet" data-secret="${esc(e.name)}">Set key…</button>`}</span></div>`).join("") || '<div class="log-row">No escrow entries yet.</div>';
-  $("#mcp-list").innerHTML = mcp.forwards.map(f=>`<div class="log-row"><span>${esc(f.name)}</span><span class="request">${esc(f.url)} · ${f.tools.length} tools</span><span>${f.connected?'<span class="verdict allowed">connected</span>':`<button class="quiet" data-oauth="${esc(f.name)}">Connect (OAuth)…</button>`}</span></div>`).join("") || '<div class="log-row">No MCP forwards configured (mcp-forwards.json).</div>';
+  $("#mcp-list").innerHTML = mcp.forwards.map(f=>{
+    const expiry = f.expires_at ? ` · expires ${new Date(f.expires_at*1000).toLocaleString()}${f.refreshable?" (auto-refresh)":""}` : "";
+    const status = f.auth==="oauth" ? `<span class="verdict allowed">OAuth</span>${esc(expiry)} <button class="quiet" data-oauth="${esc(f.name)}">Reauthorize…</button> <button class="quiet" data-oauth-disconnect="${esc(f.name)}">Disconnect</button>`
+      : f.auth==="stored-key" || f.auth==="env-key" ? `<span class="verdict allowed">${esc(f.auth)}</span> <button class="quiet" data-oauth="${esc(f.name)}">Switch to OAuth…</button>`
+      : `<button class="quiet" data-oauth="${esc(f.name)}">Connect (OAuth)…</button>`;
+    return `<div class="log-row"><span>${esc(f.name)}</span><span class="request">${esc(f.url)} · ${f.tools.length} tools${f.scope?` · scope ${esc(f.scope)}`:""}</span><span>${status}</span></div>`;
+  }).join("") || '<div class="log-row">No MCP forwards configured (mcp-forwards.json).</div>';
   $("#guest-env").textContent = env;
   document.querySelectorAll("[data-secret]").forEach(b=>b.onclick=async()=>{
     const value = prompt(`Real value for '${b.dataset.secret}' (stored on host only):`);
     if (!value) return;
     await fetch(`/api/escrow/${encodeURIComponent(b.dataset.secret)}/secret`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({value})});
+    renderSettings();
+  });
+  document.querySelectorAll("[data-oauth-disconnect]").forEach(b=>b.onclick=async()=>{
+    if (!confirm(`Disconnect OAuth for '${b.dataset.oauthDisconnect}'?`)) return;
+    await fetch(`/api/mcp/${encodeURIComponent(b.dataset.oauthDisconnect)}/oauth`,{method:"DELETE"});
     renderSettings();
   });
   document.querySelectorAll("[data-oauth]").forEach(b=>b.onclick=async()=>{

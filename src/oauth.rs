@@ -18,6 +18,89 @@ use uuid::Uuid;
 
 use crate::settings::Settings;
 
+/// A stored OAuth session for one MCP forward: everything needed to
+/// authenticate and to refresh without user involvement. Persisted as
+/// JSON in secret `mcp-oauth:{forward}`.
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+pub struct TokenRecord {
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// Unix seconds; None = server did not state a lifetime.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    pub token_endpoint: String,
+    pub client_id: String,
+}
+
+impl TokenRecord {
+    pub fn secret_name(forward: &str) -> String {
+        format!("mcp-oauth:{forward}")
+    }
+
+    pub fn load(settings: &Settings, forward: &str) -> Option<Self> {
+        settings
+            .secret(&Self::secret_name(forward))
+            .and_then(|text| serde_json::from_str(&text).ok())
+    }
+
+    pub fn store(&self, settings: &Settings, forward: &str) -> Result<()> {
+        settings.set_secret(&Self::secret_name(forward), &serde_json::to_string(self)?)
+    }
+
+    /// True within 60 seconds of expiry: refresh early, never race.
+    pub fn expires_soon(&self) -> bool {
+        self.expires_at
+            .is_some_and(|at| at - 60 <= chrono::Utc::now().timestamp())
+    }
+}
+
+/// Exchanges the stored refresh token for a new access token, persists
+/// the rotated record, and returns the fresh access token.
+pub async fn refresh(settings: &Settings, forward: &str) -> Result<String> {
+    let record = TokenRecord::load(settings, forward).context("no OAuth session to refresh")?;
+    let refresh_token = record
+        .refresh_token
+        .clone()
+        .context("server issued no refresh token; reconnect in settings")?;
+    let response = reqwest::Client::new()
+        .post(&record.token_endpoint)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &refresh_token),
+            ("client_id", &record.client_id),
+        ])
+        .send()
+        .await
+        .context("token refresh request")?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.context("parse refresh response")?;
+    if !status.is_success() {
+        anyhow::bail!("refresh failed {status}: {body} (reconnect in settings)");
+    }
+    let access_token = body
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .context("no access_token in refresh response")?
+        .to_owned();
+    let rotated = TokenRecord {
+        access_token: access_token.clone(),
+        // Servers may rotate the refresh token; keep the old one if not.
+        refresh_token: body
+            .get("refresh_token")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or(Some(refresh_token)),
+        expires_at: body
+            .get("expires_in")
+            .and_then(serde_json::Value::as_i64)
+            .map(|seconds| chrono::Utc::now().timestamp() + seconds),
+        ..record
+    };
+    rotated.store(settings, forward)?;
+    Ok(access_token)
+}
+
 /// One login attempt awaiting its callback, keyed by `state`.
 struct PendingLogin {
     forward_name: String,
@@ -50,6 +133,7 @@ impl OauthFlows {
         forward_name: &str,
         server_url: &str,
         redirect_uri: &str,
+        scope: Option<&str>,
     ) -> Result<String> {
         let origin = origin_of(server_url)?;
         let discovery = discover(&origin).await?;
@@ -62,7 +146,7 @@ impl OauthFlows {
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
         let state = random_urlsafe();
 
-        let authorize_url = format!(
+        let mut authorize_url = format!(
             "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
             discovery.authorization_endpoint,
             urlencode(&client_id),
@@ -70,6 +154,9 @@ impl OauthFlows {
             urlencode(&state),
             urlencode(&challenge),
         );
+        if let Some(scope) = scope.filter(|s| !s.is_empty()) {
+            authorize_url.push_str(&format!("&scope={}", urlencode(scope)));
+        }
 
         self.0.lock().expect("oauth lock").insert(
             state,
@@ -110,13 +197,32 @@ impl OauthFlows {
         if !status.is_success() {
             anyhow::bail!("token endpoint returned {status}: {body}");
         }
-        let token = body
+        let access_token = body
             .get("access_token")
             .and_then(serde_json::Value::as_str)
-            .context("no access_token in response")?;
-        settings.set_secret(&format!("mcp:{}", login.forward_name), token)?;
+            .context("no access_token in response")?
+            .to_owned();
+        let record = TokenRecord {
+            access_token,
+            refresh_token: body
+                .get("refresh_token")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            expires_at: body
+                .get("expires_in")
+                .and_then(serde_json::Value::as_i64)
+                .map(|seconds| chrono::Utc::now().timestamp() + seconds),
+            token_endpoint: login.token_endpoint,
+            client_id: login.client_id,
+        };
+        record.store(settings, &login.forward_name)?;
         Ok(login.forward_name)
     }
+}
+
+/// Forgets a stored OAuth session.
+pub fn disconnect(settings: &Settings, forward: &str) -> Result<()> {
+    settings.remove_secret(&TokenRecord::secret_name(forward))
 }
 
 fn origin_of(url: &str) -> Result<String> {
@@ -198,5 +304,43 @@ mod tests {
     fn urlencode_reserved() {
         assert_eq!(urlencode("http://a/b?c=d"), "http%3A%2F%2Fa%2Fb%3Fc%3Dd");
         assert_eq!(urlencode("safe-._~123"), "safe-._~123");
+    }
+
+    #[test]
+    fn token_record_round_trips_and_disconnects() {
+        let dir = std::env::temp_dir().join(format!("fz-oauth-{}", Uuid::new_v4()));
+        let settings = Settings::load(&dir).unwrap();
+        let record = TokenRecord {
+            access_token: "at-1".into(),
+            refresh_token: Some("rt-1".into()),
+            expires_at: Some(chrono::Utc::now().timestamp() + 3600),
+            token_endpoint: "https://auth.example/token".into(),
+            client_id: "client-1".into(),
+        };
+        record.store(&settings, "linear").unwrap();
+        let loaded = TokenRecord::load(&settings, "linear").unwrap();
+        assert_eq!(loaded.access_token, "at-1");
+        assert_eq!(loaded.refresh_token.as_deref(), Some("rt-1"));
+        assert!(!loaded.expires_soon());
+        disconnect(&settings, "linear").unwrap();
+        assert!(TokenRecord::load(&settings, "linear").is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn near_expiry_counts_as_expiring() {
+        let record = TokenRecord {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: Some(chrono::Utc::now().timestamp() + 30),
+            token_endpoint: String::new(),
+            client_id: String::new(),
+        };
+        assert!(record.expires_soon(), "within the 60s early-refresh window");
+        let no_expiry = TokenRecord {
+            expires_at: None,
+            ..record
+        };
+        assert!(!no_expiry.expires_soon(), "no stated lifetime never expires");
     }
 }

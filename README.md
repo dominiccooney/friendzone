@@ -113,9 +113,14 @@ Create `mcp-forwards.json` in the broker data directory:
 
 Then authorize it in the UI: Settings → MCP forwards → "Connect
 (OAuth)". The broker discovers the server's OAuth endpoints, registers
-itself, opens your browser to log in, and stores the token on the host —
-no pasting secrets. Alternatively set the `bearer_env` variable to an
-API key. Containers connect a streamable-HTTP MCP client to
+itself, opens your browser to log in, and stores the session on the
+host — no pasting secrets. Sessions carry the refresh token: the broker
+refreshes near expiry and retries once on an upstream 401, so agents
+never see a reauth seam. The settings page shows the session's expiry
+and offers Reauthorize and Disconnect. An optional `"scope"` field on
+the forward requests a narrower grant (e.g. `"read"` for Linear
+read-only). Alternatively set the `bearer_env` variable to an API key.
+Containers connect a streamable-HTTP MCP client to
 `http://HOST_IP:8082/mcp/linear`. Only `tools/list` (filtered to the
 allowlist) and allowlisted `tools/call` reach upstream; the token never
 enters the container.
@@ -152,7 +157,7 @@ CA, `fz` binary, and fake credentials.
 Not yet: proxy password validation (the username is trusted labeling,
 not authentication), new-container acknowledgement gating, the
 pending-request inbox (GitHub writes 403 instead of queueing),
-rulesets, on-disk log retention, OS-secret-store credentials, OAuth
-token refresh, stdio MCP servers, Hyper-V/tart network provisioning
+rulesets, on-disk log retention, OS-secret-store credentials,
+stdio MCP servers, Hyper-V/tart network provisioning
 (egress default-deny is the VM network's job), and terminating
 connections already in progress when the kill switch is pressed.

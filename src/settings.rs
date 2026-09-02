@@ -88,6 +88,12 @@ impl Settings {
         self.0.secrets.read().expect("settings lock").get(name).cloned()
     }
 
+    pub fn remove_secret(&self, name: &str) -> Result<()> {
+        let mut secrets = self.0.secrets.write().expect("settings lock");
+        secrets.remove(name);
+        write_json_private(&self.0.data_dir.join("secrets.json"), &*secrets)
+    }
+
     /// Real value for an entry: secrets store first, then env fallback.
     pub fn real_value(&self, entry: &EscrowEntry) -> Option<String> {
         self.secret(&entry.name)

@@ -99,6 +99,7 @@ fn ui_router(state: UiState) -> Router {
         .route("/api/guest-env", get(guest_env))
         .route("/api/mcp", get(list_forwards))
         .route("/api/mcp/{name}/oauth/start", post(oauth_start))
+        .route("/api/mcp/{name}/oauth", axum::routing::delete(oauth_disconnect))
         .route("/oauth/callback", get(oauth_callback))
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
@@ -161,22 +162,50 @@ async fn guest_env(State(state): State<UiState>) -> impl IntoResponse {
 }
 
 /// MCP forwards with connection state; tokens never leave as values.
+/// `auth` distinguishes OAuth sessions (reauth/disconnect apply) from
+/// static keys (managed outside).
 async fn list_forwards(State(state): State<UiState>) -> Json<serde_json::Value> {
     let forwards: Vec<serde_json::Value> = state
         .forwards
         .iter()
         .map(|f| {
-            let connected = state.settings.secret(&format!("mcp:{}", f.name)).is_some()
-                || std::env::var(&f.bearer_env).is_ok();
+            let session = crate::oauth::TokenRecord::load(&state.settings, &f.name);
+            let (auth, expires_at, refreshable) = match &session {
+                Some(record) => (
+                    "oauth",
+                    record.expires_at,
+                    record.refresh_token.is_some(),
+                ),
+                None if state.settings.secret(&format!("mcp:{}", f.name)).is_some() => {
+                    ("stored-key", None, false)
+                }
+                None if std::env::var(&f.bearer_env).is_ok() => ("env-key", None, false),
+                None => ("none", None, false),
+            };
             serde_json::json!({
                 "name": f.name,
                 "url": f.url,
                 "tools": f.tools,
-                "connected": connected,
+                "scope": f.scope,
+                "connected": auth != "none",
+                "auth": auth,
+                "expires_at": expires_at,
+                "refreshable": refreshable,
             })
         })
         .collect();
     Json(serde_json::json!({ "forwards": forwards }))
+}
+
+/// Forgets the OAuth session for a forward.
+async fn oauth_disconnect(
+    State(state): State<UiState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match crate::oauth::disconnect(&state.settings, &name) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
 }
 
 /// Kicks off host-side OAuth: builds the authorization URL and opens
@@ -187,7 +216,11 @@ async fn oauth_start(State(state): State<UiState>, Path(name): Path<String>) -> 
         return (StatusCode::NOT_FOUND, format!("unknown forward '{name}'")).into_response();
     };
     let redirect_uri = format!("http://{}/oauth/callback", state.ui_addr);
-    match state.oauth.start(&name, &forward.url, &redirect_uri).await {
+    match state
+        .oauth
+        .start(&name, &forward.url, &redirect_uri, forward.scope.as_deref())
+        .await
+    {
         Ok(url) => {
             open_host_browser(&url);
             Json(serde_json::json!({ "authorize_url": url })).into_response()
