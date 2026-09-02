@@ -93,22 +93,33 @@ Create `mcp-forwards.json` in the broker data directory:
 ]
 ```
 
-Set the named env var to a bearer token (for Linear: an API key or OAuth
-token; the read-only endpoint `https://mcp.linear.app/mcp/readonly` is a
-good fit). Containers connect a streamable-HTTP MCP client to
+Then authorize it in the UI: Settings → MCP forwards → "Connect
+(OAuth)". The broker discovers the server's OAuth endpoints, registers
+itself, opens your browser to log in, and stores the token on the host —
+no pasting secrets. Alternatively set the `bearer_env` variable to an
+API key. Containers connect a streamable-HTTP MCP client to
 `http://HOST_IP:8082/mcp/linear`. Only `tools/list` (filtered to the
 allowlist) and allowlisted `tools/call` reach upstream; the token never
 enters the container.
 
-## Inference via the broker
+## Credential escrow (inference and other APIs)
 
-Set `FZ_ANTHROPIC_API_KEY`, `FZ_OPENAI_API_KEY`, and/or
-`FZ_CLINE_API_KEY` on the host. The proxy substitutes the real key into
-requests to `api.anthropic.com` / `api.openai.com` / `api.cline.bot`,
-so containers can run inference holding only a fake key. The
-substitution replaces exactly the credential header and is pinned per
-host; all other headers (e.g. `anthropic-beta` feature flags,
-`anthropic-version`, `X-Task-ID`) pass through untouched.
+In the UI, Settings → Escrowed credentials: add an entry naming the
+pinned hosts, the credential header, and optionally the guest env var.
+The broker generates a fake key; click "Set key…" to store the real
+value (or set `real_env` in `escrow.json` to name a host env var).
+
+`fz setup` fetches the fakes into the guest as
+`friendzone-env.sh`; source it in the agent's shell. Example entry for
+Anthropic: hosts `api.anthropic.com`, header `x-api-key`, guest env
+`ANTHROPIC_API_KEY`. For OpenAI-style APIs (including Cline at
+`api.cline.bot`): header `authorization`, prefix `Bearer `.
+
+Substitution requires an exact fake match on a pinned host: a random
+key passes through untouched, and a fake sent toward any non-pinned
+host is blocked as an attempted leak. Non-credential headers (e.g.
+`anthropic-beta` feature flags, `anthropic-version`, `X-Task-ID`) pass
+through untouched.
 
 ## Current scope
 

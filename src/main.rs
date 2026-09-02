@@ -1,6 +1,7 @@
 mod ca;
 mod doctor;
 mod mcp;
+mod oauth;
 mod policy;
 mod proxy;
 mod proxy_server;
@@ -110,14 +111,14 @@ async fn run_broker(
         );
     }
     let settings = settings::Settings::load(&data_dir)?;
-    let mcp_state = mcp::McpState::new(state.clone(), forwards, settings.clone());
+    let mcp_state = mcp::McpState::new(state.clone(), forwards.clone(), settings.clone());
     println!("Friendzone proxy:     http://{proxy_addr}");
     println!("Friendzone UI:        http://{ui_addr}");
     println!("Friendzone bootstrap: http://{bootstrap_addr}");
 
     tokio::select! {
         result = proxy_server::serve(proxy_addr, state.clone(), issuer, settings.clone()) => result,
-        result = web::serve_ui(ui_addr, state, settings.clone()) => result,
+        result = web::serve_ui(ui_addr, state, settings.clone(), forwards) => result,
         result = web::serve_bootstrap(bootstrap_addr, files.cert_pem, mcp_state, settings) => result,
         signal = tokio::signal::ctrl_c() => signal.context("wait for Ctrl+C"),
     }

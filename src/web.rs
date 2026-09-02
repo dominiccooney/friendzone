@@ -16,6 +16,9 @@ use crate::state::{AppState, StateView};
 struct UiState {
     app: AppState,
     settings: crate::settings::Settings,
+    forwards: Arc<Vec<crate::mcp::ForwardConfig>>,
+    oauth: crate::oauth::OauthFlows,
+    ui_addr: SocketAddr,
 }
 
 #[derive(Clone)]
@@ -30,12 +33,16 @@ pub async fn serve_ui(
     addr: SocketAddr,
     state: AppState,
     settings: crate::settings::Settings,
+    forwards: Vec<crate::mcp::ForwardConfig>,
 ) -> Result<()> {
     serve(
         addr,
         ui_router(UiState {
             app: state,
             settings,
+            forwards: Arc::new(forwards),
+            oauth: crate::oauth::OauthFlows::default(),
+            ui_addr: addr,
         }),
         "web UI",
     )
@@ -85,6 +92,9 @@ fn ui_router(state: UiState) -> Router {
         .route("/api/escrow", get(list_escrow).post(add_escrow))
         .route("/api/escrow/{name}/secret", post(set_escrow_secret))
         .route("/api/guest-env", get(guest_env))
+        .route("/api/mcp", get(list_forwards))
+        .route("/api/mcp/{name}/oauth/start", post(oauth_start))
+        .route("/oauth/callback", get(oauth_callback))
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
 }
@@ -143,6 +153,79 @@ async fn guest_env(State(state): State<UiState>) -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         state.settings.guest_env_lines(),
     )
+}
+
+/// MCP forwards with connection state; tokens never leave as values.
+async fn list_forwards(State(state): State<UiState>) -> Json<serde_json::Value> {
+    let forwards: Vec<serde_json::Value> = state
+        .forwards
+        .iter()
+        .map(|f| {
+            let connected = state.settings.secret(&format!("mcp:{}", f.name)).is_some()
+                || std::env::var(&f.bearer_env).is_ok();
+            serde_json::json!({
+                "name": f.name,
+                "url": f.url,
+                "tools": f.tools,
+                "connected": connected,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "forwards": forwards }))
+}
+
+/// Kicks off host-side OAuth: builds the authorization URL and opens
+/// the host browser. Returns the URL too, in case the browser did not
+/// open.
+async fn oauth_start(State(state): State<UiState>, Path(name): Path<String>) -> impl IntoResponse {
+    let Some(forward) = state.forwards.iter().find(|f| f.name == name) else {
+        return (StatusCode::NOT_FOUND, format!("unknown forward '{name}'")).into_response();
+    };
+    let redirect_uri = format!("http://{}/oauth/callback", state.ui_addr);
+    match state.oauth.start(&name, &forward.url, &redirect_uri).await {
+        Ok(url) => {
+            open_host_browser(&url);
+            Json(serde_json::json!({ "authorize_url": url })).into_response()
+        }
+        Err(error) => (StatusCode::BAD_GATEWAY, format!("{error:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct OauthCallback {
+    state: String,
+    code: String,
+}
+
+async fn oauth_callback(
+    State(state): State<UiState>,
+    axum::extract::Query(query): axum::extract::Query<OauthCallback>,
+) -> impl IntoResponse {
+    match state
+        .oauth
+        .finish(&query.state, &query.code, &state.settings)
+        .await
+    {
+        Ok(name) => Html(format!(
+            "<h1>Connected</h1><p>MCP forward '{name}' is authorized. You can close this tab.</p>"
+        ))
+        .into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+    }
+}
+
+fn open_host_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    if let Err(error) = result {
+        tracing::warn!(%error, "could not open host browser");
+    }
 }
 
 fn bootstrap_router(state: BootstrapState) -> Router {

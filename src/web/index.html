@@ -10,7 +10,7 @@
   <header class="topbar">
     <div class="brand"><span class="shield">◇</span> Friendzone</div>
     <div class="broker-status"><span class="status-dot live"></span> Broker running</div>
-    <nav><button class="nav active" data-view="inbox">Inbox <kbd id="inbox-count">0</kbd></button><button class="nav" data-view="log">Log</button></nav>
+    <nav><button class="nav active" data-view="inbox">Inbox <kbd id="inbox-count">0</kbd></button><button class="nav" data-view="log">Log</button><button class="nav" data-view="settings">Settings</button></nav>
   </header>
   <main>
     <section id="inbox-view" class="view active">
@@ -21,6 +21,24 @@
       <div class="page-heading"><div><h1>Request log</h1><p>Recent requests intercepted by the proxy.</p></div><div class="live"><span class="pulse"></span> Live</div></div>
       <div class="filters"><input id="search" type="search" placeholder="Search method, URL, or container"><select id="container-filter"><option value="">All containers</option></select><select id="verdict-filter"><option value="">All verdicts</option><option>allowed</option><option>failed</option></select></div>
       <div class="log-table"><div class="log-head"><span>Time</span><span>Container</span><span>Request</span><span>Verdict</span></div><div id="requests"></div></div>
+    </section>
+    <section id="settings-view" class="view">
+      <div class="page-heading"><div><h1>Settings</h1><p>Escrowed credentials and MCP forwards. Real values never leave the host.</p></div></div>
+      <h2>Escrowed credentials</h2>
+      <div id="escrow-list" class="log-table"></div>
+      <form id="escrow-form" class="filters">
+        <input id="e-name" placeholder="name (e.g. anthropic)" required>
+        <input id="e-hosts" placeholder="hosts, comma-separated" required>
+        <input id="e-header" placeholder="header (e.g. x-api-key)" required>
+        <input id="e-prefix" placeholder="prefix (e.g. 'Bearer ')">
+        <input id="e-guest" placeholder="guest env var (e.g. ANTHROPIC_API_KEY)">
+        <button type="submit">Add entry</button>
+      </form>
+      <h2>MCP forwards</h2>
+      <div id="mcp-list" class="log-table"></div>
+      <h2>Guest environment</h2>
+      <p>Fake keys for the container; <code>fz setup</code> fetches these automatically.</p>
+      <pre id="guest-env"></pre>
     </section>
   </main>
   <template id="empty-template"><div class="empty"><div class="empty-icon">✓</div><h2>Inbox zero</h2><p>Waiting requests will appear under their container.</p></div></template>
