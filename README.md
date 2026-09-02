@@ -5,6 +5,9 @@ read/write policy, credential escrow with exact-fake substitution, MCP
 forwarding with host-side OAuth, certificate bootstrap, request log,
 and a web UI with settings.
 
+New here? See [QUICKSTART.md](QUICKSTART.md) for the run-this-open-that
+cheat sheet.
+
 ## Run the broker
 
 One broker serves any number of containers:
