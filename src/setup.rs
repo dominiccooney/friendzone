@@ -21,12 +21,35 @@ pub async fn run(broker: &str, output: Option<PathBuf>, install: bool) -> Result
     }
     fs::write(&path, &cert).with_context(|| format!("write {}", path.display()))?;
     println!("Saved Friendzone CA to {}", path.display());
+    fetch_guest_env(broker, &path).await?;
     if install {
         install_ca(&path)?;
     } else {
         println!("Install it in the guest trust store, or rerun with --install.");
     }
     print_runtime_instructions(&path);
+    Ok(())
+}
+
+/// Pulls the fake credentials the broker escrows and saves them next to
+/// the CA as a sourceable env file. Fakes only; reals never leave the
+/// host.
+async fn fetch_guest_env(broker: &str, cert_path: &Path) -> Result<()> {
+    let url = format!("{}/bootstrap/env", broker.trim_end_matches('/'));
+    let env = reqwest::get(&url)
+        .await
+        .with_context(|| format!("fetch {url}"))?
+        .error_for_status()
+        .context("broker rejected env request")?
+        .text()
+        .await?;
+    let env_path = cert_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("friendzone-env.sh");
+    fs::write(&env_path, &env).with_context(|| format!("write {}", env_path.display()))?;
+    println!("Saved fake credentials to {}", env_path.display());
+    println!("Source them in the agent's shell: . {}", env_path.display());
     Ok(())
 }
 

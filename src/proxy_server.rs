@@ -14,6 +14,7 @@ pub async fn serve(
     addr: SocketAddr,
     state: AppState,
     issuer: Issuer<'static, KeyPair>,
+    settings: crate::settings::Settings,
 ) -> Result<()> {
     let ca = RcgenAuthority::new(issuer, 1_000, aws_lc_rs::default_provider());
     tracing::info!(%addr, "proxy listening");
@@ -21,7 +22,7 @@ pub async fn serve(
         .with_addr(addr)
         .with_ca(ca)
         .with_rustls_connector(aws_lc_rs::default_provider())
-        .with_http_handler(EventHandler::new(state))
+        .with_http_handler(EventHandler::new(state, settings))
         .with_graceful_shutdown(pending())
         .build()
         .context("build proxy")?

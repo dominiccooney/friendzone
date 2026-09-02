@@ -15,6 +15,7 @@ use crate::state::{AppState, StateView};
 #[derive(Clone)]
 struct UiState {
     app: AppState,
+    settings: crate::settings::Settings,
 }
 
 #[derive(Clone)]
@@ -22,16 +23,30 @@ struct BootstrapState {
     cert: Arc<String>,
     binary: Arc<Vec<u8>>,
     mcp: crate::mcp::McpState,
+    settings: crate::settings::Settings,
 }
 
-pub async fn serve_ui(addr: SocketAddr, state: AppState) -> Result<()> {
-    serve(addr, ui_router(UiState { app: state }), "web UI").await
+pub async fn serve_ui(
+    addr: SocketAddr,
+    state: AppState,
+    settings: crate::settings::Settings,
+) -> Result<()> {
+    serve(
+        addr,
+        ui_router(UiState {
+            app: state,
+            settings,
+        }),
+        "web UI",
+    )
+    .await
 }
 
 pub async fn serve_bootstrap(
     addr: SocketAddr,
     cert_pem: String,
     mcp: crate::mcp::McpState,
+    settings: crate::settings::Settings,
 ) -> Result<()> {
     let executable = std::env::current_exe().context("locate fz executable")?;
     let binary = tokio::fs::read(&executable)
@@ -43,6 +58,7 @@ pub async fn serve_bootstrap(
             cert: Arc::new(cert_pem),
             binary: Arc::new(binary),
             mcp,
+            settings,
         }),
         "bootstrap server",
     )
@@ -66,17 +82,86 @@ fn ui_router(state: UiState) -> Router {
         .route("/app.js", get(js))
         .route("/api/state", get(api_state))
         .route("/api/containers/{id}/kill", post(set_killed))
+        .route("/api/escrow", get(list_escrow).post(add_escrow))
+        .route("/api/escrow/{name}/secret", post(set_escrow_secret))
+        .route("/api/guest-env", get(guest_env))
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
+}
+
+/// Escrow entries with fakes visible but real values reduced to a
+/// present/absent flag: the UI never receives a secret.
+async fn list_escrow(State(state): State<UiState>) -> Json<serde_json::Value> {
+    let entries: Vec<serde_json::Value> = state
+        .settings
+        .entries()
+        .into_iter()
+        .map(|entry| {
+            let connected = state.settings.real_value(&entry).is_some();
+            serde_json::json!({
+                "name": entry.name,
+                "hosts": entry.hosts,
+                "header": entry.header,
+                "prefix": entry.prefix,
+                "fake": entry.fake,
+                "guest_env": entry.guest_env,
+                "connected": connected,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "entries": entries }))
+}
+
+async fn add_escrow(
+    State(state): State<UiState>,
+    Json(entry): Json<crate::settings::EscrowEntry>,
+) -> impl IntoResponse {
+    match state.settings.add_entry(entry) {
+        Ok(entry) => (StatusCode::CREATED, Json(serde_json::json!(entry))).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SecretRequest {
+    value: String,
+}
+
+async fn set_escrow_secret(
+    State(state): State<UiState>,
+    Path(name): Path<String>,
+    Json(request): Json<SecretRequest>,
+) -> impl IntoResponse {
+    match state.settings.set_secret(&name, &request.value) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn guest_env(State(state): State<UiState>) -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        state.settings.guest_env_lines(),
+    )
 }
 
 fn bootstrap_router(state: BootstrapState) -> Router {
     Router::new()
         .route("/bootstrap/ca.pem", get(certificate))
         .route("/bootstrap/fz", get(binary))
+        .route("/bootstrap/env", get(bootstrap_env))
         .route("/mcp/{name}", post(mcp_message))
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
+}
+
+/// Fake credentials for the guest, as shell export lines. Serving fakes
+/// over plain HTTP is sound: fakes are worthless outside the proxy.
+async fn bootstrap_env(State(state): State<BootstrapState>) -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        state.settings.guest_env_lines(),
+    )
 }
 
 /// Container-facing MCP endpoint (streamable HTTP, JSON responses).
@@ -175,11 +260,22 @@ mod tests {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
+    fn test_settings() -> crate::settings::Settings {
+        let dir = std::env::temp_dir().join(format!("fz-web-{}", uuid::Uuid::new_v4()));
+        crate::settings::Settings::load(&dir).unwrap()
+    }
+
     fn bootstrap_app() -> Router {
+        let settings = test_settings();
         bootstrap_router(BootstrapState {
             cert: Arc::new("CERTIFICATE".into()),
             binary: Arc::new(vec![1, 2, 3]),
-            mcp: crate::mcp::McpState::new(crate::state::AppState::default(), Vec::new()),
+            mcp: crate::mcp::McpState::new(
+                crate::state::AppState::default(),
+                Vec::new(),
+                settings.clone(),
+            ),
+            settings,
         })
     }
 

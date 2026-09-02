@@ -45,46 +45,6 @@ pub fn classify(req: &Request<Body>) -> Decision {
     }
 }
 
-/// Inference hosts get escrow-style key substitution: the container
-/// holds a fake key, the broker swaps in the real one from a host env
-/// var. Host-pinned: the real key is attached only for its named host.
-pub struct InferenceRoute {
-    pub host: &'static str,
-    /// Header carrying the credential.
-    pub header: &'static str,
-    /// Header value prefix, e.g. "Bearer " (empty for x-api-key).
-    pub prefix: &'static str,
-    /// Host env var with the real key.
-    pub env: &'static str,
-}
-
-pub const INFERENCE_ROUTES: &[InferenceRoute] = &[
-    InferenceRoute {
-        host: "api.anthropic.com",
-        header: "x-api-key",
-        prefix: "",
-        env: "FZ_ANTHROPIC_API_KEY",
-    },
-    InferenceRoute {
-        host: "api.openai.com",
-        header: "authorization",
-        prefix: "Bearer ",
-        env: "FZ_OPENAI_API_KEY",
-    },
-    // Cline: OpenAI-compatible, Bearer auth (cline/cline
-    // src/api/providers/cline.ts).
-    InferenceRoute {
-        host: "api.cline.bot",
-        header: "authorization",
-        prefix: "Bearer ",
-        env: "FZ_CLINE_API_KEY",
-    },
-];
-
-pub fn inference_route(host: &str) -> Option<&'static InferenceRoute> {
-    INFERENCE_ROUTES.iter().find(|route| route.host == host)
-}
-
 pub fn note(decision: Decision) -> Option<&'static str> {
     match decision {
         Decision::BlockWrite => Some(

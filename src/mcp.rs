@@ -41,15 +41,17 @@ pub fn load_forwards(data_dir: &Path) -> Result<Vec<ForwardConfig>> {
 
 pub struct Forward {
     config: ForwardConfig,
+    settings: crate::settings::Settings,
     /// Upstream Mcp-Session-Id once initialized.
     session: Mutex<Option<String>>,
     client: reqwest::Client,
 }
 
 impl Forward {
-    pub fn new(config: ForwardConfig) -> Self {
+    pub fn new(config: ForwardConfig, settings: crate::settings::Settings) -> Self {
         Self {
             config,
+            settings,
             session: Mutex::new(None),
             client: reqwest::Client::new(),
         }
@@ -72,10 +74,14 @@ impl Forward {
         }
     }
 
+    /// OAuth-stored token first (secret `mcp:{name}`), env fallback.
     fn bearer(&self) -> Result<String> {
+        if let Some(token) = self.settings.secret(&format!("mcp:{}", self.config.name)) {
+            return Ok(token);
+        }
         std::env::var(&self.config.bearer_env).with_context(|| {
             format!(
-                "MCP forward '{}': env var {} not set",
+                "MCP forward '{}': no stored token and env var {} not set (connect it in settings)",
                 self.config.name, self.config.bearer_env
             )
         })
@@ -187,10 +193,19 @@ pub struct McpState {
 }
 
 impl McpState {
-    pub fn new(app: AppState, configs: Vec<ForwardConfig>) -> Self {
+    pub fn new(
+        app: AppState,
+        configs: Vec<ForwardConfig>,
+        settings: crate::settings::Settings,
+    ) -> Self {
         let forwards = configs
             .into_iter()
-            .map(|config| (config.name.clone(), Arc::new(Forward::new(config))))
+            .map(|config| {
+                (
+                    config.name.clone(),
+                    Arc::new(Forward::new(config, settings.clone())),
+                )
+            })
             .collect();
         Self {
             app,
@@ -300,12 +315,17 @@ mod tests {
     use super::*;
 
     fn linear_forward() -> Forward {
-        Forward::new(ForwardConfig {
-            name: "linear".into(),
-            url: "https://mcp.example.test/mcp".into(),
-            bearer_env: "FZ_TEST_UNSET".into(),
-            tools: vec!["list_issues".into(), "get_issue".into()],
-        })
+        let dir = std::env::temp_dir().join(format!("fz-mcp-{}", uuid::Uuid::new_v4()));
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        Forward::new(
+            ForwardConfig {
+                name: "linear".into(),
+                url: "https://mcp.example.test/mcp".into(),
+                bearer_env: "FZ_TEST_UNSET".into(),
+                tools: vec!["list_issues".into(), "get_issue".into()],
+            },
+            settings,
+        )
     }
 
     #[test]
