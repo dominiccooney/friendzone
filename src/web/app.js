@@ -93,11 +93,24 @@ async function renderSettings() {
     renderSettings();
   });
   document.querySelectorAll("[data-cline-oauth]").forEach(b=>b.onclick=async()=>{
-    const r = await fetch(`/api/escrow/${encodeURIComponent(b.dataset.clineOauth)}/cline-oauth/start`,{method:"POST"});
+    const entry = b.dataset.clineOauth;
+    const r = await fetch(`/api/escrow/${encodeURIComponent(entry)}/cline-oauth/start`,{method:"POST"});
     if (!r.ok) { alert(`Cline sign-in failed to start: ${await r.text()}`); return; }
-    const {authorize_url} = await r.json();
-    alert(`Complete the Cline sign-in in your browser.\nIf it did not open: ${authorize_url}`);
-    setTimeout(renderSettings, 3000);
+    const login = await r.json();
+    $("#e-hint").innerHTML = `Cline sign-in: confirm code <strong style="font-size:1.4em">${esc(login.user_code)}</strong> in the browser tab that opened (or visit ${esc(login.verification_uri)}). Waiting…`;
+    const poll = setInterval(async () => {
+      const s = await fetch(`/api/escrow/${encodeURIComponent(entry)}/cline-oauth/status`);
+      if (!s.ok) return;
+      const status = await s.json();
+      if (status.state === "connected") {
+        clearInterval(poll);
+        $("#e-hint").textContent = "Cline account connected. Tokens auto-refresh.";
+        renderSettings();
+      } else if (status.state === "failed") {
+        clearInterval(poll);
+        $("#e-hint").textContent = `Cline sign-in failed: ${status.error}`;
+      }
+    }, 2000);
   });
   document.querySelectorAll("[data-escrow-edit]").forEach(b=>b.onclick=()=>{
     const entry = window._escrowEntries.find(e=>e.name===b.dataset.escrowEdit);

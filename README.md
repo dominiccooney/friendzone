@@ -139,9 +139,11 @@ key is always broker-generated, never typed. Entries can be edited
 key rotates it) and deleted (the stored real key goes with the entry).
 
 For Cline, no key is needed: add the entry with the key field empty,
-then click "Sign in with Cline…" — the broker runs the account login in
-the host browser, exchanges the code, and auto-refreshes the token in
-the background from then on.
+then click "Sign in with Cline…". The broker uses the device-code flow:
+it shows a short code, opens the verification page in the host browser,
+and polls in the background until you confirm the code — no callback,
+no editor redirect. Tokens are registered with Cline's backend and
+auto-refresh from then on.
 
 `fz setup` fetches the fakes into the guest as `friendzone-env.sh`;
 source it in the agent's shell.

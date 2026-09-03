@@ -108,7 +108,7 @@ fn ui_router(state: UiState) -> Router {
         .route("/api/mcp/{name}/oauth", axum::routing::delete(oauth_disconnect))
         .route("/oauth/callback", get(oauth_callback))
         .route("/api/escrow/{name}/cline-oauth/start", post(cline_oauth_start))
-        .route("/oauth/cline/callback", get(cline_oauth_callback))
+        .route("/api/escrow/{name}/cline-oauth/status", get(cline_oauth_status))
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
 }
@@ -341,33 +341,35 @@ async fn oauth_callback(
     }
 }
 
-/// Starts the Cline account login for an escrow entry: opens the host
-/// browser at Cline's authorize page; the callback lands below.
+/// Starts the Cline device-code sign-in: returns the user code to show,
+/// opens the verification page in the host browser, and polls WorkOS in
+/// the background — no callback into this process, no editor redirect.
 async fn cline_oauth_start(
     State(state): State<UiState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let redirect_uri = format!("http://{}/oauth/cline/callback", state.ui_addr);
-    let url = state.cline.start(&name, &redirect_uri);
-    open_host_browser(&url);
-    Json(serde_json::json!({ "authorize_url": url }))
+    match state.cline.start(&name, &state.settings).await {
+        Ok(login) => {
+            if let crate::oauth::ClineLoginState::WaitingForUser {
+                verification_uri, ..
+            } = &login
+            {
+                open_host_browser(verification_uri);
+            }
+            Json(serde_json::json!(login)).into_response()
+        }
+        Err(error) => (StatusCode::BAD_GATEWAY, format!("{error:#}")).into_response(),
+    }
 }
 
-#[derive(Deserialize)]
-struct ClineCallback {
-    code: String,
-}
-
-async fn cline_oauth_callback(
+/// The UI polls this to learn when the background login completes.
+async fn cline_oauth_status(
     State(state): State<UiState>,
-    axum::extract::Query(query): axum::extract::Query<ClineCallback>,
+    Path(name): Path<String>,
 ) -> impl IntoResponse {
-    match state.cline.finish(&query.code, &state.settings).await {
-        Ok(entry) => Html(format!(
-            "<h1>Connected</h1><p>Cline account linked to escrow entry '{entry}'. Tokens auto-refresh; you can close this tab.</p>"
-        ))
-        .into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+    match state.cline.status(&name) {
+        Some(login) => Json(serde_json::json!(login)).into_response(),
+        None => (StatusCode::NOT_FOUND, "no sign-in in progress").into_response(),
     }
 }
 
