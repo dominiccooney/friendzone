@@ -92,16 +92,17 @@ no `cline auth`. Existing Cline settings are merged, never clobbered.
 
 ## 4. Container: agent shell environment
 
+`fz setup` writes everything — proxy vars (with this guest's identity),
+CA bundle vars, and the fake keys — into one file. Activate it:
+
 ```sh
-export HTTP_PROXY=http://reviewer:x@HOST_IP:8080
-export HTTPS_PROXY=http://reviewer:x@HOST_IP:8080
-export NODE_EXTRA_CA_CERTS=~/.config/friendzone/friendzone-ca.pem
-export REQUESTS_CA_BUNDLE=~/.config/friendzone/friendzone-ca.pem
-. ~/.config/friendzone/friendzone-env.sh    # fake API keys
+. ~/.config/friendzone/friendzone-env.sh
 ```
 
-`reviewer` = the container name from step 2; the password is unused
-(any value). Then check everything:
+Add that line to the agent's shell profile so it persists. The
+container identity defaults to the guest hostname; pass
+`--container reviewer` to `fz setup` to match a name you added in the
+UI. Then check everything:
 
 ```sh
 ./fz doctor --broker http://HOST_IP:8082 --proxy http://reviewer:x@HOST_IP:8080

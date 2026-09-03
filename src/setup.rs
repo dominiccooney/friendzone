@@ -6,7 +6,12 @@ use std::{
 
 use anyhow::{Context, Result};
 
-pub async fn run(broker: &str, output: Option<PathBuf>, install: bool) -> Result<()> {
+pub async fn run(
+    broker: &str,
+    output: Option<PathBuf>,
+    install: bool,
+    container: Option<String>,
+) -> Result<()> {
     let url = format!("{}/bootstrap/ca.pem", broker.trim_end_matches('/'));
     let cert = reqwest::get(&url)
         .await
@@ -21,7 +26,8 @@ pub async fn run(broker: &str, output: Option<PathBuf>, install: bool) -> Result
     }
     fs::write(&path, &cert).with_context(|| format!("write {}", path.display()))?;
     println!("Saved Friendzone CA to {}", path.display());
-    fetch_guest_env(broker, &path).await?;
+    let container = container.unwrap_or_else(guest_hostname);
+    fetch_guest_env(broker, &path, &container).await?;
     if install {
         install_ca(&path)?;
     } else {
@@ -31,25 +37,83 @@ pub async fn run(broker: &str, output: Option<PathBuf>, install: bool) -> Result
     Ok(())
 }
 
-/// Pulls the fake credentials the broker escrows and saves them next to
-/// the CA as a sourceable env file. Fakes only; reals never leave the
-/// host.
-async fn fetch_guest_env(broker: &str, cert_path: &Path) -> Result<()> {
-    let url = format!("{}/bootstrap/env", broker.trim_end_matches('/'));
-    let env = reqwest::get(&url)
+fn guest_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|h| h.trim().to_owned())
+                .filter(|h| !h.is_empty())
+        })
+        .unwrap_or_else(|| "guest".to_owned())
+}
+
+/// Broker host as the guest reaches it: the authority of --broker.
+fn broker_host(broker: &str) -> String {
+    let rest = broker
+        .strip_prefix("http://")
+        .or_else(|| broker.strip_prefix("https://"))
+        .unwrap_or(broker);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    authority
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(authority)
+        .to_owned()
+}
+
+/// Pulls the fake credentials and proxy facts from the broker and
+/// writes one complete, sourceable env file: proxy vars (with this
+/// container's identity), CA bundles for common runtimes, and the fake
+/// keys. Fakes only; reals never leave the host.
+async fn fetch_guest_env(broker: &str, cert_path: &Path, container: &str) -> Result<()> {
+    let base = broker.trim_end_matches('/');
+    let url = format!("{base}/bootstrap/env");
+    let fakes = reqwest::get(&url)
         .await
         .with_context(|| format!("fetch {url}"))?
         .error_for_status()
         .context("broker rejected env request")?
         .text()
         .await?;
+    let info: serde_json::Value = reqwest::get(format!("{base}/bootstrap/info"))
+        .await
+        .context("fetch broker info")?
+        .json()
+        .await
+        .context("parse broker info")?;
+    let proxy_port = info
+        .get("proxy_port")
+        .and_then(serde_json::Value::as_u64)
+        .context("no proxy_port in broker info")?;
+    let proxy_url = format!("http://{container}:x@{}:{proxy_port}", broker_host(base));
+    let env = format!(
+        "# Friendzone guest environment; source this in the agent's shell.\n\
+         export HTTP_PROXY={proxy_url}\n\
+         export HTTPS_PROXY={proxy_url}\n\
+         export http_proxy={proxy_url}\n\
+         export https_proxy={proxy_url}\n\
+         export NODE_EXTRA_CA_CERTS={cert}\n\
+         export REQUESTS_CA_BUNDLE={cert}\n\
+         export SSL_CERT_FILE={cert}\n\
+         export GIT_PROXY_SSL_CAINFO={cert}\n\
+         {fakes}",
+        cert = cert_path.display(),
+    );
     let env_path = cert_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("friendzone-env.sh");
     fs::write(&env_path, &env).with_context(|| format!("write {}", env_path.display()))?;
-    println!("Saved fake credentials to {}", env_path.display());
-    println!("Source them in the agent's shell: . {}", env_path.display());
+    println!("Container identity:   {container} (override with --container)");
+    println!("Wrote guest env to    {}", env_path.display());
+    println!();
+    println!("Copy-paste to activate now, and add to the agent's shell profile:");
+    println!();
+    println!("  . {}", env_path.display());
+    println!();
     if let Some(fake_key) = env_export_value(&env, "CLINE_API_KEY") {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         match write_cline_provider_settings(&home, &fake_key) {
@@ -174,6 +238,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn broker_host_extraction() {
+        assert_eq!(broker_host("http://172.31.208.1:8082"), "172.31.208.1");
+        assert_eq!(broker_host("http://172.31.208.1:8082/"), "172.31.208.1");
+        assert_eq!(broker_host("http://broker.local"), "broker.local");
+    }
+
+    #[test]
     fn env_export_parsing() {
         let env = "# comment\nexport CLINE_API_KEY=fz-cline-abc\nexport OTHER=x\n";
         assert_eq!(
@@ -221,7 +292,8 @@ mod tests {
 }
 
 fn print_runtime_instructions(path: &Path) {
-    println!("For Node:   export NODE_EXTRA_CA_CERTS={}", path.display());
-    println!("For Python: export REQUESTS_CA_BUNDLE={}", path.display());
-    println!("Set HTTPS_PROXY and HTTP_PROXY to the broker proxy URL.");
+    println!(
+        "The env file above already sets the proxy and CA variables ({}).",
+        path.display()
+    );
 }

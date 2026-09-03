@@ -49,6 +49,10 @@ enum Command {
         output: Option<PathBuf>,
         #[arg(long)]
         install: bool,
+        /// Container name (the proxy username). Defaults to this
+        /// guest's hostname.
+        #[arg(long)]
+        container: Option<String>,
     },
     /// Check this guest's Friendzone network setup.
     Doctor {
@@ -87,7 +91,8 @@ async fn main() -> Result<()> {
             broker,
             output,
             install,
-        } => setup::run(&broker, output, install).await,
+            container,
+        } => setup::run(&broker, output, install, container).await,
         Command::Doctor { broker, proxy } => doctor::run(&broker, &proxy).await,
     }
 }
@@ -153,7 +158,7 @@ async fn run_broker(
         _ = refresher => unreachable!("refresher loop never returns"),
         result = proxy_server::serve(proxy_addr, state.clone(), issuer, settings.clone()) => result,
         result = web::serve_ui(ui_addr, state, settings.clone(), forwards) => result,
-        result = web::serve_bootstrap(bootstrap_addr, files.cert_pem, mcp_state, settings) => result,
+        result = web::serve_bootstrap(bootstrap_addr, files.cert_pem, mcp_state, settings, proxy_addr.port()) => result,
         signal = tokio::signal::ctrl_c() => signal.context("wait for Ctrl+C"),
     }
 }

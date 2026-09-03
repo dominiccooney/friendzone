@@ -32,6 +32,7 @@ struct BootstrapState {
     guest_binaries: Arc<std::collections::HashMap<String, std::path::PathBuf>>,
     mcp: crate::mcp::McpState,
     settings: crate::settings::Settings,
+    proxy_port: u16,
 }
 
 /// Scans `<data-dir>/guest-bin/` for cross-built `fz` binaries to serve
@@ -81,6 +82,7 @@ pub async fn serve_bootstrap(
     cert_pem: String,
     mcp: crate::mcp::McpState,
     settings: crate::settings::Settings,
+    proxy_port: u16,
 ) -> Result<()> {
     let executable = std::env::current_exe().context("locate fz executable")?;
     let binary = tokio::fs::read(&executable)
@@ -95,6 +97,7 @@ pub async fn serve_bootstrap(
             guest_binaries: Arc::new(guest_binaries),
             mcp,
             settings,
+            proxy_port,
         }),
         "bootstrap server",
     )
@@ -425,10 +428,18 @@ fn bootstrap_router(state: BootstrapState) -> Router {
         .route("/bootstrap/fz", get(binary))
         .route("/bootstrap/fz/{target}", get(guest_binary))
         .route("/bootstrap/targets", get(bootstrap_targets))
+        .route("/bootstrap/info", get(bootstrap_info))
         .route("/bootstrap/env", get(bootstrap_env))
         .route("/mcp/{name}", post(mcp_message))
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
+}
+
+/// Connection facts a guest needs to compose its environment: the
+/// proxy port (the host is whatever address the guest already reached
+/// us on).
+async fn bootstrap_info(State(state): State<BootstrapState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "proxy_port": state.proxy_port }))
 }
 
 /// Fake credentials for the guest, as shell export lines. Serving fakes
@@ -651,6 +662,7 @@ mod tests {
                 settings.clone(),
             ),
             settings,
+            proxy_port: 8080,
         })
     }
 

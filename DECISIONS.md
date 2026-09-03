@@ -321,3 +321,7 @@ Attacks and workflows the design must survive, each with its resolution.
 - Risk scoring, until the quarantine corpus can train and evaluate one.
 - Graceful broker restart. Connections drop, clients retry; pending
   requests persist.
+- Single guest-facing port: multiplex the proxy (CONNECT/absolute-form
+  requests) and bootstrap (origin-form GET/POST) on one listener by
+  request shape. One firewall rule instead of two; needs care that
+  bootstrap routes can never be reached through the proxying path.
