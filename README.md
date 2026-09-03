@@ -41,18 +41,24 @@ binary**: drop it into `<data-dir>/guest-bin/` (e.g.
 by name. `GET /bootstrap/targets` lists what is available; the broker
 also prints it at startup.
 
-Cross-building the Linux guest binary from a Windows host:
+Getting the Linux guest binary onto a Windows host, easiest first:
 
-```powershell
-rustup target add x86_64-unknown-linux-musl
-cargo install cross          # uses Docker/Podman for the cross toolchain
-cross build --release --target x86_64-unknown-linux-musl
-copy target\x86_64-unknown-linux-musl\release\fz `
-  "$env:LOCALAPPDATA\friendzone\guest-bin\fz-linux-x86_64"
-```
+1. **From CI** (no local toolchain needed): the `guest-binary` GitHub
+   workflow builds `fz-linux-x86_64` on every push to master. Fetch it
+   with `scripts/get-linux-guest-binary.ps1`, which downloads the
+   latest artifact into `guest-bin/` via `gh run download`.
+2. **Cross-build locally** (needs Docker/Podman or WSL):
 
-(musl gives a static binary that runs on any distro; without Docker,
-WSL with `cargo build --target x86_64-unknown-linux-musl` also works.)
+   ```powershell
+   rustup target add x86_64-unknown-linux-musl
+   cargo install cross       # uses Docker/Podman for the cross toolchain
+   cross build --release --target x86_64-unknown-linux-musl
+   copy target\x86_64-unknown-linux-musl\release\fz `
+     "$env:LOCALAPPDATA\friendzone\guest-bin\fz-linux-x86_64"
+   ```
+
+   (musl gives a static binary that runs on any distro; without Docker,
+   build inside WSL instead.)
 
 On a Linux guest of a Windows host:
 
