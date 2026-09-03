@@ -127,16 +127,24 @@ enters the container.
 
 ## Credential escrow (inference and other APIs)
 
-In the UI, Settings → Escrowed credentials: add an entry naming the
-pinned hosts, the credential header, and optionally the guest env var.
-The broker generates a fake key; click "Set key…" to store the real
-value (or set `real_env` in `escrow.json` to name a host env var).
+In the UI, Settings → Escrowed credentials: pick a provider preset
+(Anthropic, Cline, GitHub, or Custom…) and paste the real key into the
+single masked field — the only place a real key goes. The preset fills
+the pinned hosts, credential header, prefix, and guest env var
+(Anthropic uses `x-api-key` with no prefix; OpenAI-style APIs use
+`authorization` with `Bearer `); each preset's hint says where to get
+the key (for GitHub: a fine-grained PAT or `gh auth token`). The fake
+key is always broker-generated, never typed. Entries can be edited
+(fixing hosts/header keeps the fake, so guests keep working; pasting a
+key rotates it) and deleted (the stored real key goes with the entry).
 
-`fz setup` fetches the fakes into the guest as
-`friendzone-env.sh`; source it in the agent's shell. Example entry for
-Anthropic: hosts `api.anthropic.com`, header `x-api-key`, guest env
-`ANTHROPIC_API_KEY`. For OpenAI-style APIs (including Cline at
-`api.cline.bot`): header `authorization`, prefix `Bearer `.
+For Cline, no key is needed: add the entry with the key field empty,
+then click "Sign in with Cline…" — the broker runs the account login in
+the host browser, exchanges the code, and auto-refreshes the token in
+the background from then on.
+
+`fz setup` fetches the fakes into the guest as `friendzone-env.sh`;
+source it in the agent's shell.
 
 Substitution requires an exact fake match on a pinned host: a random
 key passes through untouched, and a fake sent toward any non-pinned
@@ -149,10 +157,12 @@ through untouched.
 Working now: multi-container identity with dynamic add/remove and a
 reversible kill switch; GitHub read/write policy (reads flow, writes
 block with a note); credential escrow with exact-fake-match,
-host-pinned substitution and leak blocking; MCP forwarding of
-streamable-HTTP servers with tool allowlists and host-side OAuth
-(discovery, dynamic client registration, PKCE); guest bootstrap of the
-CA, `fz` binary, and fake credentials.
+host-pinned substitution and leak blocking, provider presets, and
+add/edit/delete from the settings UI; Cline account sign-in with
+background token refresh; MCP forwarding of streamable-HTTP servers
+with tool allowlists and host-side OAuth (discovery, dynamic client
+registration, PKCE, refresh, reauthorize/disconnect); guest bootstrap
+of the CA, `fz` binary, and fake credentials.
 
 Not yet: proxy password validation (the username is trusted labeling,
 not authentication), new-container acknowledgement gating, the
