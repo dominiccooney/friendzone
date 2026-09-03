@@ -84,7 +84,7 @@ async function renderSettings() {
       : f.auth==="stored-key" || f.auth==="env-key" ? `<span class="verdict allowed">${esc(f.auth)}</span> <button class="quiet" data-oauth="${esc(f.name)}">Switch to OAuth…</button>`
       : `<button class="quiet" data-oauth="${esc(f.name)}">Connect (OAuth)…</button>`;
     return `<div class="log-row"><span>${esc(f.name)}</span><span class="request">${esc(f.url)} · ${f.tools.length} tools${f.scope?` · scope ${esc(f.scope)}`:""}</span><span>${status}</span></div>`;
-  }).join("") || '<div class="log-row">No MCP forwards configured (mcp-forwards.json).</div>';
+  }).join("") || `<div class="log-row">No MCP forwards configured. Create <code>${esc(mcp.config_path)}</code> (see README for the format), then restart the broker.</div>`;
   $("#guest-env").textContent = env;
   document.querySelectorAll("[data-secret]").forEach(b=>b.onclick=async()=>{
     const value = prompt(`Real value for '${b.dataset.secret}' (stored on host only):`);

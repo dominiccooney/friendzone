@@ -65,6 +65,10 @@ impl Settings {
         self.0.entries.read().expect("settings lock").clone()
     }
 
+    pub fn data_dir(&self) -> &Path {
+        &self.0.data_dir
+    }
+
     pub fn add_entry(&self, mut entry: EscrowEntry) -> Result<EscrowEntry> {
         if entry.fake.is_empty() {
             entry.fake = generate_fake(&entry.name);

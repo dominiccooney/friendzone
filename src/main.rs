@@ -102,6 +102,13 @@ async fn run_broker(
     let issuer = files.issuer()?;
     let state = AppState::default();
     let forwards = mcp::load_forwards(&data_dir)?;
+    let forwards_path = mcp::forwards_path(&data_dir);
+    if forwards.is_empty() {
+        println!(
+            "MCP forwards:         none (to add some, create {})",
+            forwards_path.display()
+        );
+    }
     for forward in &forwards {
         println!(
             "MCP forward:          /mcp/{} -> {} ({} tools)",
@@ -112,6 +119,7 @@ async fn run_broker(
     }
     let settings = settings::Settings::load(&data_dir)?;
     let mcp_state = mcp::McpState::new(state.clone(), forwards.clone(), settings.clone());
+    println!("Friendzone data:      {}", data_dir.display());
     println!("Friendzone proxy:     http://{proxy_addr}");
     println!("Friendzone UI:        http://{ui_addr}");
     println!("Friendzone bootstrap: http://{bootstrap_addr}");

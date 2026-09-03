@@ -31,9 +31,14 @@ pub struct ForwardConfig {
     pub tools: Vec<String>,
 }
 
+/// Where MCP forwards are configured, for display to the user.
+pub fn forwards_path(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join("mcp-forwards.json")
+}
+
 /// Loads mcp-forwards.json from the data dir; absent file means none.
 pub fn load_forwards(data_dir: &Path) -> Result<Vec<ForwardConfig>> {
-    let path = data_dir.join("mcp-forwards.json");
+    let path = forwards_path(data_dir);
     if !path.exists() {
         return Ok(Vec::new());
     }

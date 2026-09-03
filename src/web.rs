@@ -283,7 +283,12 @@ async fn list_forwards(State(state): State<UiState>) -> Json<serde_json::Value> 
             })
         })
         .collect();
-    Json(serde_json::json!({ "forwards": forwards }))
+    Json(serde_json::json!({
+        "forwards": forwards,
+        "config_path": crate::mcp::forwards_path(state.settings.data_dir())
+            .display()
+            .to_string(),
+    }))
 }
 
 /// Forgets the OAuth session for a forward.

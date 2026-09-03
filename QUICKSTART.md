@@ -40,9 +40,12 @@ Open <http://127.0.0.1:8081>.
   browser opens. Done — the session stays on the host and auto-refreshes
   near expiry. Reauthorize/Disconnect from the same row.
 
-Optional, before starting: MCP forwards live in
-`%LOCALAPPDATA%\friendzone\mcp-forwards.json` (Windows) or
-`~/Library/Application Support/friendzone/` (macOS):
+Optional, before starting: MCP forwards live in `mcp-forwards.json` in
+the broker data directory — the broker prints the exact path at startup
+("Friendzone data: …"), and the Settings page shows it too. Defaults:
+`%LOCALAPPDATA%\friendzone\` (Windows),
+`~/Library/Application Support/friendzone/` (macOS),
+`~/.local/share/friendzone/` (Linux):
 
 ```json
 [

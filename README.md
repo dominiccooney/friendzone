@@ -98,7 +98,19 @@ exists. Other origins are logged and unpoliced.
 
 ## MCP forwarding (read tools)
 
-Create `mcp-forwards.json` in the broker data directory:
+Create `mcp-forwards.json` in the broker data directory — the same
+directory that holds the CA files. The broker prints the exact path at
+startup ("Friendzone data: …" / "MCP forwards: none (to add some,
+create …)"), and the Settings page shows it when no forwards exist.
+Defaults per OS:
+
+| OS      | Path                                                        |
+|---------|-------------------------------------------------------------|
+| Windows | `%LOCALAPPDATA%\friendzone\mcp-forwards.json`               |
+| macOS   | `~/Library/Application Support/friendzone/mcp-forwards.json`|
+| Linux   | `~/.local/share/friendzone/mcp-forwards.json`               |
+
+(With `--data-dir`, it is `<data-dir>/mcp-forwards.json`.) Contents:
 
 ```json
 [
