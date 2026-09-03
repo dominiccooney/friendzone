@@ -24,17 +24,12 @@ Open <http://127.0.0.1:8081>.
 
 - **Inbox → Add container** — name it (e.g. `reviewer`); the name is the
   proxy username and the unit of kill/logging.
-- **Settings → Escrowed credentials → Add entry** — one per API key the
-  agent needs. Examples:
-
-  | name      | hosts               | header          | prefix    | guest env           |
-  |-----------|---------------------|-----------------|-----------|---------------------|
-  | anthropic | `api.anthropic.com` | `x-api-key`     |           | `ANTHROPIC_API_KEY` |
-  | openai    | `api.openai.com`    | `authorization` | `Bearer ` | `OPENAI_API_KEY`    |
-  | cline     | `api.cline.bot`     | `authorization` | `Bearer ` | `CLINE_API_KEY`     |
-
-  Then click **Set key…** on each entry and paste the real key. The
-  broker generates the fake automatically.
+- **Settings → Escrowed credentials** — pick a provider preset
+  (Anthropic, Cline, GitHub, or Custom…), paste the real key in the one
+  masked field, click Add. Hosts/header/env-var are prefilled by the
+  preset; the fake key is broker-generated. The in-UI hint says where to
+  get each key (for GitHub: a fine-grained PAT, or just `gh auth
+  token`). Delete removes the entry and its stored key together.
 - **Settings → MCP forwards → Connect (OAuth)** — if you configured
   `mcp-forwards.json` (see below), click Connect; log in when the
   browser opens. Done — the session stays on the host and auto-refreshes

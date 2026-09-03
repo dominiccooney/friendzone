@@ -95,6 +95,10 @@ fn ui_router(state: UiState) -> Router {
         )
         .route("/api/containers/{id}/kill", post(set_killed))
         .route("/api/escrow", get(list_escrow).post(add_escrow))
+        .route(
+            "/api/escrow/{name}",
+            axum::routing::delete(remove_escrow),
+        )
         .route("/api/escrow/{name}/secret", post(set_escrow_secret))
         .route("/api/guest-env", get(guest_env))
         .route("/api/mcp", get(list_forwards))
@@ -128,13 +132,56 @@ async fn list_escrow(State(state): State<UiState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "entries": entries }))
 }
 
+/// The add form's shape: no `fake` field exists, so a client cannot
+/// supply one — the broker always generates it. The real key travels
+/// in `real_value`, its one designated place, straight to the secret
+/// store.
+#[derive(Deserialize)]
+struct AddEscrowRequest {
+    name: String,
+    hosts: Vec<String>,
+    header: String,
+    #[serde(default)]
+    prefix: String,
+    #[serde(default)]
+    guest_env: Option<String>,
+    #[serde(default)]
+    real_value: Option<String>,
+}
+
 async fn add_escrow(
     State(state): State<UiState>,
-    Json(entry): Json<crate::settings::EscrowEntry>,
+    Json(request): Json<AddEscrowRequest>,
 ) -> impl IntoResponse {
-    match state.settings.add_entry(entry) {
-        Ok(entry) => (StatusCode::CREATED, Json(serde_json::json!(entry))).into_response(),
-        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    let entry = crate::settings::EscrowEntry {
+        name: request.name,
+        hosts: request.hosts,
+        header: request.header,
+        prefix: request.prefix,
+        fake: String::new(), // always broker-generated
+        real_env: None,
+        guest_env: request.guest_env,
+    };
+    let entry = match state.settings.add_entry(entry) {
+        Ok(entry) => entry,
+        Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+    };
+    if let Some(real) = request.real_value.filter(|v| !v.trim().is_empty())
+        && let Err(error) = state.settings.set_secret(&entry.name, real.trim())
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+    }
+    (StatusCode::CREATED, Json(serde_json::json!(entry))).into_response()
+}
+
+/// Deletes an escrow entry and its stored real key together.
+async fn remove_escrow(
+    State(state): State<UiState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match state.settings.remove_entry(&name) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
 

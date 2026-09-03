@@ -41,13 +41,39 @@ function renderLog() {
 
 async function refresh() { try { const response=await fetch("/api/state"); snapshot=await response.json(); renderContainers(); renderLog(); } catch(e) { console.error(e); } }
 
+const PROVIDER_PRESETS = {
+  anthropic: {
+    name: "anthropic", hosts: "api.anthropic.com", header: "x-api-key", prefix: "", guest: "ANTHROPIC_API_KEY",
+    hint: "Get a key at console.anthropic.com → Settings → API keys. Agents read it from ANTHROPIC_API_KEY.",
+  },
+  cline: {
+    name: "cline", hosts: "api.cline.bot", header: "authorization", prefix: "Bearer ", guest: "CLINE_API_KEY",
+    hint: "Get a key at app.cline.bot → Account. OpenAI-compatible; agents read it from CLINE_API_KEY.",
+  },
+  github: {
+    name: "github", hosts: "api.github.com,github.com,codeload.github.com", header: "authorization", prefix: "Bearer ", guest: "GITHUB_TOKEN",
+    hint: "Use a fine-grained PAT from github.com → Settings → Developer settings → Personal access tokens (read-only scopes recommended), or reuse the gh CLI's token: run `gh auth token`. Agents and gh read it from GITHUB_TOKEN. Note: GitHub writes are blocked by policy regardless of the token's scopes.",
+  },
+  custom: { name: "", hosts: "", header: "", prefix: "", guest: "", hint: "Fill the advanced fields: pinned hosts, credential header, optional 'Bearer ' prefix, and the env var the agent expects." },
+};
+
+$("#e-provider").onchange = () => {
+  const preset = PROVIDER_PRESETS[$("#e-provider").value];
+  if (!preset) { $("#e-hint").textContent = ""; return; }
+  $("#e-name").value = preset.name; $("#e-hosts").value = preset.hosts;
+  $("#e-header").value = preset.header; $("#e-prefix").value = preset.prefix;
+  $("#e-guest").value = preset.guest;
+  $("#e-hint").textContent = preset.hint;
+  $("#e-advanced").open = $("#e-provider").value === "custom";
+};
+
 async function renderSettings() {
   const [escrow, mcp, env] = await Promise.all([
     fetch("/api/escrow").then(r=>r.json()),
     fetch("/api/mcp").then(r=>r.json()),
     fetch("/api/guest-env").then(r=>r.text()),
   ]);
-  $("#escrow-list").innerHTML = escrow.entries.map(e=>`<div class="log-row"><span>${esc(e.name)}</span><span>${esc(e.hosts.join(", "))}</span><span class="request">${esc(e.header)} · fake <code>${esc(e.fake)}</code></span><span>${e.connected?'<span class="verdict allowed">connected</span>':`<button class="quiet" data-secret="${esc(e.name)}">Set key…</button>`}</span></div>`).join("") || '<div class="log-row">No escrow entries yet.</div>';
+  $("#escrow-list").innerHTML = escrow.entries.map(e=>`<div class="log-row"><span>${esc(e.name)}</span><span>${esc(e.hosts.join(", "))}</span><span class="request">${esc(e.header)} · fake <code>${esc(e.fake)}</code></span><span>${e.connected?'<span class="verdict allowed">connected</span>':`<button class="quiet" data-secret="${esc(e.name)}">Set key…</button>`} <button class="quiet" data-escrow-delete="${esc(e.name)}">Delete</button></span></div>`).join("") || '<div class="log-row">No escrow entries yet.</div>';
   $("#mcp-list").innerHTML = mcp.forwards.map(f=>{
     const expiry = f.expires_at ? ` · expires ${new Date(f.expires_at*1000).toLocaleString()}${f.refreshable?" (auto-refresh)":""}` : "";
     const status = f.auth==="oauth" ? `<span class="verdict allowed">OAuth</span>${esc(expiry)} <button class="quiet" data-oauth="${esc(f.name)}">Reauthorize…</button> <button class="quiet" data-oauth-disconnect="${esc(f.name)}">Disconnect</button>`
@@ -60,6 +86,11 @@ async function renderSettings() {
     const value = prompt(`Real value for '${b.dataset.secret}' (stored on host only):`);
     if (!value) return;
     await fetch(`/api/escrow/${encodeURIComponent(b.dataset.secret)}/secret`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({value})});
+    renderSettings();
+  });
+  document.querySelectorAll("[data-escrow-delete]").forEach(b=>b.onclick=async()=>{
+    if (!confirm(`Delete escrow entry '${b.dataset.escrowDelete}' and its stored real key? Containers holding its fake lose access.`)) return;
+    await fetch(`/api/escrow/${encodeURIComponent(b.dataset.escrowDelete)}`,{method:"DELETE"});
     renderSettings();
   });
   document.querySelectorAll("[data-oauth-disconnect]").forEach(b=>b.onclick=async()=>{
@@ -85,17 +116,21 @@ $("#add-container").onsubmit = async (e) => {
 
 $("#escrow-form").onsubmit = async (e) => {
   e.preventDefault();
+  if (!$("#e-provider").value) { alert("Pick a provider (or Custom…) first."); return; }
   const body = {
     name: $("#e-name").value.trim(),
     hosts: $("#e-hosts").value.split(",").map(h=>h.trim()).filter(Boolean),
     header: $("#e-header").value.trim().toLowerCase(),
     prefix: $("#e-prefix").value,
-    fake: "",
     guest_env: $("#e-guest").value.trim() || null,
+    real_value: $("#e-real").value || null,
   };
+  if (!body.name || !body.hosts.length || !body.header) {
+    alert("Missing name/hosts/header — open Advanced and fill them in."); return;
+  }
   const r = await fetch("/api/escrow",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
   if (!r.ok) { alert(await r.text()); return; }
-  e.target.reset(); renderSettings();
+  e.target.reset(); $("#e-hint").textContent = ""; renderSettings();
 };
 
 document.querySelectorAll(".nav").forEach(button=>button.onclick=()=>{document.querySelectorAll(".nav,.view").forEach(n=>n.classList.remove("active"));button.classList.add("active");$(`#${button.dataset.view}-view`).classList.add("active");if(button.dataset.view==="settings")renderSettings().catch(console.error);});

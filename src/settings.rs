@@ -78,6 +78,16 @@ impl Settings {
         Ok(entry)
     }
 
+    /// Deletes an escrow entry and its stored real value together, so
+    /// no orphaned secret outlives its entry.
+    pub fn remove_entry(&self, name: &str) -> Result<()> {
+        let mut entries = self.0.entries.write().expect("settings lock");
+        entries.retain(|entry| entry.name != name);
+        write_json(&self.0.data_dir.join("escrow.json"), &*entries)?;
+        drop(entries);
+        self.remove_secret(name)
+    }
+
     pub fn set_secret(&self, name: &str, value: &str) -> Result<()> {
         let mut secrets = self.0.secrets.write().expect("settings lock");
         secrets.insert(name.to_owned(), value.to_owned());
@@ -242,6 +252,20 @@ mod tests {
             (h == "x-api-key").then(|| "fz-fake-anthropic".to_owned())
         });
         assert!(matches!(result, Substitution::Block(_)));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn remove_entry_takes_its_secret_with_it() {
+        let (settings, dir) = temp_settings();
+        assert!(settings.secret("anthropic").is_some());
+        settings.remove_entry("anthropic").unwrap();
+        assert!(settings.entries().is_empty());
+        assert!(settings.secret("anthropic").is_none(), "secret must not orphan");
+        // Removal persists across reload.
+        let reloaded = Settings::load(&dir).unwrap();
+        assert!(reloaded.entries().is_empty());
+        assert!(reloaded.secret("anthropic").is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 
