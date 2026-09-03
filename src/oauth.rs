@@ -225,6 +225,175 @@ pub fn disconnect(settings: &Settings, forward: &str) -> Result<()> {
     settings.remove_secret(&TokenRecord::secret_name(forward))
 }
 
+// ---------------------------------------------------------------------
+// Cline account OAuth (provider-specific: no RFC 8414 discovery, no DCR,
+// no state echo). Contract from cline/cline
+// sdk/packages/core/src/auth/cline.ts:
+//   authorize: GET  {base}/api/v1/auth/authorize?client_type=extension
+//                    &callback_url={cb}&redirect_uri={cb}
+//   exchange:  POST {base}/api/v1/auth/token
+//                    {"grant_type":"authorization_code","code":..,
+//                     "client_type":"extension","redirect_uri":..}
+//   refresh:   POST {base}/api/v1/auth/refresh
+//                    {"refreshToken":..,"grantType":"refresh_token"}
+// Responses: {"success":true,"data":{"accessToken","refreshToken",
+//             "expiresAt"(ISO 8601),..}}
+// ---------------------------------------------------------------------
+
+pub const CLINE_API_BASE: &str = "https://api.cline.bot";
+
+/// A Cline account session backing an escrow entry. The current access
+/// token is mirrored into the entry's secret so the proxy's synchronous
+/// substitution path never waits on a refresh.
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+pub struct ClineSession {
+    pub refresh_token: String,
+    pub expires_at: i64,
+    pub api_base_url: String,
+}
+
+impl ClineSession {
+    pub fn secret_name(entry: &str) -> String {
+        format!("cline-oauth:{entry}")
+    }
+
+    pub fn load(settings: &Settings, entry: &str) -> Option<Self> {
+        settings
+            .secret(&Self::secret_name(entry))
+            .and_then(|text| serde_json::from_str(&text).ok())
+    }
+
+    pub fn expires_soon(&self) -> bool {
+        // Cline's own SDK refreshes 5 minutes early; match it.
+        self.expires_at - 300 <= chrono::Utc::now().timestamp()
+    }
+}
+
+/// The one pending Cline login (their callback carries no state echo,
+/// so exactly one login may be in flight).
+#[derive(Clone, Default)]
+pub struct ClineFlows(Arc<Mutex<Option<(String, String)>>>); // (entry, redirect_uri)
+
+impl ClineFlows {
+    /// Returns the URL to open in the host browser.
+    pub fn start(&self, entry: &str, redirect_uri: &str) -> String {
+        *self.0.lock().expect("cline oauth lock") =
+            Some((entry.to_owned(), redirect_uri.to_owned()));
+        format!(
+            "{CLINE_API_BASE}/api/v1/auth/authorize?client_type=extension&callback_url={cb}&redirect_uri={cb}",
+            cb = urlencode(redirect_uri)
+        )
+    }
+
+    /// Exchanges the callback code, stores the session, and mirrors the
+    /// access token into the escrow entry's secret. Returns the entry.
+    pub async fn finish(&self, code: &str, settings: &Settings) -> Result<String> {
+        let (entry, redirect_uri) = self
+            .0
+            .lock()
+            .expect("cline oauth lock")
+            .take()
+            .context("no Cline login in progress")?;
+        let body = serde_json::json!({
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_type": "extension",
+            "redirect_uri": redirect_uri,
+        });
+        let data = cline_token_request(
+            &format!("{CLINE_API_BASE}/api/v1/auth/token"),
+            &body,
+        )
+        .await
+        .context("Cline token exchange")?;
+        store_cline_session(settings, &entry, &data, CLINE_API_BASE)?;
+        Ok(entry)
+    }
+}
+
+/// Refreshes a Cline session and re-mirrors the access token into the
+/// entry's secret. Returns the new access token.
+pub async fn refresh_cline(settings: &Settings, entry: &str) -> Result<String> {
+    let session = ClineSession::load(settings, entry).context("no Cline session to refresh")?;
+    let body = serde_json::json!({
+        "refreshToken": session.refresh_token,
+        "grantType": "refresh_token",
+    });
+    let data = cline_token_request(
+        &format!("{}/api/v1/auth/refresh", session.api_base_url),
+        &body,
+    )
+    .await
+    .context("Cline token refresh (reconnect in settings if this persists)")?;
+    store_cline_session(settings, entry, &data, &session.api_base_url)?;
+    data.get("accessToken")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .context("no accessToken after refresh")
+}
+
+async fn cline_token_request(url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(body)
+        .send()
+        .await
+        .context("request")?;
+    let status = response.status();
+    let json: serde_json::Value = response.json().await.context("parse response")?;
+    if !status.is_success() || json.get("success").and_then(serde_json::Value::as_bool) != Some(true)
+    {
+        anyhow::bail!("{url} returned {status}: {json}");
+    }
+    json.get("data").cloned().context("no data in response")
+}
+
+fn store_cline_session(
+    settings: &Settings,
+    entry: &str,
+    data: &serde_json::Value,
+    api_base_url: &str,
+) -> Result<()> {
+    let access = data
+        .get("accessToken")
+        .and_then(serde_json::Value::as_str)
+        .context("no accessToken")?;
+    let refresh = data
+        .get("refreshToken")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        // Rotation optional: keep the old refresh token when absent.
+        .or_else(|| ClineSession::load(settings, entry).map(|s| s.refresh_token))
+        .context("no refreshToken")?;
+    let expires_at = data
+        .get("expiresAt")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|iso| chrono::DateTime::parse_from_rfc3339(iso).ok())
+        .map(|dt| dt.timestamp())
+        .context("no parseable expiresAt")?;
+    let session = ClineSession {
+        refresh_token: refresh,
+        expires_at,
+        api_base_url: api_base_url.to_owned(),
+    };
+    settings.set_secret(&ClineSession::secret_name(entry), &serde_json::to_string(&session)?)?;
+    // Mirror for the synchronous substitution path.
+    settings.set_secret(entry, access)
+}
+
+/// Background maintenance: refresh any Cline session nearing expiry so
+/// the mirrored access token stays valid without blocking the proxy.
+pub async fn refresh_expiring_cline_sessions(settings: &Settings) {
+    for entry in settings.entries() {
+        if let Some(session) = ClineSession::load(settings, &entry.name)
+            && session.expires_soon()
+            && let Err(error) = refresh_cline(settings, &entry.name).await
+        {
+            tracing::warn!(%error, entry = %entry.name, "Cline session refresh failed");
+        }
+    }
+}
+
 fn origin_of(url: &str) -> Result<String> {
     let rest = url
         .strip_prefix("https://")

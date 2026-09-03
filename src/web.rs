@@ -18,6 +18,7 @@ struct UiState {
     settings: crate::settings::Settings,
     forwards: Arc<Vec<crate::mcp::ForwardConfig>>,
     oauth: crate::oauth::OauthFlows,
+    cline: crate::oauth::ClineFlows,
     ui_addr: SocketAddr,
 }
 
@@ -42,6 +43,7 @@ pub async fn serve_ui(
             settings,
             forwards: Arc::new(forwards),
             oauth: crate::oauth::OauthFlows::default(),
+            cline: crate::oauth::ClineFlows::default(),
             ui_addr: addr,
         }),
         "web UI",
@@ -97,7 +99,7 @@ fn ui_router(state: UiState) -> Router {
         .route("/api/escrow", get(list_escrow).post(add_escrow))
         .route(
             "/api/escrow/{name}",
-            axum::routing::delete(remove_escrow),
+            axum::routing::put(update_escrow).delete(remove_escrow),
         )
         .route("/api/escrow/{name}/secret", post(set_escrow_secret))
         .route("/api/guest-env", get(guest_env))
@@ -105,6 +107,8 @@ fn ui_router(state: UiState) -> Router {
         .route("/api/mcp/{name}/oauth/start", post(oauth_start))
         .route("/api/mcp/{name}/oauth", axum::routing::delete(oauth_disconnect))
         .route("/oauth/callback", get(oauth_callback))
+        .route("/api/escrow/{name}/cline-oauth/start", post(cline_oauth_start))
+        .route("/oauth/cline/callback", get(cline_oauth_callback))
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
 }
@@ -172,6 +176,44 @@ async fn add_escrow(
         return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
     }
     (StatusCode::CREATED, Json(serde_json::json!(entry))).into_response()
+}
+
+#[derive(Deserialize)]
+struct UpdateEscrowRequest {
+    hosts: Vec<String>,
+    header: String,
+    #[serde(default)]
+    prefix: String,
+    #[serde(default)]
+    guest_env: Option<String>,
+    /// Optionally rotate the real key in the same edit.
+    #[serde(default)]
+    real_value: Option<String>,
+}
+
+/// Edits an entry's routing fields; the fake never changes, so guest
+/// env files stay valid.
+async fn update_escrow(
+    State(state): State<UiState>,
+    Path(name): Path<String>,
+    Json(request): Json<UpdateEscrowRequest>,
+) -> impl IntoResponse {
+    let updated = match state.settings.update_entry(
+        &name,
+        request.hosts,
+        request.header,
+        request.prefix,
+        request.guest_env,
+    ) {
+        Ok(entry) => entry,
+        Err(error) => return (StatusCode::NOT_FOUND, error.to_string()).into_response(),
+    };
+    if let Some(real) = request.real_value.filter(|v| !v.trim().is_empty())
+        && let Err(error) = state.settings.set_secret(&name, real.trim())
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+    }
+    Json(serde_json::json!(updated)).into_response()
 }
 
 /// Deletes an escrow entry and its stored real key together.
@@ -293,6 +335,36 @@ async fn oauth_callback(
     {
         Ok(name) => Html(format!(
             "<h1>Connected</h1><p>MCP forward '{name}' is authorized. You can close this tab.</p>"
+        ))
+        .into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+    }
+}
+
+/// Starts the Cline account login for an escrow entry: opens the host
+/// browser at Cline's authorize page; the callback lands below.
+async fn cline_oauth_start(
+    State(state): State<UiState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let redirect_uri = format!("http://{}/oauth/cline/callback", state.ui_addr);
+    let url = state.cline.start(&name, &redirect_uri);
+    open_host_browser(&url);
+    Json(serde_json::json!({ "authorize_url": url }))
+}
+
+#[derive(Deserialize)]
+struct ClineCallback {
+    code: String,
+}
+
+async fn cline_oauth_callback(
+    State(state): State<UiState>,
+    axum::extract::Query(query): axum::extract::Query<ClineCallback>,
+) -> impl IntoResponse {
+    match state.cline.finish(&query.code, &state.settings).await {
+        Ok(entry) => Html(format!(
+            "<h1>Connected</h1><p>Cline account linked to escrow entry '{entry}'. Tokens auto-refresh; you can close this tab.</p>"
         ))
         .into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),

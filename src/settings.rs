@@ -78,6 +78,30 @@ impl Settings {
         Ok(entry)
     }
 
+    /// Edits an entry's routing fields. The fake is deliberately
+    /// preserved: guests keep their env files working across an edit.
+    pub fn update_entry(
+        &self,
+        name: &str,
+        hosts: Vec<String>,
+        header: String,
+        prefix: String,
+        guest_env: Option<String>,
+    ) -> Result<EscrowEntry> {
+        let mut entries = self.0.entries.write().expect("settings lock");
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.name == name)
+            .with_context(|| format!("no escrow entry '{name}'"))?;
+        entry.hosts = hosts;
+        entry.header = header;
+        entry.prefix = prefix;
+        entry.guest_env = guest_env;
+        let updated = entry.clone();
+        write_json(&self.0.data_dir.join("escrow.json"), &*entries)?;
+        Ok(updated)
+    }
+
     /// Deletes an escrow entry and its stored real value together, so
     /// no orphaned secret outlives its entry.
     pub fn remove_entry(&self, name: &str) -> Result<()> {
@@ -252,6 +276,26 @@ mod tests {
             (h == "x-api-key").then(|| "fz-fake-anthropic".to_owned())
         });
         assert!(matches!(result, Substitution::Block(_)));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn update_entry_fixes_fields_but_keeps_the_fake() {
+        let (settings, dir) = temp_settings();
+        let fake_before = settings.entries()[0].fake.clone();
+        // The accident this exists for: wrong header/prefix on Anthropic.
+        let updated = settings
+            .update_entry(
+                "anthropic",
+                vec!["api.anthropic.com".into()],
+                "x-api-key".into(),
+                String::new(),
+                Some("ANTHROPIC_API_KEY".into()),
+            )
+            .unwrap();
+        assert_eq!(updated.fake, fake_before, "guests keep their fake across edits");
+        assert_eq!(updated.header, "x-api-key");
+        assert!(settings.update_entry("missing", vec![], "h".into(), String::new(), None).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 

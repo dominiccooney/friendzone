@@ -116,7 +116,20 @@ async fn run_broker(
     println!("Friendzone UI:        http://{ui_addr}");
     println!("Friendzone bootstrap: http://{bootstrap_addr}");
 
+    // Keep Cline (and future) sessions fresh so the proxy's synchronous
+    // substitution always sees a valid mirrored token.
+    let refresher = {
+        let settings = settings.clone();
+        async move {
+            loop {
+                oauth::refresh_expiring_cline_sessions(&settings).await;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        }
+    };
+
     tokio::select! {
+        _ = refresher => unreachable!("refresher loop never returns"),
         result = proxy_server::serve(proxy_addr, state.clone(), issuer, settings.clone()) => result,
         result = web::serve_ui(ui_addr, state, settings.clone(), forwards) => result,
         result = web::serve_bootstrap(bootstrap_addr, files.cert_pem, mcp_state, settings) => result,

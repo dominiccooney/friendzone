@@ -48,7 +48,7 @@ const PROVIDER_PRESETS = {
   },
   cline: {
     name: "cline", hosts: "api.cline.bot", header: "authorization", prefix: "Bearer ", guest: "CLINE_API_KEY",
-    hint: "Get a key at app.cline.bot → Account. OpenAI-compatible; agents read it from CLINE_API_KEY.",
+    hint: "Easiest: add the entry (key field empty), then click 'Sign in with Cline…' on its row — tokens are fetched and refreshed automatically. Or paste a static API key from app.cline.bot → Settings → API Keys. Agents read it from CLINE_API_KEY.",
   },
   github: {
     name: "github", hosts: "api.github.com,github.com,codeload.github.com", header: "authorization", prefix: "Bearer ", guest: "GITHUB_TOKEN",
@@ -73,7 +73,11 @@ async function renderSettings() {
     fetch("/api/mcp").then(r=>r.json()),
     fetch("/api/guest-env").then(r=>r.text()),
   ]);
-  $("#escrow-list").innerHTML = escrow.entries.map(e=>`<div class="log-row"><span>${esc(e.name)}</span><span>${esc(e.hosts.join(", "))}</span><span class="request">${esc(e.header)} · fake <code>${esc(e.fake)}</code></span><span>${e.connected?'<span class="verdict allowed">connected</span>':`<button class="quiet" data-secret="${esc(e.name)}">Set key…</button>`} <button class="quiet" data-escrow-delete="${esc(e.name)}">Delete</button></span></div>`).join("") || '<div class="log-row">No escrow entries yet.</div>';
+  window._escrowEntries = escrow.entries;
+  $("#escrow-list").innerHTML = escrow.entries.map(e=>{
+    const clineBtn = e.name === "cline" ? ` <button class="quiet" data-cline-oauth="${esc(e.name)}">Sign in with Cline…</button>` : "";
+    return `<div class="log-row"><span>${esc(e.name)}</span><span>${esc(e.hosts.join(", "))}</span><span class="request">${esc(e.header)}${e.prefix?` · prefix '${esc(e.prefix)}'`:""} · fake <code>${esc(e.fake)}</code></span><span>${e.connected?'<span class="verdict allowed">connected</span>':`<button class="quiet" data-secret="${esc(e.name)}">Set key…</button>`}${clineBtn} <button class="quiet" data-escrow-edit="${esc(e.name)}">Edit</button> <button class="quiet" data-escrow-delete="${esc(e.name)}">Delete</button></span></div>`;
+  }).join("") || '<div class="log-row">No escrow entries yet.</div>';
   $("#mcp-list").innerHTML = mcp.forwards.map(f=>{
     const expiry = f.expires_at ? ` · expires ${new Date(f.expires_at*1000).toLocaleString()}${f.refreshable?" (auto-refresh)":""}` : "";
     const status = f.auth==="oauth" ? `<span class="verdict allowed">OAuth</span>${esc(expiry)} <button class="quiet" data-oauth="${esc(f.name)}">Reauthorize…</button> <button class="quiet" data-oauth-disconnect="${esc(f.name)}">Disconnect</button>`
@@ -87,6 +91,26 @@ async function renderSettings() {
     if (!value) return;
     await fetch(`/api/escrow/${encodeURIComponent(b.dataset.secret)}/secret`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({value})});
     renderSettings();
+  });
+  document.querySelectorAll("[data-cline-oauth]").forEach(b=>b.onclick=async()=>{
+    const r = await fetch(`/api/escrow/${encodeURIComponent(b.dataset.clineOauth)}/cline-oauth/start`,{method:"POST"});
+    if (!r.ok) { alert(`Cline sign-in failed to start: ${await r.text()}`); return; }
+    const {authorize_url} = await r.json();
+    alert(`Complete the Cline sign-in in your browser.\nIf it did not open: ${authorize_url}`);
+    setTimeout(renderSettings, 3000);
+  });
+  document.querySelectorAll("[data-escrow-edit]").forEach(b=>b.onclick=()=>{
+    const entry = window._escrowEntries.find(e=>e.name===b.dataset.escrowEdit);
+    if (!entry) return;
+    $("#e-provider").value = PROVIDER_PRESETS[entry.name] ? entry.name : "custom";
+    $("#e-name").value = entry.name; $("#e-hosts").value = entry.hosts.join(",");
+    $("#e-header").value = entry.header; $("#e-prefix").value = entry.prefix || "";
+    $("#e-guest").value = entry.guest_env || "";
+    $("#e-advanced").open = true;
+    editingEntry = entry.name;
+    $("#escrow-form button[type=submit]").textContent = "Save changes";
+    $("#e-hint").textContent = `Editing '${entry.name}' — the fake key stays the same, so guests keep working. Leave the key field empty to keep the current real key, or paste a new one to rotate it.`;
+    $("#e-real").focus();
   });
   document.querySelectorAll("[data-escrow-delete]").forEach(b=>b.onclick=async()=>{
     if (!confirm(`Delete escrow entry '${b.dataset.escrowDelete}' and its stored real key? Containers holding its fake lose access.`)) return;
@@ -114,9 +138,11 @@ $("#add-container").onsubmit = async (e) => {
   e.target.reset(); refresh();
 };
 
+let editingEntry = null;
+
 $("#escrow-form").onsubmit = async (e) => {
   e.preventDefault();
-  if (!$("#e-provider").value) { alert("Pick a provider (or Custom…) first."); return; }
+  if (!editingEntry && !$("#e-provider").value) { alert("Pick a provider (or Custom…) first."); return; }
   const body = {
     name: $("#e-name").value.trim(),
     hosts: $("#e-hosts").value.split(",").map(h=>h.trim()).filter(Boolean),
@@ -128,8 +154,12 @@ $("#escrow-form").onsubmit = async (e) => {
   if (!body.name || !body.hosts.length || !body.header) {
     alert("Missing name/hosts/header — open Advanced and fill them in."); return;
   }
-  const r = await fetch("/api/escrow",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+  const r = editingEntry
+    ? await fetch(`/api/escrow/${encodeURIComponent(editingEntry)}`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify(body)})
+    : await fetch("/api/escrow",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
   if (!r.ok) { alert(await r.text()); return; }
+  editingEntry = null;
+  $("#escrow-form button[type=submit]").textContent = "Add";
   e.target.reset(); $("#e-hint").textContent = ""; renderSettings();
 };
 

@@ -29,7 +29,11 @@ Open <http://127.0.0.1:8081>.
   masked field, click Add. Hosts/header/env-var are prefilled by the
   preset; the fake key is broker-generated. The in-UI hint says where to
   get each key (for GitHub: a fine-grained PAT, or just `gh auth
-  token`). Delete removes the entry and its stored key together.
+  token`). For Cline, skip the key entirely: add the entry, then click
+  "Sign in with Cline…" — the broker runs the account login in your
+  browser and auto-refreshes tokens from then on. Edit fixes a wrong
+  header/host without changing the fake; Delete removes the entry and
+  its stored key together.
 - **Settings → MCP forwards → Connect (OAuth)** — if you configured
   `mcp-forwards.json` (see below), click Connect; log in when the
   browser opens. Done — the session stays on the host and auto-refreshes
