@@ -79,6 +79,11 @@ chmod +x fz
 sudo ./fz setup --broker http://HOST_IP:8082 --install
 ```
 
+Running under `sudo` is fine: setup detects the invoking user and
+writes the CA, env file, and Cline settings into *their* home
+(`~/.config/friendzone/`, `~/.cline/`), owned by them and
+world-readable — only the CA trust-store install needs root.
+
 This installs the CA into the trust store and writes two files next to
 each other (path is printed; typically `~/.config/friendzone/`):
 

@@ -20,14 +20,17 @@ pub async fn run(
         .context("broker rejected certificate request")?
         .bytes()
         .await?;
-    let path = output.unwrap_or_else(default_cert_path);
+    let target = TargetUser::resolve();
+    let path = output.unwrap_or_else(|| target.config_dir().join("friendzone-ca.pem"));
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        target.adopt(parent);
     }
     fs::write(&path, &cert).with_context(|| format!("write {}", path.display()))?;
+    target.adopt(&path);
     println!("Saved Friendzone CA to {}", path.display());
     let container = container.unwrap_or_else(guest_hostname);
-    fetch_guest_env(broker, &path, &container).await?;
+    fetch_guest_env(broker, &path, &container, &target).await?;
     if install {
         install_ca(&path)?;
     } else {
@@ -35,6 +38,74 @@ pub async fn run(
     }
     print_runtime_instructions(&path);
     Ok(())
+}
+
+/// Who setup is really for. `sudo ./fz setup` runs as root, but the
+/// agent runs as the invoking user: files must land in that user's
+/// home and be owned by them, not vanish into /root (mode 0700).
+struct TargetUser {
+    /// Set when running under sudo for a non-root user.
+    sudo_home: Option<PathBuf>,
+    /// uid/gid to hand written files back to.
+    owner: Option<(u32, u32)>,
+}
+
+impl TargetUser {
+    fn resolve() -> Self {
+        #[cfg(unix)]
+        if let Ok(user) = std::env::var("SUDO_USER")
+            && user != "root"
+        {
+            let home = PathBuf::from("/home").join(&user);
+            if home.is_dir() {
+                let uid = std::env::var("SUDO_UID").ok().and_then(|v| v.parse().ok());
+                let gid = std::env::var("SUDO_GID").ok().and_then(|v| v.parse().ok());
+                return Self {
+                    sudo_home: Some(home),
+                    owner: uid.zip(gid),
+                };
+            }
+        }
+        Self {
+            sudo_home: None,
+            owner: None,
+        }
+    }
+
+    fn home(&self) -> PathBuf {
+        self.sudo_home
+            .clone()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    fn config_dir(&self) -> PathBuf {
+        match &self.sudo_home {
+            Some(home) => home.join(".config").join("friendzone"),
+            None => dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("friendzone"),
+        }
+    }
+
+    /// Hands a written path back to the invoking user and makes it
+    /// world-readable (0755 dirs / 0644 files): everything setup writes
+    /// is non-secret (public CA, worthless fakes, provider config).
+    fn adopt(&self, path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some((uid, gid)) = self.owner {
+                let _ = std::os::unix::fs::chown(path, Some(uid), Some(gid));
+            }
+            if let Ok(metadata) = fs::metadata(path) {
+                let mode = if metadata.is_dir() { 0o755 } else { 0o644 };
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+    }
 }
 
 fn guest_hostname() -> String {
@@ -68,7 +139,12 @@ fn broker_host(broker: &str) -> String {
 /// writes one complete, sourceable env file: proxy vars (with this
 /// container's identity), CA bundles for common runtimes, and the fake
 /// keys. Fakes only; reals never leave the host.
-async fn fetch_guest_env(broker: &str, cert_path: &Path, container: &str) -> Result<()> {
+async fn fetch_guest_env(
+    broker: &str,
+    cert_path: &Path,
+    container: &str,
+    target: &TargetUser,
+) -> Result<()> {
     let base = broker.trim_end_matches('/');
     let url = format!("{base}/bootstrap/env");
     let fakes = reqwest::get(&url)
@@ -107,6 +183,7 @@ async fn fetch_guest_env(broker: &str, cert_path: &Path, container: &str) -> Res
         .unwrap_or_else(|| Path::new("."))
         .join("friendzone-env.sh");
     fs::write(&env_path, &env).with_context(|| format!("write {}", env_path.display()))?;
+    target.adopt(&env_path);
     println!("Container identity:   {container} (override with --container)");
     println!("Wrote guest env to    {}", env_path.display());
     println!();
@@ -115,9 +192,25 @@ async fn fetch_guest_env(broker: &str, cert_path: &Path, container: &str) -> Res
     println!("  . {}", env_path.display());
     println!();
     if let Some(fake_key) = env_export_value(&env, "CLINE_API_KEY") {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        // The agent runs as the invoking user; its Cline reads that
+        // user's ~/.cline, not root's.
+        let home = target.home();
         match write_cline_provider_settings(&home, &fake_key) {
-            Ok(path) => println!("Configured Cline inference (fake key) in {}", path.display()),
+            Ok(path) => {
+                // Hand the whole created chain back: ~/.cline down to
+                // the settings file.
+                let mut current = path.as_path();
+                loop {
+                    target.adopt(current);
+                    match current.parent() {
+                        Some(parent) if parent.starts_with(&home) && parent != home => {
+                            current = parent
+                        }
+                        _ => break,
+                    }
+                }
+                println!("Configured Cline inference (fake key) in {}", path.display());
+            }
             Err(error) => println!("Could not configure Cline settings: {error:#}"),
         }
     }
@@ -189,13 +282,6 @@ fn write_cline_provider_settings(home: &Path, fake_key: &str) -> Result<PathBuf>
     fs::write(&path, serde_json::to_string_pretty(&root)?)
         .with_context(|| format!("write {}", path.display()))?;
     Ok(path)
-}
-
-fn default_cert_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("friendzone")
-        .join("friendzone-ca.pem")
 }
 
 fn install_ca(path: &Path) -> Result<()> {
