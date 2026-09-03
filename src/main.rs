@@ -119,6 +119,19 @@ async fn run_broker(
     }
     let settings = settings::Settings::load(&data_dir)?;
     let mcp_state = mcp::McpState::new(state.clone(), forwards.clone(), settings.clone());
+    let guest_binaries = web::discover_guest_binaries(&data_dir);
+    if guest_binaries.is_empty() {
+        println!(
+            "Guest binaries:       none beyond the host's own ({}-{}); cross-OS guests need builds in {}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            data_dir.join("guest-bin").display()
+        );
+    } else {
+        let mut names: Vec<_> = guest_binaries.keys().cloned().collect();
+        names.sort();
+        println!("Guest binaries:       {}", names.join(", "));
+    }
     println!("Friendzone data:      {}", data_dir.display());
     println!("Friendzone proxy:     http://{proxy_addr}");
     println!("Friendzone UI:        http://{ui_addr}");

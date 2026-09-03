@@ -33,21 +33,36 @@ logging, and the kill switch.
 
 ## Set up a guest
 
-The broker also exposes its current-platform binary at
-`http://HOST_IP:8082/bootstrap/fz`. On a matching guest:
+The broker exposes its own binary at `http://HOST_IP:8082/bootstrap/fz`
+— right only when the guest matches the host's OS/arch. **A Windows
+host serving a Linux VM (the common case) must provide a cross-built
+binary**: drop it into `<data-dir>/guest-bin/` (e.g.
+`guest-bin/fz-linux-x86_64`), restart the broker, and guests fetch it
+by name. `GET /bootstrap/targets` lists what is available; the broker
+also prints it at startup.
+
+Cross-building the Linux guest binary from a Windows host:
+
+```powershell
+rustup target add x86_64-unknown-linux-musl
+cargo install cross          # uses Docker/Podman for the cross toolchain
+cross build --release --target x86_64-unknown-linux-musl
+copy target\x86_64-unknown-linux-musl\release\fz `
+  "$env:LOCALAPPDATA\friendzone\guest-bin\fz-linux-x86_64"
+```
+
+(musl gives a static binary that runs on any distro; without Docker,
+WSL with `cargo build --target x86_64-unknown-linux-musl` also works.)
+
+On a Linux guest of a Windows host:
 
 ```text
-curl -o fz http://HOST_IP:8082/bootstrap/fz
-chmod +x fz                  # Unix guests
+curl -o fz http://HOST_IP:8082/bootstrap/fz/fz-linux-x86_64
+chmod +x fz
 ./fz setup --broker http://HOST_IP:8082 --install
 ```
 
-For a guest with a different OS or architecture, copy an appropriate `fz`
-build into the VM, then run:
-
-```text
-fz setup --broker http://HOST_IP:8082 --install
-```
+On a guest matching the host platform, `/bootstrap/fz` works as before.
 
 Without `--install`, setup saves the certificate and prints manual and
 per-runtime instructions. Installation may require an elevated shell.

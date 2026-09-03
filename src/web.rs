@@ -25,9 +25,34 @@ struct UiState {
 #[derive(Clone)]
 struct BootstrapState {
     cert: Arc<String>,
+    /// The broker's own binary: right only for guests matching the host.
     binary: Arc<Vec<u8>>,
+    /// Cross-built guest binaries dropped into `<data-dir>/guest-bin/`,
+    /// keyed by file name (e.g. `fz-linux-x86_64`).
+    guest_binaries: Arc<std::collections::HashMap<String, std::path::PathBuf>>,
     mcp: crate::mcp::McpState,
     settings: crate::settings::Settings,
+}
+
+/// Scans `<data-dir>/guest-bin/` for cross-built `fz` binaries to serve
+/// to guests whose OS/arch differ from the host's. Any regular file
+/// counts; the file name is the target label.
+pub fn discover_guest_binaries(
+    data_dir: &std::path::Path,
+) -> std::collections::HashMap<String, std::path::PathBuf> {
+    let dir = data_dir.join("guest-bin");
+    let mut found = std::collections::HashMap::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            {
+                found.insert(name.to_owned(), path.clone());
+            }
+        }
+    }
+    found
 }
 
 pub async fn serve_ui(
@@ -61,11 +86,13 @@ pub async fn serve_bootstrap(
     let binary = tokio::fs::read(&executable)
         .await
         .with_context(|| format!("read {}", executable.display()))?;
+    let guest_binaries = discover_guest_binaries(settings.data_dir());
     serve(
         addr,
         bootstrap_router(BootstrapState {
             cert: Arc::new(cert_pem),
             binary: Arc::new(binary),
+            guest_binaries: Arc::new(guest_binaries),
             mcp,
             settings,
         }),
@@ -396,6 +423,8 @@ fn bootstrap_router(state: BootstrapState) -> Router {
     Router::new()
         .route("/bootstrap/ca.pem", get(certificate))
         .route("/bootstrap/fz", get(binary))
+        .route("/bootstrap/fz/{target}", get(guest_binary))
+        .route("/bootstrap/targets", get(bootstrap_targets))
         .route("/bootstrap/env", get(bootstrap_env))
         .route("/mcp/{name}", post(mcp_message))
         .route("/health", get(|| async { "ok" }))
@@ -502,6 +531,67 @@ async fn set_killed(
     StatusCode::NO_CONTENT
 }
 
+/// What this broker can bootstrap: the host binary's platform plus any
+/// cross-built binaries in guest-bin/. Guests (and humans) check here
+/// before downloading.
+async fn bootstrap_targets(State(state): State<BootstrapState>) -> Json<serde_json::Value> {
+    let mut targets: Vec<String> = state.guest_binaries.keys().cloned().collect();
+    targets.sort();
+    Json(serde_json::json!({
+        "host_platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        "host_binary": "/bootstrap/fz",
+        "guest_binaries": targets
+            .iter()
+            .map(|name| format!("/bootstrap/fz/{name}"))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// Serves a cross-built guest binary by file name. The directory is
+/// scanned at startup (new files need a broker restart), but content is
+/// read per request, so rebuilding an already-known binary is picked up
+/// live. Lookup is by exact name from the scanned map, never by a path
+/// from the client.
+async fn guest_binary(
+    State(state): State<BootstrapState>,
+    Path(target): Path<String>,
+) -> impl IntoResponse {
+    let Some(path) = state.guest_binaries.get(&target) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!(
+                "no guest binary '{target}'; available: {} (drop cross-built binaries into <data-dir>/guest-bin/ and restart)",
+                state
+                    .guest_binaries
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+            .into_response();
+    };
+    match tokio::fs::read(path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename={target}"),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("read {}: {error}", path.display()),
+        )
+            .into_response(),
+    }
+}
+
 async fn binary(State(state): State<BootstrapState>) -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -547,9 +637,14 @@ mod tests {
 
     fn bootstrap_app() -> Router {
         let settings = test_settings();
+        let mut guest_binaries = std::collections::HashMap::new();
+        let linux_bin = settings.data_dir().join("fz-linux-x86_64");
+        std::fs::write(&linux_bin, b"\x7fELF-test").unwrap();
+        guest_binaries.insert("fz-linux-x86_64".to_owned(), linux_bin);
         bootstrap_router(BootstrapState {
             cert: Arc::new("CERTIFICATE".into()),
             binary: Arc::new(vec![1, 2, 3]),
+            guest_binaries: Arc::new(guest_binaries),
             mcp: crate::mcp::McpState::new(
                 crate::state::AppState::default(),
                 Vec::new(),
@@ -557,6 +652,52 @@ mod tests {
             ),
             settings,
         })
+    }
+
+    #[tokio::test]
+    async fn guest_binary_served_by_target_name() {
+        let response = bootstrap_app()
+            .oneshot(
+                Request::get("/bootstrap/fz/fz-linux-x86_64")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=fz-linux-x86_64"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_guest_target_lists_available() {
+        let response = bootstrap_app()
+            .oneshot(
+                Request::get("/bootstrap/fz/fz-plan9-mips")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("fz-linux-x86_64"), "404 names what exists: {text}");
+    }
+
+    #[tokio::test]
+    async fn targets_manifest_names_host_and_guests() {
+        let response = bootstrap_app()
+            .oneshot(Request::get("/bootstrap/targets").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["guest_binaries"][0], "/bootstrap/fz/fz-linux-x86_64");
+        assert!(json["host_platform"].as_str().unwrap().contains('-'));
     }
 
     #[tokio::test]

@@ -63,8 +63,18 @@ Restart the broker after editing it.
 
 ## 3. Container: bootstrap
 
+Cross-OS note: `/bootstrap/fz` is the *host's* binary. A Windows host
+serving a Linux VM must provide a Linux build first — cross-build it
+(see README "Set up a guest") and drop it in
+`<data-dir>/guest-bin/fz-linux-x86_64`, then restart the broker.
+`curl http://HOST_IP:8082/bootstrap/targets` shows what's available.
+
 ```sh
+# Linux guest of a Windows host:
+curl -o fz http://HOST_IP:8082/bootstrap/fz/fz-linux-x86_64
+# Guest matching the host platform:
 curl -o fz http://HOST_IP:8082/bootstrap/fz
+
 chmod +x fz
 sudo ./fz setup --broker http://HOST_IP:8082 --install
 ```
