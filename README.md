@@ -34,41 +34,30 @@ logging, and the kill switch.
 ## Set up a guest
 
 The broker exposes its own binary at `http://HOST_IP:8082/bootstrap/fz`
-— right only when the guest matches the host's OS/arch. **A Windows
-host serving a Linux VM (the common case) must provide a cross-built
-binary**: drop it into `<data-dir>/guest-bin/` (e.g.
-`guest-bin/fz-linux-x86_64`), restart the broker, and guests fetch it
-by name. `GET /bootstrap/targets` lists what is available; the broker
-also prints it at startup.
+— right only when the guest matches the host's OS/arch.
 
-Getting the Linux guest binary onto a Windows host, easiest first:
-
-1. **From CI** (no local toolchain needed): the `guest-binary` GitHub
-   workflow builds `fz-linux-x86_64` on every push to master. Fetch it
-   with `scripts/get-linux-guest-binary.ps1`, which downloads the
-   latest artifact into `guest-bin/` via `gh run download`.
-2. **Cross-build locally** (needs Docker/Podman or WSL):
-
-   ```powershell
-   rustup target add x86_64-unknown-linux-musl
-   cargo install cross       # uses Docker/Podman for the cross toolchain
-   cross build --release --target x86_64-unknown-linux-musl
-   copy target\x86_64-unknown-linux-musl\release\fz `
-     "$env:LOCALAPPDATA\friendzone\guest-bin\fz-linux-x86_64"
-   ```
-
-   (musl gives a static binary that runs on any distro; without Docker,
-   build inside WSL instead.)
-
-On a Linux guest of a Windows host:
+For a guest with a different OS (e.g. a Linux VM on a Windows host),
+build `fz` inside the guest from the repo:
 
 ```text
-curl -o fz http://HOST_IP:8082/bootstrap/fz/fz-linux-x86_64
-chmod +x fz
-./fz setup --broker http://HOST_IP:8082 --install
+git clone https://github.com/dominiccooney/friendzone
+cd friendzone && cargo build --release
+sudo ./target/release/fz setup --broker http://HOST_IP:8082 --install
 ```
 
-On a guest matching the host platform, `/bootstrap/fz` works as before.
+Optionally copy the built binary to the host's `<data-dir>/guest-bin/`
+(e.g. as `fz-linux-x86_64`) and restart the broker; further guests of
+that platform can then skip the build and fetch it from
+`/bootstrap/fz/fz-linux-x86_64` (`GET /bootstrap/targets` lists what is
+available; the broker prints it at startup).
+
+On a guest matching the host platform:
+
+```text
+curl -o fz http://HOST_IP:8082/bootstrap/fz
+chmod +x fz
+sudo ./fz setup --broker http://HOST_IP:8082 --install
+```
 
 Without `--install`, setup saves the certificate and prints manual and
 per-runtime instructions. Installation may require an elevated shell.

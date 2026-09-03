@@ -127,7 +127,7 @@ async fn run_broker(
     let guest_binaries = web::discover_guest_binaries(&data_dir);
     if guest_binaries.is_empty() {
         println!(
-            "Guest binaries:       none beyond the host's own ({}-{}). For Linux guests, run scripts/get-linux-guest-binary.ps1 (downloads the CI build into {}), then restart.",
+            "Guest binaries:       none beyond the host's own ({}-{}). Cross-OS guests: build fz in the guest (cargo build --release), or drop builds into {} to serve them.",
             std::env::consts::OS,
             std::env::consts::ARCH,
             data_dir.join("guest-bin").display()
