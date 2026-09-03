@@ -295,6 +295,13 @@ mod tests {
             .unwrap();
         assert_eq!(updated.fake, fake_before, "guests keep their fake across edits");
         assert_eq!(updated.header, "x-api-key");
+        // Editing routing fields must never touch the stored real key:
+        // an edit with no key pasted keeps the credential working.
+        assert_eq!(
+            settings.secret("anthropic").as_deref(),
+            Some("sk-ant-real"),
+            "real key survives an edit"
+        );
         assert!(settings.update_entry("missing", vec![], "h".into(), String::new(), None).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
