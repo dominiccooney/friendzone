@@ -146,7 +146,13 @@ no editor redirect. Tokens are registered with Cline's backend and
 auto-refresh from then on.
 
 `fz setup` fetches the fakes into the guest as `friendzone-env.sh`;
-source it in the agent's shell.
+source it in the agent's shell. When the fakes include `CLINE_API_KEY`,
+setup also writes `~/.cline/data/settings/providers.json` (the settings
+file Cline's CLI, IDE extension, and SDK share) registering the `cline`
+provider with the fake key, so Cline inference works in the guest with
+no `cline auth`. The write is merge-safe: other providers, the user's
+model choice, and `lastUsedProvider` are preserved; only the `cline`
+provider's key is set.
 
 Substitution requires an exact fake match on a pinned host: a random
 key passes through untouched, and a fake sent toward any non-pinned

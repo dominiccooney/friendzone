@@ -72,6 +72,11 @@ each other (path is printed; typically `~/.config/friendzone/`):
 - `friendzone-ca.pem` — the CA for runtimes with their own bundle
 - `friendzone-env.sh` — the fake credentials, as `export` lines
 
+If a `CLINE_API_KEY` fake exists, setup also writes
+`~/.cline/data/settings/providers.json` registering the `cline`
+provider with the fake key — Cline CLI/IDE inference works immediately,
+no `cline auth`. Existing Cline settings are merged, never clobbered.
+
 ## 4. Container: agent shell environment
 
 ```sh
