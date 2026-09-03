@@ -19,8 +19,8 @@
       <div id="containers" class="containers"></div>
     </section>
     <section id="log-view" class="view">
-      <div class="page-heading"><div><h1>Request log</h1><p>Recent requests intercepted by the proxy.</p></div><div class="live"><span class="pulse"></span> Live</div></div>
-      <div class="filters"><input id="search" type="search" placeholder="Search method, URL, or container"><select id="container-filter"><option value="">All containers</option></select><select id="verdict-filter"><option value="">All verdicts</option><option>allowed</option><option>failed</option></select></div>
+      <div class="page-heading"><div><h1>Request log</h1><p>Recent requests intercepted by the proxy. Updates every 2 seconds.</p></div></div>
+      <div class="filters"><input id="search" type="search" placeholder="Search method, URL, status, detail, or container"><select id="container-filter"><option value="">All containers</option></select><select id="verdict-filter"><option value="">All verdicts</option><option>allowed</option><option>blocked</option></select></div>
       <div class="log-table"><div class="log-head"><span>Time</span><span>Container</span><span>Request</span><span>Verdict</span></div><div id="requests"></div></div>
     </section>
     <section id="settings-view" class="view">
@@ -54,8 +54,14 @@
       </form>
       <h2>MCP forwards</h2>
       <div id="mcp-list" class="log-table"></div>
+      <details id="mcp-editor-details">
+        <summary class="meta">Edit mcp-forwards.json…</summary>
+        <textarea id="mcp-editor" rows="12" spellcheck="false" style="width:100%;font-family:monospace"></textarea>
+        <div class="filters"><button id="mcp-save" type="button">Save &amp; apply</button><button id="mcp-reload" type="button" class="quiet">Reload from disk</button><span id="mcp-editor-status" class="meta"></span></div>
+      </details>
       <h2>Guest environment</h2>
-      <p>Fake keys for the container; <code>fz setup</code> fetches these automatically.</p>
+      <p>Fake keys for the container; <code>fz setup</code> fetches these automatically, or pull them by hand:</p>
+      <pre id="guest-env-curl"></pre>
       <pre id="guest-env"></pre>
     </section>
   </main>

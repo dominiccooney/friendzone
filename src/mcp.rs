@@ -225,31 +225,75 @@ async fn parse_body(response: reqwest::Response) -> Result<Value> {
     }
 }
 
+/// Shared, reloadable set of forwards: the UI edits the file and calls
+/// reload; the MCP endpoint reads through it per message.
 #[derive(Clone)]
-pub struct McpState {
-    pub app: AppState,
-    pub forwards: Arc<HashMap<String, Arc<Forward>>>,
+pub struct ForwardRegistry {
+    data_dir: std::path::PathBuf,
+    settings: crate::settings::Settings,
+    forwards: Arc<std::sync::RwLock<HashMap<String, Arc<Forward>>>>,
 }
 
-impl McpState {
-    pub fn new(
-        app: AppState,
-        configs: Vec<ForwardConfig>,
-        settings: crate::settings::Settings,
-    ) -> Self {
-        let forwards = configs
+impl ForwardRegistry {
+    pub fn load(data_dir: &Path, settings: crate::settings::Settings) -> Result<Self> {
+        let registry = Self {
+            data_dir: data_dir.to_owned(),
+            settings,
+            forwards: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        };
+        registry.reload()?;
+        Ok(registry)
+    }
+
+    /// Re-reads mcp-forwards.json and rebuilds the forwards. Upstream
+    /// sessions restart lazily; container-side sessions are stateless
+    /// here, so agents just keep calling.
+    pub fn reload(&self) -> Result<usize> {
+        let configs = load_forwards(&self.data_dir)?;
+        let rebuilt: HashMap<String, Arc<Forward>> = configs
             .into_iter()
             .map(|config| {
                 (
                     config.name.clone(),
-                    Arc::new(Forward::new(config, settings.clone())),
+                    Arc::new(Forward::new(config, self.settings.clone())),
                 )
             })
             .collect();
-        Self {
-            app,
-            forwards: Arc::new(forwards),
-        }
+        let count = rebuilt.len();
+        *self.forwards.write().expect("forwards lock") = rebuilt;
+        Ok(count)
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<Forward>> {
+        self.forwards.read().expect("forwards lock").get(name).cloned()
+    }
+
+    pub fn configs(&self) -> Vec<ForwardConfig> {
+        let mut configs: Vec<ForwardConfig> = self
+            .forwards
+            .read()
+            .expect("forwards lock")
+            .values()
+            .map(|forward| forward.config.clone())
+            .collect();
+        configs.sort_by(|a, b| a.name.cmp(&b.name));
+        configs
+    }
+
+    pub fn config_path(&self) -> std::path::PathBuf {
+        forwards_path(&self.data_dir)
+    }
+}
+
+#[derive(Clone)]
+pub struct McpState {
+    pub app: AppState,
+    pub registry: ForwardRegistry,
+}
+
+impl McpState {
+    pub fn new(app: AppState, registry: ForwardRegistry) -> Self {
+        Self { app, registry }
     }
 }
 
@@ -263,13 +307,20 @@ pub async fn handle_message(state: &McpState, name: &str, container: &str, messa
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let Some(forward) = state.forwards.get(name) else {
+    let Some(forward) = state.registry.get(name) else {
         return error_response(id, -32601, &format!("unknown MCP forward '{name}'"));
     };
     if state.app.is_killed(container) {
         return error_response(id, -32000, "container is killed");
     }
-    let (verdict, response) = dispatch(forward, &method, id, &message).await;
+    if !state.app.is_approved(container) {
+        return error_response(
+            id,
+            -32000,
+            "container awaiting approval; approve it in the friendzone UI",
+        );
+    }
+    let (verdict, response) = dispatch(&forward, &method, id, &message).await;
     state.app.record(
         container.to_owned(),
         format!("MCP {method}"),

@@ -184,7 +184,29 @@ async fn fetch_guest_env(
         .join("friendzone-env.sh");
     fs::write(&env_path, &env).with_context(|| format!("write {}", env_path.display()))?;
     target.adopt(&env_path);
+    // Announce this guest so a join request appears in the UI now.
+    let approved = reqwest::get(format!(
+        "{base}/bootstrap/hello?container={}",
+        urlencoding_min(container)
+    ))
+    .await
+    .ok();
+    let approved = match approved {
+        Some(response) => response
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("approved").and_then(serde_json::Value::as_bool)),
+        None => None,
+    };
     println!("Container identity:   {container} (override with --container)");
+    match approved {
+        Some(true) => println!("Broker approval:      approved — traffic will flow"),
+        Some(false) => println!(
+            "Broker approval:      awaiting approval — open the friendzone UI inbox and approve '{container}'"
+        ),
+        None => println!("Broker approval:      could not check (broker unreachable?)"),
+    }
     println!("Wrote guest env to    {}", env_path.display());
     println!();
     println!("Copy-paste to activate now, and add to the agent's shell profile:");
@@ -215,6 +237,16 @@ async fn fetch_guest_env(
         }
     }
     Ok(())
+}
+
+/// Percent-encodes the few characters plausible in a container name.
+fn urlencoding_min(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace(' ', "%20")
+        .replace('&', "%26")
+        .replace('#', "%23")
+        .replace('?', "%3F")
 }
 
 /// Extracts `export NAME=value` from the fetched env file.

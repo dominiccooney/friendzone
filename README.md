@@ -23,13 +23,15 @@ under the operating system's local application-data directory in
 ## Containers
 
 Containers are dynamic; the launch command never names them. A container
-is identified by the username in its proxy credentials, and appears in
-the UI the moment it first connects. You can also add one ahead of time
-(Inbox → "Add container") so its section exists before the VM boots, and
-remove one after tearing down its VM (its log rows remain for audit).
-Kill/Resume stops a container's traffic reversibly; Remove forgets it.
-Give every container a distinct username — it is the unit of identity,
-logging, and the kill switch.
+is identified by the username in its proxy credentials. **Unknown
+containers are denied**: first contact (traffic or `fz setup`) creates a
+join request in the Inbox, and nothing flows until you approve it —
+"Approve + pin IP" also locks the name to the address it connected
+from, so containers cannot use each other's names. Pins are editable
+per container (Pin…; empty = any address). "Add container"
+pre-approves a name (wildcard address) before its VM boots. Kill/Resume
+stops traffic reversibly; Remove forgets the container (its log rows
+remain for audit).
 
 ## Set up a guest
 
@@ -58,6 +60,12 @@ curl -o fz http://HOST_IP:8082/bootstrap/fz
 chmod +x fz
 sudo ./fz setup --broker http://HOST_IP:8082 --install
 ```
+
+`/bootstrap/fz` also takes a platform query — `?linux`, `?win`,
+`?macos` — which serves a matching build from `guest-bin/` (the bare
+URL always serves the host's own binary). Setup ends by announcing the
+container to the broker: if it is not yet approved, setup says so and
+the join request is already waiting in the UI inbox.
 
 Without `--install`, setup saves the certificate and prints manual and
 per-runtime instructions. Installation may require an elevated shell.
@@ -184,8 +192,11 @@ through untouched.
 
 ## Current scope
 
-Working now: multi-container identity with dynamic add/remove and a
-reversible kill switch; GitHub read/write policy (reads flow, writes
+Working now: multi-container identity with join-request approval, IP
+pinning, dynamic add/remove, and a
+reversible kill switch; request log with HTTP status, inference token
+counts, and working search; in-UI MCP forwards editing with live
+reload; GitHub read/write policy (reads flow, writes
 block with a note); credential escrow with exact-fake-match,
 host-pinned substitution and leak blocking, provider presets, and
 add/edit/delete from the settings UI; Cline account sign-in with
@@ -194,8 +205,8 @@ with tool allowlists and host-side OAuth (discovery, dynamic client
 registration, PKCE, refresh, reauthorize/disconnect); guest bootstrap
 of the CA, `fz` binary, and fake credentials.
 
-Not yet: proxy password validation (the username is trusted labeling,
-not authentication), new-container acknowledgement gating, the
+Not yet: proxy password validation (identity is name + approval + IP
+pin, not a secret), the
 pending-request inbox (GitHub writes 403 instead of queueing),
 rulesets, on-disk log retention, OS-secret-store credentials,
 stdio MCP servers, Hyper-V/tart network provisioning

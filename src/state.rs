@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
@@ -24,6 +24,10 @@ pub struct RequestEvent {
     pub method: String,
     pub url: String,
     pub verdict: Verdict,
+    /// Upstream HTTP status, once the response was seen.
+    pub status: Option<u16>,
+    /// Parsed summary for known providers, e.g. token counts.
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -33,6 +37,19 @@ pub struct ContainerView {
     pub state: &'static str,
     pub last_activity: DateTime<Utc>,
     pub request_count: usize,
+    pub approved: bool,
+    /// None = any address (wildcard).
+    pub pinned_ip: Option<String>,
+}
+
+/// Verdict of the container gate, checked before any policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Authorization {
+    Allowed,
+    /// Unknown or not yet approved: a join request exists in the UI.
+    Pending,
+    /// Known name from the wrong address.
+    IpMismatch,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -43,8 +60,15 @@ pub struct StateView {
 
 #[derive(Clone, Debug)]
 struct ContainerRecord {
+    #[allow(dead_code)]
     created: DateTime<Utc>,
     last_activity: DateTime<Utc>,
+    /// Unapproved containers are join requests: traffic denied.
+    approved: bool,
+    /// Approved traffic must come from this IP; None = any.
+    pinned_ip: Option<IpAddr>,
+    /// Last source address seen, to make pinning one click.
+    last_ip: Option<IpAddr>,
 }
 
 #[derive(Default)]
@@ -59,15 +83,24 @@ struct StateData {
 }
 
 impl StateData {
-    fn touch_container(&mut self, name: &str) {
+    /// Records activity. A previously unknown name becomes a *pending*
+    /// container (a join request), never an approved one.
+    fn touch_container(&mut self, name: &str, ip: Option<IpAddr>) {
         let now = Utc::now();
-        self.containers
+        let record = self
+            .containers
             .entry(name.to_owned())
-            .and_modify(|record| record.last_activity = now)
             .or_insert(ContainerRecord {
                 created: now,
                 last_activity: now,
+                approved: false,
+                pinned_ip: None,
+                last_ip: None,
             });
+        record.last_activity = now;
+        if ip.is_some() {
+            record.last_ip = ip;
+        }
     }
 }
 
@@ -75,19 +108,36 @@ impl StateData {
 pub struct AppState(Arc<RwLock<StateData>>);
 
 impl AppState {
-    pub fn record(&self, container: String, method: String, url: String, verdict: Verdict) {
+    pub fn record(&self, container: String, method: String, url: String, verdict: Verdict) -> Uuid {
         let mut state = self.0.write().expect("state lock poisoned");
-        state.touch_container(&container);
+        state.touch_container(&container, None);
+        let id = Uuid::new_v4();
         state.requests.push(RequestEvent {
-            id: Uuid::new_v4(),
+            id,
             at: Utc::now(),
             container,
             method,
             url,
             verdict,
+            status: None,
+            detail: None,
         });
         if state.requests.len() > 1000 {
             state.requests.drain(..100);
+        }
+        id
+    }
+
+    /// Backfills response facts onto a logged request.
+    pub fn annotate(&self, id: Uuid, status: Option<u16>, detail: Option<String>) {
+        let mut state = self.0.write().expect("state lock poisoned");
+        if let Some(event) = state.requests.iter_mut().rev().find(|e| e.id == id) {
+            if status.is_some() {
+                event.status = status;
+            }
+            if detail.is_some() {
+                event.detail = detail;
+            }
         }
     }
 
@@ -98,7 +148,7 @@ impl AppState {
     ) -> String {
         let mut state = self.0.write().expect("state lock poisoned");
         if let Some(username) = presented_username {
-            state.touch_container(&username);
+            state.touch_container(&username, Some(peer.ip()));
             state
                 .connection_identities
                 .insert(peer, (username.clone(), Instant::now()));
@@ -117,10 +167,62 @@ impl AppState {
         }
     }
 
-    /// Registers a container before any traffic, e.g. from the UI.
+    /// The container gate: known + approved + right address, checked
+    /// before any policy. Unknown names become pending join requests.
+    pub fn authorize(&self, container: &str, peer_ip: IpAddr) -> Authorization {
+        let mut state = self.0.write().expect("state lock poisoned");
+        state.touch_container(container, Some(peer_ip));
+        let record = state.containers.get(container).expect("just touched");
+        if !record.approved {
+            return Authorization::Pending;
+        }
+        match record.pinned_ip {
+            Some(pinned) if pinned != peer_ip => Authorization::IpMismatch,
+            _ => Authorization::Allowed,
+        }
+    }
+
+    /// Approval check without an address (used where the peer IP is
+    /// not available, e.g. the MCP endpoint).
+    pub fn is_approved(&self, container: &str) -> bool {
+        self.0
+            .read()
+            .expect("state lock poisoned")
+            .containers
+            .get(container)
+            .is_some_and(|record| record.approved)
+    }
+
+    /// Registers a pre-approved container from the UI (wildcard IP
+    /// until pinned).
     pub fn add_container(&self, name: &str) {
         let mut state = self.0.write().expect("state lock poisoned");
-        state.touch_container(name);
+        state.touch_container(name, None);
+        state
+            .containers
+            .get_mut(name)
+            .expect("just touched")
+            .approved = true;
+    }
+
+    /// Approves a join request, optionally pinning it to the address it
+    /// last connected from.
+    pub fn approve_container(&self, name: &str, pin_to_last_ip: bool) {
+        let mut state = self.0.write().expect("state lock poisoned");
+        if let Some(record) = state.containers.get_mut(name) {
+            record.approved = true;
+            if pin_to_last_ip {
+                record.pinned_ip = record.last_ip;
+            }
+        }
+    }
+
+    /// Sets or clears (None = wildcard) a container's pinned IP.
+    pub fn set_pinned_ip(&self, name: &str, ip: Option<IpAddr>) {
+        let mut state = self.0.write().expect("state lock poisoned");
+        if let Some(record) = state.containers.get_mut(name) {
+            record.pinned_ip = ip;
+        }
     }
 
     /// Removes a container: registry entry, kill flag, and connection
@@ -166,11 +268,18 @@ impl AppState {
                 name: id.clone(),
                 state: if state.killed.contains(id) {
                     "killed"
+                } else if !record.approved {
+                    "pending"
                 } else {
                     "working"
                 },
                 last_activity: record.last_activity,
                 request_count: request_counts.get(id.as_str()).copied().unwrap_or(0),
+                approved: record.approved,
+                pinned_ip: record
+                    .pinned_ip
+                    .map(|ip| ip.to_string())
+                    .or_else(|| record.last_ip.map(|ip| format!("~{ip}"))),
             })
             .collect();
         containers.sort_by_key(|container| std::cmp::Reverse(container.last_activity));
@@ -184,6 +293,27 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_gate_denies_unknown_and_wrong_ip() {
+        let state = AppState::default();
+        let ip1: IpAddr = "10.0.0.5".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.6".parse().unwrap();
+        // Unknown container: pending join request, denied.
+        assert_eq!(state.authorize("stranger", ip1), Authorization::Pending);
+        assert!(state.view().containers.iter().any(|c| c.id == "stranger" && c.state == "pending"));
+        // Approve and pin to the IP it came from.
+        state.approve_container("stranger", true);
+        assert_eq!(state.authorize("stranger", ip1), Authorization::Allowed);
+        // Same name from a different address: name-guessing is denied.
+        assert_eq!(state.authorize("stranger", ip2), Authorization::IpMismatch);
+        // Clearing the pin allows any address again.
+        state.set_pinned_ip("stranger", None);
+        assert_eq!(state.authorize("stranger", ip2), Authorization::Allowed);
+        // UI-added containers are pre-approved with wildcard IP.
+        state.add_container("reviewer");
+        assert_eq!(state.authorize("reviewer", ip2), Authorization::Allowed);
+    }
 
     #[test]
     fn containers_add_and_remove_dynamically() {

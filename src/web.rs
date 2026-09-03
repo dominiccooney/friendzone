@@ -16,10 +16,11 @@ use crate::state::{AppState, StateView};
 struct UiState {
     app: AppState,
     settings: crate::settings::Settings,
-    forwards: Arc<Vec<crate::mcp::ForwardConfig>>,
+    registry: crate::mcp::ForwardRegistry,
     oauth: crate::oauth::OauthFlows,
     cline: crate::oauth::ClineFlows,
     ui_addr: SocketAddr,
+    bootstrap_port: u16,
 }
 
 #[derive(Clone)]
@@ -60,17 +61,19 @@ pub async fn serve_ui(
     addr: SocketAddr,
     state: AppState,
     settings: crate::settings::Settings,
-    forwards: Vec<crate::mcp::ForwardConfig>,
+    registry: crate::mcp::ForwardRegistry,
+    bootstrap_port: u16,
 ) -> Result<()> {
     serve(
         addr,
         ui_router(UiState {
             app: state,
             settings,
-            forwards: Arc::new(forwards),
+            registry,
             oauth: crate::oauth::OauthFlows::default(),
             cline: crate::oauth::ClineFlows::default(),
             ui_addr: addr,
+            bootstrap_port,
         }),
         "web UI",
     )
@@ -109,9 +112,12 @@ async fn serve(addr: SocketAddr, app: Router, name: &'static str) -> Result<()> 
         .await
         .with_context(|| format!("bind {name} to {addr}"))?;
     tracing::info!(%addr, "{name} listening");
-    axum::serve(listener, app)
-        .await
-        .with_context(|| format!("serve {name}"))
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .with_context(|| format!("serve {name}"))
 }
 
 fn ui_router(state: UiState) -> Router {
@@ -126,6 +132,8 @@ fn ui_router(state: UiState) -> Router {
             axum::routing::delete(remove_container),
         )
         .route("/api/containers/{id}/kill", post(set_killed))
+        .route("/api/containers/{id}/approve", post(approve_container))
+        .route("/api/containers/{id}/pin", post(set_container_pin))
         .route("/api/escrow", get(list_escrow).post(add_escrow))
         .route(
             "/api/escrow/{name}",
@@ -134,6 +142,8 @@ fn ui_router(state: UiState) -> Router {
         .route("/api/escrow/{name}/secret", post(set_escrow_secret))
         .route("/api/guest-env", get(guest_env))
         .route("/api/mcp", get(list_forwards))
+        .route("/api/mcp/config", get(get_mcp_config).put(put_mcp_config))
+        .route("/api/mcp/reload", post(reload_mcp_config))
         .route("/api/mcp/{name}/oauth/start", post(oauth_start))
         .route("/api/mcp/{name}/oauth", axum::routing::delete(oauth_disconnect))
         .route("/oauth/callback", get(oauth_callback))
@@ -276,7 +286,11 @@ async fn set_escrow_secret(
 async fn guest_env(State(state): State<UiState>) -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        state.settings.guest_env_lines(),
+        format!(
+            "# Fetch from a guest: curl http://HOST_IP:{}/bootstrap/env\n{}",
+            state.bootstrap_port,
+            state.settings.guest_env_lines()
+        ),
     )
 }
 
@@ -285,7 +299,8 @@ async fn guest_env(State(state): State<UiState>) -> impl IntoResponse {
 /// static keys (managed outside).
 async fn list_forwards(State(state): State<UiState>) -> Json<serde_json::Value> {
     let forwards: Vec<serde_json::Value> = state
-        .forwards
+        .registry
+        .configs()
         .iter()
         .map(|f| {
             let session = crate::oauth::TokenRecord::load(&state.settings, &f.name);
@@ -315,10 +330,46 @@ async fn list_forwards(State(state): State<UiState>) -> Json<serde_json::Value> 
         .collect();
     Json(serde_json::json!({
         "forwards": forwards,
-        "config_path": crate::mcp::forwards_path(state.settings.data_dir())
-            .display()
-            .to_string(),
+        "config_path": state.registry.config_path().display().to_string(),
     }))
+}
+
+/// The raw mcp-forwards.json for in-UI editing.
+async fn get_mcp_config(State(state): State<UiState>) -> impl IntoResponse {
+    let path = state.registry.config_path();
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| "[]".to_owned());
+    ([(header::CONTENT_TYPE, "application/json; charset=utf-8")], text)
+}
+
+/// Saves mcp-forwards.json (validated first) and reloads the forwards.
+async fn put_mcp_config(State(state): State<UiState>, body: String) -> impl IntoResponse {
+    if let Err(error) = serde_json::from_str::<Vec<crate::mcp::ForwardConfig>>(&body) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("not a valid forwards config: {error}"),
+        )
+            .into_response();
+    }
+    let path = state.registry.config_path();
+    if let Err(error) = std::fs::write(&path, &body) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write {}: {error}", path.display()),
+        )
+            .into_response();
+    }
+    match state.registry.reload() {
+        Ok(count) => Json(serde_json::json!({ "forwards": count })).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")).into_response(),
+    }
+}
+
+/// Re-reads mcp-forwards.json from disk (for out-of-band edits).
+async fn reload_mcp_config(State(state): State<UiState>) -> impl IntoResponse {
+    match state.registry.reload() {
+        Ok(count) => Json(serde_json::json!({ "forwards": count })).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, format!("{error:#}")).into_response(),
+    }
 }
 
 /// Forgets the OAuth session for a forward.
@@ -336,7 +387,8 @@ async fn oauth_disconnect(
 /// the host browser. Returns the URL too, in case the browser did not
 /// open.
 async fn oauth_start(State(state): State<UiState>, Path(name): Path<String>) -> impl IntoResponse {
-    let Some(forward) = state.forwards.iter().find(|f| f.name == name) else {
+    let configs = state.registry.configs();
+    let Some(forward) = configs.iter().find(|f| f.name == name) else {
         return (StatusCode::NOT_FOUND, format!("unknown forward '{name}'")).into_response();
     };
     let redirect_uri = format!("http://{}/oauth/callback", state.ui_addr);
@@ -429,10 +481,30 @@ fn bootstrap_router(state: BootstrapState) -> Router {
         .route("/bootstrap/fz/{target}", get(guest_binary))
         .route("/bootstrap/targets", get(bootstrap_targets))
         .route("/bootstrap/info", get(bootstrap_info))
+        .route("/bootstrap/hello", get(bootstrap_hello))
         .route("/bootstrap/env", get(bootstrap_env))
         .route("/mcp/{name}", post(mcp_message))
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+struct HelloQuery {
+    container: String,
+}
+
+/// `fz setup` announces the guest: creates/updates the join request so
+/// it appears in the UI immediately, with the address to pin.
+async fn bootstrap_hello(
+    State(state): State<BootstrapState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    axum::extract::Query(query): axum::extract::Query<HelloQuery>,
+) -> Json<serde_json::Value> {
+    let authorization = state.mcp.app.authorize(&query.container, peer.ip());
+    Json(serde_json::json!({
+        "container": query.container,
+        "approved": authorization == crate::state::Authorization::Allowed,
+    }))
 }
 
 /// Connection facts a guest needs to compose its environment: the
@@ -529,6 +601,49 @@ async fn remove_container(
 }
 
 #[derive(Deserialize)]
+struct ApproveRequest {
+    /// Pin the container to the address it last connected from.
+    #[serde(default)]
+    pin_to_last_ip: bool,
+}
+
+/// Approves a pending join request (or re-approves a container).
+async fn approve_container(
+    State(state): State<UiState>,
+    Path(id): Path<String>,
+    Json(request): Json<ApproveRequest>,
+) -> StatusCode {
+    state.app.approve_container(&id, request.pin_to_last_ip);
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct PinRequest {
+    /// IP to pin to; null/empty clears the pin (any address).
+    ip: Option<String>,
+}
+
+async fn set_container_pin(
+    State(state): State<UiState>,
+    Path(id): Path<String>,
+    Json(request): Json<PinRequest>,
+) -> impl IntoResponse {
+    match request.ip.filter(|ip| !ip.trim().is_empty()) {
+        None => {
+            state.app.set_pinned_ip(&id, None);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Some(text) => match text.trim().parse() {
+            Ok(ip) => {
+                state.app.set_pinned_ip(&id, Some(ip));
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Err(_) => (StatusCode::UNPROCESSABLE_ENTITY, "not an IP address").into_response(),
+        },
+    }
+}
+
+#[derive(Deserialize)]
 struct KillRequest {
     killed: bool,
 }
@@ -603,22 +718,75 @@ async fn guest_binary(
     }
 }
 
-async fn binary(State(state): State<BootstrapState>) -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/octet-stream"),
-            (
-                header::CONTENT_DISPOSITION,
-                if cfg!(windows) {
-                    "attachment; filename=fz.exe"
-                } else {
-                    "attachment; filename=fz"
-                },
+/// `/bootstrap/fz` serves the host's own binary; `/bootstrap/fz?linux`
+/// (or `?win`, `?macos`, or any guest-bin prefix) picks a cross-built
+/// one: bare query keys are matched as prefixes against guest-bin file
+/// names, so `?linux` finds `fz-linux-x86_64`.
+async fn binary(
+    State(state): State<BootstrapState>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> impl IntoResponse {
+    let host_platform = std::env::consts::OS; // "windows" | "macos" | "linux"
+    let wanted = query.unwrap_or_default().trim().to_lowercase();
+    let wanted = match wanted.as_str() {
+        "" => String::new(),
+        "win" | "windows" => "windows".to_owned(),
+        "mac" | "macos" | "darwin" => "macos".to_owned(),
+        other => other.to_owned(),
+    };
+    // No query, or asking for the host's own platform: serve ourselves.
+    if wanted.is_empty() || wanted == host_platform {
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    if cfg!(windows) {
+                        "attachment; filename=fz.exe".to_owned()
+                    } else {
+                        "attachment; filename=fz".to_owned()
+                    },
+                ),
+            ],
+            state.binary.as_ref().clone(),
+        )
+            .into_response();
+    }
+    // Otherwise find a guest binary whose name mentions the platform,
+    // e.g. ?linux -> fz-linux-x86_64.
+    let candidate = state
+        .guest_binaries
+        .iter()
+        .find(|(name, _)| name.to_lowercase().contains(&wanted));
+    match candidate {
+        Some((name, path)) => match tokio::fs::read(path).await {
+            Ok(bytes) => (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        format!("attachment; filename={name}"),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read {}: {error}", path.display()),
+            )
+                .into_response(),
+        },
+        None => (
+            StatusCode::NOT_FOUND,
+            format!(
+                "no '{wanted}' build here (host is {host_platform}); build fz in the guest (cargo build --release) or add one to <data-dir>/guest-bin/"
             ),
-        ],
-        state.binary.as_ref().clone(),
-    )
+        )
+            .into_response(),
+    }
 }
 
 async fn certificate(State(state): State<BootstrapState>) -> impl IntoResponse {
@@ -658,8 +826,7 @@ mod tests {
             guest_binaries: Arc::new(guest_binaries),
             mcp: crate::mcp::McpState::new(
                 crate::state::AppState::default(),
-                Vec::new(),
-                settings.clone(),
+                crate::mcp::ForwardRegistry::load(settings.data_dir(), settings.clone()).unwrap(),
             ),
             settings,
             proxy_port: 8080,

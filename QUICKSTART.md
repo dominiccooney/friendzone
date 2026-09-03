@@ -22,8 +22,11 @@ Local demo without a VM? Use `127.0.0.1` everywhere `HOST_IP` appears.
 
 Open <http://127.0.0.1:8081>.
 
-- **Inbox → Add container** — name it (e.g. `reviewer`); the name is the
-  proxy username and the unit of kill/logging.
+- **Containers**: either pre-add one (Inbox → Add container, e.g.
+  `reviewer`), or just run `fz setup` in the guest — it appears in the
+  Inbox as "awaiting approval"; click **Approve + pin IP** to admit it
+  and lock the name to its address. Unknown containers are denied until
+  approved.
 - **Settings → Escrowed credentials** — pick a provider preset
   (Anthropic, Cline, GitHub, or Custom…), paste the real key in the one
   masked field, click Add. Hosts/header/env-var are prefilled by the

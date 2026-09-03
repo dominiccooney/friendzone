@@ -106,12 +106,13 @@ async fn run_broker(
     let files = AuthorityFiles::load_or_create(&data_dir)?;
     let issuer = files.issuer()?;
     let state = AppState::default();
-    let forwards = mcp::load_forwards(&data_dir)?;
-    let forwards_path = mcp::forwards_path(&data_dir);
+    let settings = settings::Settings::load(&data_dir)?;
+    let registry = mcp::ForwardRegistry::load(&data_dir, settings.clone())?;
+    let forwards = registry.configs();
     if forwards.is_empty() {
         println!(
-            "MCP forwards:         none (to add some, create {})",
-            forwards_path.display()
+            "MCP forwards:         none (to add some, create {} or use Settings in the UI)",
+            registry.config_path().display()
         );
     }
     for forward in &forwards {
@@ -122,8 +123,7 @@ async fn run_broker(
             forward.tools.len()
         );
     }
-    let settings = settings::Settings::load(&data_dir)?;
-    let mcp_state = mcp::McpState::new(state.clone(), forwards.clone(), settings.clone());
+    let mcp_state = mcp::McpState::new(state.clone(), registry.clone());
     let guest_binaries = web::discover_guest_binaries(&data_dir);
     if guest_binaries.is_empty() {
         println!(
@@ -157,7 +157,7 @@ async fn run_broker(
     tokio::select! {
         _ = refresher => unreachable!("refresher loop never returns"),
         result = proxy_server::serve(proxy_addr, state.clone(), issuer, settings.clone()) => result,
-        result = web::serve_ui(ui_addr, state, settings.clone(), forwards) => result,
+        result = web::serve_ui(ui_addr, state, settings.clone(), registry, bootstrap_addr.port()) => result,
         result = web::serve_bootstrap(bootstrap_addr, files.cert_pem, mcp_state, settings, proxy_addr.port()) => result,
         signal = tokio::signal::ctrl_c() => signal.context("wait for Ctrl+C"),
     }

@@ -747,6 +747,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "http-body-util",
  "hudsucker",
  "rcgen",
  "reqwest",

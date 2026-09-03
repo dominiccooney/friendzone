@@ -17,10 +17,31 @@ function renderContainers() {
   if (!snapshot.containers.length) { root.append($("#empty-template").content.cloneNode(true)); return; }
   for (const c of ordered(snapshot.containers)) {
     const killed = c.state === "killed";
+    const pending = c.state === "pending";
     const section = document.createElement("section");
     section.className = "container"; section.draggable = true; section.dataset.id = c.id;
-    section.innerHTML = `<div class="container-head"><span class="status-dot ${killed?"":"live"}" style="${killed?"background:#999":""}"></span><div><div class="container-name">${esc(c.name)}</div><div class="meta">${c.request_count} requests · last traffic ${displayTime(c.last_activity)}</div></div><div class="actions"><span class="state ${killed?"killed":"working"}">${killed?"killed":"working"}</span><button class="stop ${killed?"resume":""}">${killed?"Resume":"Kill"}</button><button class="quiet remove">Remove</button></div></div><div class="container-body">No decisions waiting</div>`;
-    section.querySelector(".stop").onclick = () => setKilled(c.id, !killed).catch(console.error);
+    const pin = c.pinned_ip ? (c.pinned_ip.startsWith("~") ? `last seen ${esc(c.pinned_ip.slice(1))}, not pinned` : `pinned to ${esc(c.pinned_ip)}`) : "any address";
+    const actions = pending
+      ? `<span class="state killed">awaiting approval</span><button class="approve">Approve</button><button class="approve-pin">Approve + pin IP</button><button class="quiet remove">Deny</button>`
+      : `<span class="state ${killed?"killed":"working"}">${killed?"killed":"working"}</span><button class="stop ${killed?"resume":""}">${killed?"Resume":"Kill"}</button><button class="quiet pin-edit">Pin…</button><button class="quiet remove">Remove</button>`;
+    section.innerHTML = `<div class="container-head"><span class="status-dot ${killed||pending?"":"live"}" style="${killed||pending?"background:#999":""}"></span><div><div class="container-name">${esc(c.name)}</div><div class="meta">${c.request_count} requests · last traffic ${displayTime(c.last_activity)} · ${pin}</div></div><div class="actions">${actions}</div></div><div class="container-body">${pending?"This container asked to join (first traffic or fz setup). Approving lets its requests through.":"No decisions waiting"}</div>`;
+    section.querySelector(".stop")?.addEventListener("click", () => setKilled(c.id, !killed).catch(console.error));
+    section.querySelector(".approve")?.addEventListener("click", async () => {
+      await fetch(`/api/containers/${encodeURIComponent(c.id)}/approve`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pin_to_last_ip:false})});
+      refresh();
+    });
+    section.querySelector(".approve-pin")?.addEventListener("click", async () => {
+      await fetch(`/api/containers/${encodeURIComponent(c.id)}/approve`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pin_to_last_ip:true})});
+      refresh();
+    });
+    section.querySelector(".pin-edit")?.addEventListener("click", async () => {
+      const current = c.pinned_ip && !c.pinned_ip.startsWith("~") ? c.pinned_ip : "";
+      const ip = prompt(`Pin '${c.name}' to an IP (empty = any address):`, current);
+      if (ip === null) return;
+      const r = await fetch(`/api/containers/${encodeURIComponent(c.id)}/pin`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({ip:ip||null})});
+      if (!r.ok) alert(await r.text());
+      refresh();
+    });
     section.querySelector(".remove").onclick = async () => {
       if (!confirm(`Remove container '${c.name}'? Kill it first if it is still running.`)) return;
       await fetch(`/api/containers/${encodeURIComponent(c.id)}`, {method:"DELETE"});
@@ -34,8 +55,16 @@ function renderContainers() {
 }
 
 function renderLog() {
-  const query = $("#search").value.toLowerCase(), container=$("#container-filter").value, verdict=$("#verdict-filter").value;
-  $("#requests").innerHTML = snapshot.requests.filter(r => (!container||r.container===container)&&(!verdict||r.verdict===verdict)&&(!query||`${r.container} ${r.method} ${r.url}`.toLowerCase().includes(query))).map(r=>`<div class="log-row"><span>${displayTime(r.at)}</span><span class="container-id">${esc(r.container)}</span><span class="request"><span class="method">${esc(r.method)}</span>${esc(r.url)}</span><span class="verdict ${r.verdict}">${esc(r.verdict)}</span></div>`).join("");
+  const query = $("#search").value.trim().toLowerCase(), container=$("#container-filter").value, verdict=$("#verdict-filter").value;
+  $("#requests").innerHTML = snapshot.requests
+    .filter(r => (!container||r.container===container)
+      && (!verdict||r.verdict===verdict)
+      && (!query||`${r.container} ${r.method} ${r.url} ${r.status??""} ${r.detail??""} ${r.verdict}`.toLowerCase().includes(query)))
+    .map(r=>{
+      const status = r.status ? `<span class="verdict ${r.status<400?"allowed":"blocked"}">${r.status}</span> ` : "";
+      const detail = r.detail ? `<div class="meta">${esc(r.detail)}</div>` : "";
+      return `<div class="log-row"><span>${displayTime(r.at)}</span><span class="container-id">${esc(r.container)}</span><span class="request">${status}<span class="method">${esc(r.method)}</span>${esc(r.url)}${detail}</span><span class="verdict ${r.verdict}">${esc(r.verdict)}</span></div>`;
+    }).join("") || '<div class="log-row">No matching requests.</div>';
   const selected=$("#container-filter").value; $("#container-filter").innerHTML='<option value="">All containers</option>'+snapshot.containers.map(c=>`<option value="${esc(c.id)}">${esc(c.name)}</option>`).join(""); $("#container-filter").value=selected;
 }
 
@@ -85,7 +114,12 @@ async function renderSettings() {
       : `<button class="quiet" data-oauth="${esc(f.name)}">Connect (OAuth)…</button>`;
     return `<div class="log-row"><span>${esc(f.name)}</span><span class="request">${esc(f.url)} · ${f.tools.length} tools${f.scope?` · scope ${esc(f.scope)}`:""}</span><span>${status}</span></div>`;
   }).join("") || `<div class="log-row">No MCP forwards configured. Create <code>${esc(mcp.config_path)}</code> (see README for the format), then restart the broker.</div>`;
-  $("#guest-env").textContent = env;
+  const [curlLine, ...envRest] = env.split("\n");
+  $("#guest-env-curl").textContent = curlLine.replace(/^# Fetch from a guest: /, "");
+  $("#guest-env").textContent = envRest.join("\n");
+  if (!$("#mcp-editor").value) {
+    fetch("/api/mcp/config").then(r=>r.text()).then(text => { $("#mcp-editor").value = text; });
+  }
   document.querySelectorAll("[data-secret]").forEach(b=>b.onclick=async()=>{
     const value = prompt(`Real value for '${b.dataset.secret}' (stored on host only):`);
     if (!value) return;
@@ -143,6 +177,24 @@ async function renderSettings() {
     setTimeout(renderSettings, 3000);
   });
 }
+
+$("#mcp-save").onclick = async () => {
+  const r = await fetch("/api/mcp/config",{method:"PUT",headers:{"content-type":"application/json"},body:$("#mcp-editor").value});
+  if (!r.ok) { $("#mcp-editor-status").textContent = `✗ ${await r.text()}`; return; }
+  const {forwards} = await r.json();
+  $("#mcp-editor-status").textContent = `✓ applied, ${forwards} forward(s) active`;
+  renderSettings();
+};
+
+$("#mcp-reload").onclick = async () => {
+  const r = await fetch("/api/mcp/reload",{method:"POST"});
+  if (!r.ok) { $("#mcp-editor-status").textContent = `✗ ${await r.text()}`; return; }
+  const {forwards} = await r.json();
+  const text = await (await fetch("/api/mcp/config")).text();
+  $("#mcp-editor").value = text;
+  $("#mcp-editor-status").textContent = `✓ reloaded, ${forwards} forward(s) active`;
+  renderSettings();
+};
 
 $("#add-container").onsubmit = async (e) => {
   e.preventDefault();
