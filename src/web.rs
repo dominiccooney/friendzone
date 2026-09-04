@@ -126,6 +126,7 @@ fn ui_router(state: UiState) -> Router {
         .route("/app.css", get(css))
         .route("/app.js", get(js))
         .route("/api/state", get(api_state))
+        .route("/api/events", get(state_events))
         .route("/api/containers", post(add_container))
         .route(
             "/api/containers/{id}",
@@ -565,6 +566,46 @@ async fn js() -> impl IntoResponse {
 
 async fn api_state(State(state): State<UiState>) -> Json<StateView> {
     Json(state.app.view())
+}
+
+/// Live state over SSE: a full `StateView` snapshot on connect and on
+/// every change (the watch channel coalesces bursts). Clients stay
+/// dumb — render whatever arrives — and EventSource reconnects itself.
+async fn state_events(State(state): State<UiState>) -> impl IntoResponse {
+    let mut changes = state.app.subscribe();
+    let app = state.app.clone();
+    let stream = async_stream(move |emit| async move {
+        loop {
+            let view = app.view();
+            let data = serde_json::to_string(&view).expect("serialize state view");
+            if emit.send(data).await.is_err() {
+                return; // client went away
+            }
+            if changes.changed().await.is_err() {
+                return; // broker shutting down
+            }
+        }
+    });
+    axum::response::sse::Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+    )
+}
+
+/// Adapts an emit-loop into the `Stream<Item = Result<Event, _>>` SSE
+/// wants, with a small buffer so a slow client cannot back up state.
+fn async_stream<F, Fut>(
+    body: F,
+) -> impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
+where
+    F: FnOnce(tokio::sync::mpsc::Sender<String>) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    tokio::spawn(body(tx));
+    futures_util::stream::poll_fn(move |cx| {
+        rx.poll_recv(cx)
+            .map(|item| item.map(|data| Ok(axum::response::sse::Event::default().data(data))))
+    })
 }
 
 #[derive(Deserialize)]

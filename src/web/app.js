@@ -230,4 +230,11 @@ $("#escrow-form").onsubmit = async (e) => {
 
 document.querySelectorAll(".nav").forEach(button=>button.onclick=()=>{document.querySelectorAll(".nav,.view").forEach(n=>n.classList.remove("active"));button.classList.add("active");$(`#${button.dataset.view}-view`).classList.add("active");if(button.dataset.view==="settings")renderSettings().catch(console.error);});
 $("#refresh").onclick=refresh; ["#search","#container-filter","#verdict-filter"].forEach(s=>$(s).addEventListener("input",renderLog));
-refresh(); setInterval(refresh,2000);
+
+// Live updates over SSE: the broker pushes a full snapshot on every
+// change; EventSource reconnects on its own. The initial fetch covers
+// the gap before the stream opens.
+refresh();
+const events = new EventSource("/api/events");
+events.onmessage = (e) => { snapshot = JSON.parse(e.data); renderContainers(); renderLog(); };
+events.onerror = () => setTimeout(refresh, 3000); // bridge reconnect gaps

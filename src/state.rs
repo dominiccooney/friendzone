@@ -104,12 +104,36 @@ impl StateData {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct AppState(Arc<RwLock<StateData>>);
+#[derive(Clone)]
+pub struct AppState {
+    data: Arc<RwLock<StateData>>,
+    /// Bumped on every mutation; SSE subscribers wake on change and
+    /// fetch a fresh view. watch coalesces bursts automatically.
+    changes: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            data: Arc::new(RwLock::new(StateData::default())),
+            changes: tokio::sync::watch::Sender::new(0),
+        }
+    }
+}
 
 impl AppState {
+    /// Wakes SSE subscribers; call after every visible mutation.
+    fn notify(&self) {
+        self.changes.send_modify(|version| *version += 1);
+    }
+
+    /// A receiver that wakes whenever state changes.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
     pub fn record(&self, container: String, method: String, url: String, verdict: Verdict) -> Uuid {
-        let mut state = self.0.write().expect("state lock poisoned");
+        let mut state = self.data.write().expect("state lock poisoned");
         state.touch_container(&container, None);
         let id = Uuid::new_v4();
         state.requests.push(RequestEvent {
@@ -125,12 +149,14 @@ impl AppState {
         if state.requests.len() > 1000 {
             state.requests.drain(..100);
         }
+        drop(state);
+        self.notify();
         id
     }
 
     /// Backfills response facts onto a logged request.
     pub fn annotate(&self, id: Uuid, status: Option<u16>, detail: Option<String>) {
-        let mut state = self.0.write().expect("state lock poisoned");
+        let mut state = self.data.write().expect("state lock poisoned");
         if let Some(event) = state.requests.iter_mut().rev().find(|e| e.id == id) {
             if status.is_some() {
                 event.status = status;
@@ -139,6 +165,8 @@ impl AppState {
                 event.detail = detail;
             }
         }
+        drop(state);
+        self.notify();
     }
 
     pub fn identify_connection(
@@ -146,7 +174,7 @@ impl AppState {
         peer: SocketAddr,
         presented_username: Option<String>,
     ) -> String {
-        let mut state = self.0.write().expect("state lock poisoned");
+        let mut state = self.data.write().expect("state lock poisoned");
         if let Some(username) = presented_username {
             state.touch_container(&username, Some(peer.ip()));
             state
@@ -170,22 +198,27 @@ impl AppState {
     /// The container gate: known + approved + right address, checked
     /// before any policy. Unknown names become pending join requests.
     pub fn authorize(&self, container: &str, peer_ip: IpAddr) -> Authorization {
-        let mut state = self.0.write().expect("state lock poisoned");
+        let mut state = self.data.write().expect("state lock poisoned");
         state.touch_container(container, Some(peer_ip));
         let record = state.containers.get(container).expect("just touched");
-        if !record.approved {
-            return Authorization::Pending;
-        }
-        match record.pinned_ip {
-            Some(pinned) if pinned != peer_ip => Authorization::IpMismatch,
-            _ => Authorization::Allowed,
-        }
+        let verdict = if !record.approved {
+            Authorization::Pending
+        } else {
+            match record.pinned_ip {
+                Some(pinned) if pinned != peer_ip => Authorization::IpMismatch,
+                _ => Authorization::Allowed,
+            }
+        };
+        drop(state);
+        // A pending gate check is a join request appearing: wake the UI.
+        self.notify();
+        verdict
     }
 
     /// Approval check without an address (used where the peer IP is
     /// not available, e.g. the MCP endpoint).
     pub fn is_approved(&self, container: &str) -> bool {
-        self.0
+        self.data
             .read()
             .expect("state lock poisoned")
             .containers
@@ -196,49 +229,57 @@ impl AppState {
     /// Registers a pre-approved container from the UI (wildcard IP
     /// until pinned).
     pub fn add_container(&self, name: &str) {
-        let mut state = self.0.write().expect("state lock poisoned");
+        let mut state = self.data.write().expect("state lock poisoned");
         state.touch_container(name, None);
         state
             .containers
             .get_mut(name)
             .expect("just touched")
             .approved = true;
+        drop(state);
+        self.notify();
     }
 
     /// Approves a join request, optionally pinning it to the address it
     /// last connected from.
     pub fn approve_container(&self, name: &str, pin_to_last_ip: bool) {
-        let mut state = self.0.write().expect("state lock poisoned");
+        let mut state = self.data.write().expect("state lock poisoned");
         if let Some(record) = state.containers.get_mut(name) {
             record.approved = true;
             if pin_to_last_ip {
                 record.pinned_ip = record.last_ip;
             }
         }
+        drop(state);
+        self.notify();
     }
 
     /// Sets or clears (None = wildcard) a container's pinned IP.
     pub fn set_pinned_ip(&self, name: &str, ip: Option<IpAddr>) {
-        let mut state = self.0.write().expect("state lock poisoned");
+        let mut state = self.data.write().expect("state lock poisoned");
         if let Some(record) = state.containers.get_mut(name) {
             record.pinned_ip = ip;
         }
+        drop(state);
+        self.notify();
     }
 
     /// Removes a container: registry entry, kill flag, and connection
     /// identities go; log rows stay for audit. If it reconnects it is a
     /// new container (and will re-appear live — kill first to stop it).
     pub fn remove_container(&self, name: &str) {
-        let mut state = self.0.write().expect("state lock poisoned");
+        let mut state = self.data.write().expect("state lock poisoned");
         state.containers.remove(name);
         state.killed.remove(name);
         state
             .connection_identities
             .retain(|_, (identity, _)| identity != name);
+        drop(state);
+        self.notify();
     }
 
     pub fn is_killed(&self, container: &str) -> bool {
-        self.0
+        self.data
             .read()
             .expect("state lock poisoned")
             .killed
@@ -246,16 +287,18 @@ impl AppState {
     }
 
     pub fn set_killed(&self, container: String, killed: bool) {
-        let mut state = self.0.write().expect("state lock poisoned");
+        let mut state = self.data.write().expect("state lock poisoned");
         if killed {
             state.killed.insert(container);
         } else {
             state.killed.remove(&container);
         }
+        drop(state);
+        self.notify();
     }
 
     pub fn view(&self) -> StateView {
-        let state = self.0.read().expect("state lock poisoned");
+        let state = self.data.read().expect("state lock poisoned");
         let mut request_counts: HashMap<&str, usize> = HashMap::new();
         for event in &state.requests {
             *request_counts.entry(event.container.as_str()).or_default() += 1;
