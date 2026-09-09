@@ -174,6 +174,16 @@ There is no need to disable TLS verification or globally bypass the proxy.
 
 ## 5. Container: point the agent at MCP forwards
 
+In the host UI, **Settings → MCP forwards → Connect from Cline** shows
+the guest endpoint and copyable Cline JSON for each forward. Select the
+guest and merge the generated entry into its Cline MCP settings; do not
+overwrite other servers. The broker host/port default comes from the
+bootstrap listener, not the UI address. For wildcard binds enter the host
+IP/DNS name reachable from the guest. The panel warns about missing
+approval, sharing, tools, killed guests and loopback-only listeners;
+generating/copying a configuration does not grant access.
+
+There is **one endpoint per forwarded server**, not one combined endpoint.
 Use a streamable-HTTP MCP client with explicit guest Basic authorization.
 The endpoint is `$FZ_BROKER/mcp/<name>`; proxy credentials are not a
 substitute for its `Authorization` header. Cline guest settings example

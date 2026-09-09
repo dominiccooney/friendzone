@@ -8,6 +8,7 @@ use axum::{
     response::{Html, IntoResponse},
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 
 use crate::state::{AppState, StateView};
@@ -20,7 +21,7 @@ struct UiState {
     oauth: crate::oauth::OauthFlows,
     cline: crate::oauth::ClineFlows,
     ui_addr: SocketAddr,
-    bootstrap_port: u16,
+    bootstrap_addr: SocketAddr,
 }
 
 #[derive(Clone)]
@@ -62,7 +63,7 @@ pub async fn serve_ui(
     state: AppState,
     settings: crate::settings::Settings,
     registry: crate::mcp::ForwardRegistry,
-    bootstrap_port: u16,
+    bootstrap_addr: SocketAddr,
 ) -> Result<()> {
     serve(
         addr,
@@ -73,7 +74,7 @@ pub async fn serve_ui(
             oauth: crate::oauth::OauthFlows::default(),
             cline: crate::oauth::ClineFlows::default(),
             ui_addr: addr,
-            bootstrap_port,
+            bootstrap_addr,
         }),
         "web UI",
     )
@@ -148,6 +149,7 @@ fn ui_router(state: UiState) -> Router {
         .route("/api/mcp/reload", post(reload_mcp_config))
         .route("/api/mcp/import/cline", post(preview_cline_mcp))
         .route("/api/mcp/validate", post(validate_mcp))
+        .route("/api/mcp/{name}/guest-config", get(mcp_guest_config))
         .route("/api/mcp/{name}/oauth/start", post(oauth_start))
         .route(
             "/api/mcp/{name}/oauth",
@@ -301,7 +303,7 @@ async fn guest_env(State(state): State<UiState>) -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         format!(
             "# Fetch from a guest: curl http://HOST_IP:{}/bootstrap/env\n{}",
-            state.bootstrap_port,
+            state.bootstrap_addr.port(),
             state.settings.guest_env_lines()
         ),
     )
@@ -329,6 +331,7 @@ async fn list_forwards(State(state): State<UiState>) -> Json<serde_json::Value> 
             serde_json::json!({
                 "name": f.name,
                 "url": f.url,
+                "guest_endpoint": guest_mcp_endpoint(state.bootstrap_addr, None, &f.name).ok(),
                 "tools": f.tools,
                 "scope": f.scope,
                 "guests": f.guests,
@@ -342,7 +345,128 @@ async fn list_forwards(State(state): State<UiState>) -> Json<serde_json::Value> 
     Json(serde_json::json!({
         "forwards": forwards,
         "config_path": state.registry.config_path().display().to_string(),
+        "guest_host": (!state.bootstrap_addr.ip().is_unspecified()).then(|| state.bootstrap_addr.ip().to_string()),
+        "guest_port": state.bootstrap_addr.port(),
+        "guest_address_warning": if state.bootstrap_addr.ip().is_unspecified() {
+            Some("The broker listens on all interfaces. Enter its host IP or DNS name reachable from the guest.")
+        } else if state.bootstrap_addr.ip().is_loopback() {
+            Some("The bootstrap listener is loopback-only. For a VM/container, bind it to a guest-facing interface; changing the displayed host does not change the listener.")
+        } else { None },
     }))
+}
+
+/// The bootstrap listener, never the UI origin or upstream URL, owns MCP
+/// endpoints. Host overrides only describe guest routing; they do not bind
+/// a new listener or make a network request.
+fn guest_mcp_endpoint(addr: SocketAddr, host: Option<&str>, name: &str) -> Result<String> {
+    let host = host
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| addr.ip().to_string());
+    let authority = host
+        .parse::<std::net::IpAddr>()
+        .map(|ip| match ip {
+            std::net::IpAddr::V4(ip) => ip.to_string(),
+            std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+        })
+        .unwrap_or(host.clone());
+    if host
+        .chars()
+        .any(|c| c.is_whitespace() || "/\\@?#".contains(c))
+    {
+        anyhow::bail!(
+            "Enter only the broker host IP or DNS name, without a scheme, credentials, path or port"
+        );
+    }
+    let mut url =
+        reqwest::Url::parse(&format!("http://{authority}")).context("invalid broker host")?;
+    // Check the authority too: URL parsers normalize an explicit :80 away.
+    let has_port = if authority.starts_with('[') {
+        !authority.ends_with(']')
+    } else {
+        authority.contains(':')
+    };
+    if has_port || url.host_str().is_none() || url.path() != "/" {
+        anyhow::bail!(
+            "Enter only the broker host IP or DNS name; the bootstrap port is supplied automatically"
+        );
+    }
+    if url
+        .host_str()
+        .and_then(|h| h.trim_matches(['[', ']']).parse::<std::net::IpAddr>().ok())
+        .is_some_and(|ip| ip.is_unspecified())
+    {
+        anyhow::bail!(
+            "A wildcard bind address is not a guest endpoint; enter the broker host IP or DNS name"
+        );
+    }
+    url.set_port(Some(addr.port()))
+        .map_err(|_| anyhow::anyhow!("invalid bootstrap port"))?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("invalid broker URL"))?
+        .push("mcp")
+        .push(name);
+    Ok(url.into())
+}
+
+#[derive(Deserialize)]
+struct GuestConfigQuery {
+    guest: String,
+    host: Option<String>,
+}
+
+async fn mcp_guest_config(
+    State(state): State<UiState>,
+    Path(name): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<GuestConfigQuery>,
+) -> impl IntoResponse {
+    // Read-only snapshot for instructions. Real admission still uses the
+    // same forward's allows_guest plus approval/IP/kill gates per request.
+    let Some(forward) = state.registry.get(&name) else {
+        return (StatusCode::NOT_FOUND, "MCP forward no longer exists").into_response();
+    };
+    let Some(guest) = state
+        .app
+        .view()
+        .containers
+        .into_iter()
+        .find(|guest| guest.id == query.guest)
+    else {
+        return (StatusCode::NOT_FOUND, "Select a guest from the Inbox first").into_response();
+    };
+    if guest.id.is_empty() || guest.id.contains(':') || guest.id.chars().any(char::is_control) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "This guest name cannot be encoded as a Basic username; use a name without ':' or control characters").into_response();
+    }
+    let endpoint = match guest_mcp_endpoint(state.bootstrap_addr, query.host.as_deref(), &name) {
+        Ok(endpoint) => endpoint,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+    let authorization = format!("Basic {}", STANDARD.encode(format!("{}:x", guest.id)));
+    let mut warnings = Vec::new();
+    if !guest.approved {
+        warnings.push("Guest is awaiting approval. Approve it in the host Inbox.".to_owned());
+    }
+    if guest.state == "killed" {
+        warnings.push("Guest is killed. Resume it in the host Inbox.".to_owned());
+    }
+    if !forward.allows_guest(&guest.id) {
+        warnings.push("This forward is not shared with the selected guest. Add its name to the forward's allowed guests and apply.".to_owned());
+    }
+    if state.bootstrap_addr.ip().is_loopback() {
+        warnings.push("Bootstrap listener is loopback-only; remote guests cannot reach it. Rebind it to a guest-facing interface.".to_owned());
+    }
+    let key = format!("{name}-via-friendzone");
+    Json(serde_json::json!({
+        "endpoint": endpoint,
+        "authorization": authorization,
+        "warnings": warnings,
+        "cline_config": {"mcpServers": {key: {"transport": {
+            "type": "streamableHttp", "url": endpoint,
+            "headers": {"Authorization": authorization}
+        }}}}
+    }))
+    .into_response()
 }
 
 /// The raw mcp-forwards.json for in-UI editing.
@@ -946,6 +1070,60 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
+    fn guest_endpoints_use_bootstrap_address_and_one_path_per_forward() {
+        let addr = "172.31.208.1:9092".parse().unwrap();
+        assert_eq!(
+            guest_mcp_endpoint(addr, None, "linear").unwrap(),
+            "http://172.31.208.1:9092/mcp/linear"
+        );
+        assert_eq!(
+            guest_mcp_endpoint(addr, None, "github").unwrap(),
+            "http://172.31.208.1:9092/mcp/github"
+        );
+        assert_eq!(
+            guest_mcp_endpoint(addr, Some("broker.local"), "linear").unwrap(),
+            "http://broker.local:9092/mcp/linear"
+        );
+        assert_eq!(
+            guest_mcp_endpoint("[fd00::1]:8082".parse().unwrap(), None, "linear").unwrap(),
+            "http://[fd00::1]:8082/mcp/linear"
+        );
+        assert_eq!(
+            guest_mcp_endpoint(addr, Some("fd00::2"), "linear").unwrap(),
+            "http://[fd00::2]:9092/mcp/linear"
+        );
+        assert_eq!(
+            guest_mcp_endpoint(addr, Some("[fd00::2]"), "linear").unwrap(),
+            "http://[fd00::2]:9092/mcp/linear"
+        );
+        for wildcard in ["0.0.0.0:8082", "[::]:8082"] {
+            let addr = wildcard.parse().unwrap();
+            assert!(guest_mcp_endpoint(addr, None, "linear").is_err());
+            assert_eq!(
+                guest_mcp_endpoint(addr, Some("broker.local"), "linear").unwrap(),
+                "http://broker.local:8082/mcp/linear"
+            );
+        }
+        for invalid in [
+            "http://broker.local",
+            "broker.local:80",
+            "broker.local:9999",
+            "user@broker.local",
+            "broker.local/path",
+            "broker.local?q=1",
+            "broker.local#fragment",
+            "0.0.0.0",
+            "[::]",
+            "bad host",
+        ] {
+            assert!(
+                guest_mcp_endpoint(addr, Some(invalid), "linear").is_err(),
+                "accepted invalid host {invalid}"
+            );
+        }
+    }
+
+    #[test]
     fn index_escapes_default_path_in_editable_input() {
         let Html(html) = render_index("/home/a&b/\"<Cline>'/settings.json");
         let input = html
@@ -974,7 +1152,7 @@ mod tests {
             oauth: crate::oauth::OauthFlows::default(),
             cline: crate::oauth::ClineFlows::default(),
             ui_addr: "127.0.0.1:8081".parse().unwrap(),
-            bootstrap_port: 8082,
+            bootstrap_addr: "172.31.208.1:8082".parse().unwrap(),
         });
         let page = ui
             .clone()
@@ -1012,10 +1190,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(saved.status(), StatusCode::OK);
+        let generated = ui
+            .clone()
+            .oneshot(
+                Request::get("/api/mcp/test/guest-config?guest=guest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(generated.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(generated.into_body(), 8192)
+            .await
+            .unwrap();
+        let generated: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let transport =
+            &generated["cline_config"]["mcpServers"]["test-via-friendzone"]["transport"];
+        assert_eq!(transport["type"], "streamableHttp");
+        assert_eq!(transport["url"], "http://172.31.208.1:8082/mcp/test");
+        let authorization = transport["headers"]["Authorization"].as_str().unwrap();
+        assert_eq!(
+            crate::proxy::basic_username(authorization).as_deref(),
+            Some("guest")
+        );
+        assert_eq!(
+            transport["headers"].as_object().unwrap().len(),
+            1,
+            "no upstream headers copied"
+        );
+        assert_eq!(generated["warnings"], serde_json::json!([]));
+        let endpoint = reqwest::Url::parse(transport["url"].as_str().unwrap()).unwrap();
         let request = |auth: bool, address: SocketAddr| {
-            let mut builder = Request::post("/mcp/test").header("content-type", "application/json");
+            // Consume the generated instructions through the real guest route.
+            let mut builder =
+                Request::post(endpoint.path()).header("content-type", "application/json");
             if auth {
-                builder = builder.header("authorization", "Basic Z3Vlc3Q6eA==");
+                builder = builder.header("authorization", authorization);
             }
             let mut request = builder
                 .body(Body::from(
@@ -1101,6 +1311,133 @@ mod tests {
                 .await
                 .unwrap()
                 .status(),
+            StatusCode::NOT_FOUND
+        );
+        std::fs::remove_dir_all(settings.data_dir()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn guest_instructions_warn_without_granting_access() {
+        let settings = test_settings();
+        let registry =
+            crate::mcp::ForwardRegistry::load(settings.data_dir(), settings.clone()).unwrap();
+        let app = AppState::default();
+        app.authorize("scratch-kali", "10.0.0.2".parse().unwrap());
+        app.set_killed("scratch-kali".into(), true);
+        app.add_container("guest-ü");
+        app.add_container("bad:name");
+        let config: Vec<crate::mcp::ForwardConfig> = serde_json::from_value(serde_json::json!([
+            {"name":"linear", "url":"https://upstream.invalid/mcp", "tools":["read"], "guests":[]},
+            {"name":"github", "url":"https://other.invalid/mcp", "tools":[], "guests":null}
+        ]))
+        .unwrap();
+        registry.save(config).unwrap();
+        let ui_state = UiState {
+            app: app.clone(),
+            settings: settings.clone(),
+            registry: registry.clone(),
+            oauth: crate::oauth::OauthFlows::default(),
+            cline: crate::oauth::ClineFlows::default(),
+            ui_addr: "127.0.0.1:8081".parse().unwrap(),
+            bootstrap_addr: "0.0.0.0:9082".parse().unwrap(),
+        };
+        let ui = ui_router(ui_state.clone());
+        let before = serde_json::to_value(app.view()).unwrap();
+        let request = |uri| Request::get(uri).body(Body::empty()).unwrap();
+        let list = ui.clone().oneshot(request("/api/mcp")).await.unwrap();
+        let list: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(list.into_body(), 8192).await.unwrap())
+                .unwrap();
+        assert!(list["guest_host"].is_null());
+        assert_eq!(list["guest_port"], 9082);
+        assert!(list["forwards"][0]["guest_endpoint"].is_null());
+        assert!(list["guest_address_warning"].is_string());
+        assert_eq!(
+            ui.clone()
+                .oneshot(request("/api/mcp/linear/guest-config?guest=scratch-kali"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let response = ui
+            .clone()
+            .oneshot(request(
+                "/api/mcp/linear/guest-config?guest=scratch-kali&host=broker.local",
+            ))
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["endpoint"], "http://broker.local:9082/mcp/linear");
+        assert_eq!(response["authorization"], "Basic c2NyYXRjaC1rYWxpOng=");
+        assert_eq!(
+            response["warnings"].as_array().unwrap().len(),
+            3,
+            "approval, kill and sharing warnings"
+        );
+        assert_eq!(
+            serde_json::to_value(app.view()).unwrap(),
+            before,
+            "instructions must not change guest state"
+        );
+        assert_eq!(registry.configs()[1].guests, Some(vec![]));
+        let loopback = ui_router(UiState {
+            bootstrap_addr: "127.0.0.1:9082".parse().unwrap(),
+            ..ui_state
+        });
+        let response = loopback
+            .oneshot(request("/api/mcp/github/guest-config?guest=guest-%C3%BC"))
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::proxy::basic_username(response["authorization"].as_str().unwrap()).as_deref(),
+            Some("guest-ü")
+        );
+        assert!(
+            response["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("loopback")
+        );
+        assert_eq!(
+            ui.clone()
+                .oneshot(request(
+                    "/api/mcp/github/guest-config?guest=bad%3Aname&host=broker.local"
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            ui.clone()
+                .oneshot(request(
+                    "/api/mcp/linear/guest-config?guest=unknown&host=broker.local"
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        registry.save(vec![]).unwrap();
+        assert_eq!(
+            ui.oneshot(request(
+                "/api/mcp/linear/guest-config?guest=scratch-kali&host=broker.local"
+            ))
+            .await
+            .unwrap()
+            .status(),
             StatusCode::NOT_FOUND
         );
         std::fs::remove_dir_all(settings.data_dir()).unwrap();

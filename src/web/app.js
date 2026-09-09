@@ -2,6 +2,7 @@ const $ = (s) => document.querySelector(s);
 let snapshot = { containers: [], requests: [] };
 let logRows = [], logCursor = null, logPaused = false, logGeneration = 0, logTimer;
 let order = JSON.parse(localStorage.getItem("fz-order") || "[]");
+let mcpConnectData = null, mcpHostInitialized = false, mcpConnectGeneration = 0, mcpGuestSignature = "";
 
 function esc(value) { return String(value).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;"); }
 function displayTime(value) { return new Date(value).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"}); }
@@ -14,6 +15,7 @@ async function setKilled(id, killed) {
 }
 
 function renderContainers() {
+  updateMcpConnectionGuests();
   const root = $("#containers"); root.innerHTML = "";
   if (!snapshot.containers.length) { root.append($("#empty-template").content.cloneNode(true)); return; }
   for (const c of ordered(snapshot.containers)) {
@@ -125,6 +127,15 @@ async function renderSettings() {
     fetch("/api/mcp").then(r=>r.json()),
     fetch("/api/guest-env").then(r=>r.text()),
   ]);
+  mcpConnectData = mcp;
+  if (!mcpHostInitialized) {
+    $("#mcp-connect-host").value = mcp.guest_host || "";
+    mcpHostInitialized = true;
+  }
+  $("#mcp-connect-address").textContent = `Uses bootstrap port ${mcp.guest_port}, not the UI or proxy port. ${mcp.guest_address_warning || "The host is prefilled from the broker listener; change it only if your guest reaches the host by another address."}`;
+  fillMcpConnectSelect("#mcp-connect-forward", mcp.forwards.map(f=>({value:f.name,label:f.name})), "Select a forward");
+  updateMcpConnectionGuests();
+  loadMcpConnection();
   window._escrowEntries = escrow.entries;
   $("#escrow-list").innerHTML = escrow.entries.map(e=>{
     const clineBtn = e.name === "cline" ? ` <button class="quiet" data-cline-oauth="${esc(e.name)}">Sign in with Cline…</button>` : "";
@@ -136,8 +147,13 @@ async function renderSettings() {
       : f.auth==="oauth" ? `<span class="verdict allowed">OAuth</span>${esc(expiry)} <button class="quiet" data-oauth="${esc(f.name)}">Reauthorize…</button> <button class="quiet" data-oauth-disconnect="${esc(f.name)}">Disconnect</button>`
       : f.auth==="stored-key" || f.auth==="env-key" ? `<span class="verdict allowed">${esc(f.auth)}</span> <button class="quiet" data-oauth="${esc(f.name)}">Switch to OAuth…</button>`
       : `<button class="quiet" data-oauth="${esc(f.name)}">Connect (OAuth)…</button>`;
-    return `<div class="log-row"><span>${esc(f.name)}</span><span class="request">${esc(f.url)} · ${f.tools.length} tools · guests: ${f.guests===null?"all approved":esc(f.guests.join(", ")||"none")}${f.scope?` · scope ${esc(f.scope)}`:""}</span><span>${status} <button data-mcp-delete="${esc(f.name)}">Remove</button></span></div>`;
+    return `<div class="log-row"><span>${esc(f.name)}</span><span class="request">Upstream: ${esc(f.url)} · ${f.tools.length} tools · guests: ${f.guests===null?"all approved":esc(f.guests.join(", ")||"none")}${f.scope?` · scope ${esc(f.scope)}`:""}<span class="mcp-endpoint">Guest endpoint: <code>${esc(f.guest_endpoint || `/mcp/${encodeURIComponent(f.name)} — choose the broker host below`)}</code></span></span><span>${status} <button data-mcp-connect="${esc(f.name)}">Connect from Cline</button> <button data-mcp-delete="${esc(f.name)}">Remove</button></span></div>`;
   }).join("") || '<div class="log-row">No MCP forwards yet. Add or import one below; no broker restart needed.</div>';
+  document.querySelectorAll("[data-mcp-connect]").forEach(button => button.onclick = () => {
+    $("#mcp-connect-forward").value = button.dataset.mcpConnect;
+    loadMcpConnection();
+    $("#mcp-connect").scrollIntoView({behavior:"smooth", block:"start"});
+  });
   document.querySelectorAll("[data-mcp-delete]").forEach(button => button.onclick = async () => {
     if (!confirm(`Remove '${button.dataset.mcpDelete}' for new requests? In-flight calls will finish.`)) return;
     try {
@@ -225,6 +241,69 @@ $("#mcp-reload").onclick = async () => {
   $("#mcp-editor").value = text;
   $("#mcp-editor-status").textContent = `✓ reloaded, ${forwards} forward(s) active`;
   renderSettings();
+};
+
+function fillMcpConnectSelect(selector, options, prompt) {
+  const select = $(selector), selected = select.value;
+  select.innerHTML = `<option value="">${esc(prompt)}</option>` + options.map(o=>`<option value="${esc(o.value)}">${esc(o.label)}</option>`).join("");
+  select.value = options.some(o=>o.value===selected) ? selected : options.length===1 ? options[0].value : "";
+}
+
+function updateMcpConnectionGuests() {
+  // SSE updates activity frequently; only policy/identity changes need to
+  // regenerate instructions. Preserve the user's guest/host selections.
+  const guests = snapshot.containers.map(g=>({id:g.id, name:g.name, approved:g.approved, state:g.state, pinned_ip:g.pinned_ip})).sort((a,b)=>a.id.localeCompare(b.id));
+  const signature = JSON.stringify(guests);
+  if (signature === mcpGuestSignature) return;
+  mcpGuestSignature = signature;
+  fillMcpConnectSelect("#mcp-connect-guest", guests.map(g=>({value:g.id,label:`${g.name}${!g.approved?" (awaiting approval)":g.state==="killed"?" (killed)":""}`})), "Select a guest");
+  if (mcpConnectData) loadMcpConnection();
+}
+
+async function loadMcpConnection() {
+  const generation = ++mcpConnectGeneration;
+  for (const id of ["url", "auth", "json"]) $("#mcp-connect-"+id).value = "";
+  for (const id of ["url", "auth", "json"]) $("#mcp-copy-"+id).disabled = true;
+  $("#mcp-connect-warning").textContent = "";
+  const name = $("#mcp-connect-forward").value, guest = $("#mcp-connect-guest").value, host = $("#mcp-connect-host").value.trim();
+  if (!name || !guest || !host) {
+    $("#mcp-connect-status").textContent = !name ? "Select or add a forward to see its Cline configuration." : !guest ? "Select a guest. If none appear, run fz setup in the guest or add it in the Inbox." : "Enter the broker host address reachable from this guest.";
+    return;
+  }
+  $("#mcp-connect-status").textContent = "Generating guest connection instructions…";
+  try {
+    const query = new URLSearchParams({guest, host});
+    const response = await fetch(`/api/mcp/${encodeURIComponent(name)}/guest-config?${query}`);
+    if (!response.ok) throw new Error(await response.text());
+    const result = await response.json();
+    if (generation !== mcpConnectGeneration) return;
+    $("#mcp-connect-url").value = result.endpoint;
+    $("#mcp-connect-auth").value = result.authorization;
+    $("#mcp-connect-json").value = JSON.stringify(result.cline_config, null, 2);
+    const forward = mcpConnectData?.forwards.find(f=>f.name===name);
+    const warnings = [...result.warnings];
+    if (forward && !forward.tools.length) warnings.push("No tools are allowed yet. Select tools for this forward and apply.");
+    $("#mcp-connect-warning").textContent = warnings.join("\n");
+    $("#mcp-connect-status").textContent = `Configuration for '${name}' as '${guest}'. This is not a connectivity test.`;
+    for (const id of ["url", "auth", "json"]) $("#mcp-copy-"+id).disabled = false;
+  } catch (error) {
+    if (generation === mcpConnectGeneration) $("#mcp-connect-status").textContent = String(error);
+  }
+}
+
+for (const id of ["forward", "guest"]) $("#mcp-connect-"+id).addEventListener("change", loadMcpConnection);
+$("#mcp-connect-host").addEventListener("input", () => {mcpHostInitialized=true;loadMcpConnection();});
+for (const id of ["url", "auth", "json"]) $("#mcp-copy-"+id).onclick = async () => {
+  const input = $("#mcp-connect-"+id), generation = mcpConnectGeneration;
+  if (!input.value) return;
+  try {
+    await navigator.clipboard.writeText(input.value);
+    if (generation === mcpConnectGeneration) $("#mcp-connect-status").textContent = "Copied. Paste into guest Cline, not the host's upstream server settings.";
+  } catch {
+    if (generation !== mcpConnectGeneration) return;
+    input.focus(); input.select();
+    $("#mcp-connect-status").textContent = "Clipboard access unavailable. Text selected; press Ctrl+C / Cmd+C to copy.";
+  }
 };
 
 let clineLink = null, validatedMcp = null;
