@@ -72,7 +72,10 @@ old snapshot. Add `"guests": ["scratch-kali"]` to restrict a forward;
 with all approved guests. An empty `tools` list denies all tool calls.
 
 Cline import accepts nested `transport.type: "streamableHttp"` and legacy
-streamable-HTTP entries. It links the **absolute host path**, reads current
+streamable-HTTP entries. The path is prefilled from the broker user's Cline
+settings location, honoring `CLINE_MCP_SETTINGS_PATH`, `CLINE_DATA_DIR`,
+and `CLINE_DIR` in that order; edit it for another profile. It links the
+**absolute host path**, reads current
 headers/access tokens per request, and does not copy secrets or execute
 commands. Cline retains OAuth refresh ownership: reconnect/refresh in host
 Cline when needed. Removing/disabling the source or changing its URL fails

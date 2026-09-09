@@ -620,8 +620,25 @@ async fn mcp_message(
     }
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("web/index.html"))
+async fn index() -> Html<String> {
+    let path = crate::mcp_import::default_settings_path();
+    render_index(
+        &path
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    )
+}
+
+fn render_index(cline_mcp_path: &str) -> Html<String> {
+    // Fill only the initial HTML. Settings refreshes never write this
+    // input, so typing (including clearing it) cannot race an async default.
+    let escaped = cline_mcp_path
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\'', "&#39;");
+    Html(include_str!("web/index.html").replace("{{CLINE_MCP_SETTINGS_PATH}}", &escaped))
 }
 
 async fn css() -> impl IntoResponse {
@@ -928,6 +945,19 @@ mod tests {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
+    #[test]
+    fn index_escapes_default_path_in_editable_input() {
+        let Html(html) = render_index("/home/a&b/\"<Cline>'/settings.json");
+        let input = html
+            .lines()
+            .find(|line| line.contains("id=\"mcp-cline-path\""))
+            .unwrap();
+        assert!(input.contains("value=\"/home/a&amp;b/&quot;&lt;Cline&gt;&#39;/settings.json\""));
+        assert!(!input.contains("readonly"));
+        assert!(!input.contains("disabled"));
+        assert!(!html.contains("{{CLINE_MCP_SETTINGS_PATH}}"));
+    }
+
     #[tokio::test]
     async fn management_save_and_guest_auth_share_the_live_registry() {
         let settings = test_settings();
@@ -946,6 +976,22 @@ mod tests {
             ui_addr: "127.0.0.1:8081".parse().unwrap(),
             bootstrap_port: 8082,
         });
+        let page = ui
+            .clone()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(page.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let default =
+            crate::mcp_import::default_settings_path().expect("test host has a home directory");
+        assert!(default.is_absolute());
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            render_index(&default.to_string_lossy()).0
+        );
         let bootstrap = bootstrap_router(BootstrapState {
             cert: Arc::new(String::new()),
             binary: Arc::new(vec![]),

@@ -58,7 +58,8 @@
       <div id="mcp-list" class="log-table"></div>
       <h3>Add / import and validate</h3>
       <p class="meta">Link a streamable-HTTP server already configured in Cline on the host. Credentials stay in Cline's file; Cline owns OAuth refresh. Stdio and SSE are not supported by this adapter.</p>
-      <div class="filters"><input id="mcp-cline-path" aria-label="Cline MCP settings absolute host path" placeholder="absolute host path to cline_mcp_settings.json"><button id="mcp-preview">Preview Cline servers</button></div>
+      <div class="filters"><input id="mcp-cline-path" aria-label="Cline MCP settings file on the host" value="{{CLINE_MCP_SETTINGS_PATH}}" placeholder="Cline MCP settings file"><button id="mcp-preview">Preview Cline servers</button></div>
+      <p class="meta">Prefilled from Cline's default location on the broker host. Edit it if your Cline uses a different profile.</p>
       <div id="mcp-candidates"></div>
       <div class="filters"><input id="mcp-name" aria-label="MCP forward name" placeholder="forward name"><input id="mcp-url" aria-label="MCP server URL" placeholder="https://server.example/mcp"><input id="mcp-bearer" aria-label="Host bearer environment variable" placeholder="optional host bearer env variable"></div>
       <p id="mcp-source" class="meta">Standalone server (no Cline link).</p>

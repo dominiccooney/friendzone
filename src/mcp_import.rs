@@ -2,7 +2,10 @@
 //! core/src/extensions/mcp/config-loader.ts (nested and legacy entries).
 //! Cline owns OAuth refresh. We never execute commands or write its file.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -21,6 +24,49 @@ pub struct Candidate {
     pub url: Option<String>,
     pub supported: bool,
     pub reason: String,
+}
+
+/// Cline b18de090 shared/src/storage/paths.ts: use the broker process's
+/// environment/home, not the browser's OS or a guest path. Resolving a
+/// suggestion does not read the file, and it need not exist yet.
+pub fn default_settings_path() -> Option<PathBuf> {
+    settings_path_from_env(|name| std::env::var(name).ok(), dirs::home_dir())
+        .and_then(|path| std::path::absolute(path).ok())
+}
+
+fn settings_path_from_env(
+    env: impl Fn(&str) -> Option<String>,
+    os_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let value = |name| {
+        env(name)
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
+    if let Some(path) = value("CLINE_MCP_SETTINGS_PATH") {
+        return Some(path.into());
+    }
+    let data_dir = if let Some(dir) = value("CLINE_DATA_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let cline_dir = if let Some(dir) = value("CLINE_DIR") {
+            PathBuf::from(dir)
+        } else {
+            let home = value("HOME")
+                .filter(|v| v != "~")
+                .or_else(|| value("USERPROFILE"))
+                .or_else(|| {
+                    value("HOMEDRIVE")
+                        .zip(value("HOMEPATH"))
+                        .map(|(drive, path)| format!("{drive}{path}"))
+                })
+                .map(PathBuf::from)
+                .or(os_home)?;
+            home.join(".cline")
+        };
+        cline_dir.join("data")
+    };
+    Some(data_dir.join("settings").join("cline_mcp_settings.json"))
 }
 
 fn read_servers(path: &str) -> Result<serde_json::Map<String, Value>> {
@@ -173,6 +219,64 @@ pub fn headers(source: &ClineSource, expected_url: &str) -> Result<BTreeMap<Stri
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn default_path_honors_cline_override_precedence() {
+        let mut env = BTreeMap::from([
+            ("CLINE_MCP_SETTINGS_PATH", " explicit.json "),
+            ("CLINE_DATA_DIR", " data-override "),
+            ("CLINE_DIR", " cline-override "),
+            ("HOME", "host-home"),
+        ]);
+        let resolve = |env: &BTreeMap<&str, &str>| {
+            settings_path_from_env(|name| env.get(name).map(|v| (*v).into()), None).unwrap()
+        };
+        assert_eq!(resolve(&env), PathBuf::from("explicit.json"));
+        env.insert("CLINE_MCP_SETTINGS_PATH", " \t ");
+        assert_eq!(
+            resolve(&env),
+            Path::new("data-override").join("settings/cline_mcp_settings.json")
+        );
+        env.remove("CLINE_DATA_DIR");
+        assert_eq!(
+            resolve(&env),
+            Path::new("cline-override").join("data/settings/cline_mcp_settings.json")
+        );
+        env.remove("CLINE_DIR");
+        assert_eq!(
+            resolve(&env),
+            Path::new("host-home").join(".cline/data/settings/cline_mcp_settings.json")
+        );
+    }
+
+    #[test]
+    fn default_path_uses_cline_home_fallbacks() {
+        let resolve = |entries: &[(&str, &str)], fallback: Option<PathBuf>| {
+            settings_path_from_env(
+                |name| {
+                    entries
+                        .iter()
+                        .find(|(key, _)| *key == name)
+                        .map(|(_, value)| (*value).into())
+                },
+                fallback,
+            )
+        };
+        let suffix = ".cline/data/settings/cline_mcp_settings.json";
+        assert_eq!(
+            resolve(&[("HOME", "~"), ("USERPROFILE", " profile ")], None),
+            Some(Path::new("profile").join(suffix))
+        );
+        assert_eq!(
+            resolve(&[("HOMEDRIVE", "C:"), ("HOMEPATH", "\\Users\\guest")], None),
+            Some(Path::new("C:\\Users\\guest").join(suffix))
+        );
+        assert_eq!(
+            resolve(&[], Some("os-home".into())),
+            Some(Path::new("os-home").join(suffix))
+        );
+        assert_eq!(resolve(&[], None), None);
+    }
 
     #[test]
     fn cline_contract_handles_nested_legacy_and_unsupported_shapes() {
