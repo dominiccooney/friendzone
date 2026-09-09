@@ -29,6 +29,10 @@ decision reopens it.
 
 ## 1. Secure architecture
 
+This section describes the target architecture, not a claim that every
+property is implemented. See [NETWORK-ISOLATION.md](NETWORK-ISOLATION.md)
+for current deployment requirements, known gaps, and recovery procedures.
+
 Security holds by construction. Detection raises alarms; no security
 property depends on it.
 
@@ -36,9 +40,13 @@ property depends on it.
   substitution locations. A fake token is worthless in any encoding, so
   escrowed credentials cannot be exfiltrated.
 - **Egress is default-deny, enforced outside the container.** Hyper-V:
-  internal switch, no NAT — no route exists except the broker. tart:
-  softnet with block-all policy allowing only the host. UDP, DNS, and
-  port 22 have no path out. Fail closed: broker down means no network.
+  dedicated internal switch, no NAT, and host/switch port ACLs. Guests can
+  reach only the broker's proxy and separate bootstrap/MCP listeners, not
+  all host services. tart: host-managed default-deny with the same port
+  restriction; allowing the entire host IP is not sufficient. Direct UDP,
+  DNS, IPv6 bypasses and port 22 have no path out. Management stays loopback
+  and is denied through the proxy too. Fail closed: broker down means no
+  Internet, with offline host-console recovery—not automatic open egress.
 - **The parser holds no secrets.** Container bytes are hostile; the
   parsing process is separate from the credential-holding process.
 - **Approvals bind to what the human saw.** Views render from

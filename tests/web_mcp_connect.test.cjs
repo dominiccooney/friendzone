@@ -17,6 +17,7 @@ function fixture() {
     addEventListener(type, listener) { this.listeners[type] = listener; },
     focus() { this.focused = true; },
     select() { this.selected = true; },
+    scrollIntoView() { this.scrolled = true; },
   }]));
   const calls = [];
   const timers = [];
@@ -33,17 +34,17 @@ function fixture() {
         // exercise both button wiring and choosing the guest (not upstream) URL.
         for (const button of copyButtons) button.input.isConnected = false;
         const markup = elements.get("#mcp-list").innerHTML;
-        const values = [...markup.matchAll(/<input data-mcp-endpoint[^>]* value="([^"]*)"/g)].map(match=>match[1]);
+        const values = [...markup.matchAll(/<textarea data-mcp-endpoint[^>]*>([^<]*)<\/textarea>/g)].map(match=>match[1]);
         copyButtons = [...markup.matchAll(/data-mcp-copy-url="([^"]*)"/g)].map((match, index) => {
           const input = {value:values[index], isConnected:true, focus(){this.focused=true;}, select(){this.selected=true;}};
-          return {input, dataset:{mcpCopyUrl:match[1]}, closest(selector){assert.equal(selector,".log-row");return {querySelector(selector){assert.equal(selector,"[data-mcp-endpoint]");return input;}};}};
+          return {input, dataset:{mcpCopyUrl:match[1]}, closest(selector){assert.equal(selector,".mcp-card");return {querySelector(selector){assert.equal(selector,"[data-mcp-endpoint]");return input;}};}};
         });
         return copyButtons;
       },
     },
     localStorage: { getItem() { return null; } },
     EventSource: class {},
-    window: {}, navigator: {}, URLSearchParams, console,
+    window: {addEventListener(){}}, navigator: {}, URL, URLSearchParams, console,
     setTimeout(callback) { const timer = {callback, cancelled:false}; timers.push(timer); return timer; },
     clearTimeout(timer) { if (timer) timer.cancelled = true; },
     fetch(url, options) {
@@ -93,6 +94,8 @@ test("forward row explains Cline credential ownership and copies the Friendzone 
   assert.match(f.element("list").innerHTML, /Uses host Cline's credentials/);
   assert.match(f.element("list").innerHTML, /host Cline must refresh it/);
   assert.match(f.element("list").innerHTML, /Authorize in Friendzone/);
+  assert.match(f.element("list").innerHTML, /class="mcp-card"/);
+  assert.doesNotMatch(f.element("list").innerHTML, /class="log-row"|class="request"/);
   assert.equal(f.element("connect-guest").value, "");
   let copied;
   f.sandbox.navigator.clipboard={async writeText(value){copied=value;}};
@@ -124,14 +127,49 @@ test("broker OAuth posts selected scope and reports completion without guest log
   assert.equal(call.url,"/api/mcp/Linear/oauth/start");
   assert.equal(call.options.method,"POST");
   assert.deepEqual(JSON.parse(call.options.body),{scope:"read"});
-  call.resolve({ok:true,json:async()=>({authorize_url:"https://auth.example/authorize"})});
+  const authorizeUrl="https://auth.example/authorize?response_type=code&client_id=test&redirect_uri=http%3A%2F%2F127.0.0.1%3A8081%2Foauth%2Fcallback&state=abc&scope=read%20write";
+  call.resolve({ok:true,json:async()=>({authorize_url:authorizeUrl,browser_opened:false})});
   await resolveSettings(f); await start;
-  assert.equal(f.element("oauth-link").href,"https://auth.example/authorize");
+  assert.equal(f.element("oauth-link").href,authorizeUrl);
+  assert.equal(f.element("oauth-url").value,authorizeUrl);
+  assert.equal(f.element("oauth-redirect").value,"http://127.0.0.1:8081/oauth/callback");
+  assert.match(f.element("oauth-status").textContent,/could not be opened/);
+  let copied;
+  f.sandbox.navigator.clipboard={async writeText(value){copied=value;}};
+  await f.element("copy-oauth").onclick();
+  assert.equal(copied,authorizeUrl);
   const poll=f.timers.at(-1).callback();
   f.calls.at(-1).resolve({ok:true,json:async()=>({state:"connected"})});
   await resolveSettings(f); await poll;
   assert.equal(f.element("oauth-link").hidden,true);
   assert.match(f.element("form-status").textContent,/Friendzone now refreshes/);
+  assert.equal(f.element("oauth-next").hidden,false);
+});
+
+test("Add & authorize saves a private server and immediately starts sign-in", async () => {
+  const f=fixture();
+  f.element("name").value="Linear"; f.element("url").value="https://mcp.linear.app/mcp";
+  f.element("scope").value="read";
+  const pending=f.element("save-oauth").onclick();
+  f.calls.at(-1).resolve({json:async()=>[]});
+  await new Promise(setImmediate);
+  const save=f.calls.at(-1);
+  assert.equal(save.url,"/api/mcp/config"); assert.equal(save.options.method,"PUT");
+  const [config]=JSON.parse(save.options.body);
+  assert.equal(config.oauth,true); assert.deepEqual(config.tools,[]); assert.deepEqual(config.guests,[]);
+  save.resolve({ok:true});
+  await resolveSettings(f,[{...linearForward,auth:"oauth-required",tools:[],guests:[]}]);
+  await new Promise(setImmediate);
+  const login=f.calls.at(-1);
+  assert.equal(login.url,"/api/mcp/Linear/oauth/start");
+  assert.deepEqual(JSON.parse(login.options.body),{scope:"read"});
+  login.resolve({ok:true,json:async()=>({authorize_url:"https://auth.example/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A8081%2Foauth%2Fcallback",browser_opened:true})});
+  await resolveSettings(f,[{...linearForward,auth:"oauth-required",tools:[],guests:[]}]);
+  await pending;
+  assert.equal(f.element("save-oauth").disabled,false);
+  assert.equal(f.element("oauth-panel").hidden,false);
+  assert.match(html,/Add &amp; authorize/);
+  assert.doesNotMatch(html,/Save for OAuth \(no tools\/guests yet\)/);
 });
 
 test("cancelled OAuth polling cannot restore a waiting or success state", async () => {

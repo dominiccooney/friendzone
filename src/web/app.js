@@ -5,6 +5,7 @@ let order = JSON.parse(localStorage.getItem("fz-order") || "[]");
 let mcpConnectData = null, mcpHostInitialized = false, mcpConnectGeneration = 0, mcpGuestSignature = "";
 const mcpOAuthPolls = new Map();
 let reviewingMcp = null;
+let activeMcpOAuth = null;
 
 function esc(value) { return String(value).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;"); }
 function displayTime(value) { return new Date(value).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"}); }
@@ -150,12 +151,13 @@ async function renderSettings() {
       : f.auth==="stored-key" || f.auth==="env-key" ? `<span class="verdict allowed">${esc(f.auth)}</span> <button class="quiet" data-oauth="${esc(f.name)}">Switch to OAuth…</button>`
       : `<button class="quiet" data-oauth="${esc(f.name)}">Authorize in Friendzone…</button>`;
     const endpoint = f.guest_endpoint
-      ? `<input data-mcp-endpoint readonly aria-label="Friendzone URL for ${esc(f.name)}" value="${esc(f.guest_endpoint)}"><button type="button" data-mcp-copy-url="${esc(f.name)}">Copy Friendzone URL</button>`
+      ? `<textarea data-mcp-endpoint rows="2" readonly spellcheck="false" aria-label="Friendzone URL for ${esc(f.name)}">${esc(f.guest_endpoint)}</textarea><button type="button" data-mcp-copy-url="${esc(f.name)}">Copy URL</button>`
       : `<code>/mcp/${esc(encodeURIComponent(f.name))}</code> — set the broker host in Connect from Cline below to get a complete URL.`;
-    return `<div class="log-row"><span>${esc(f.name)}</span><span class="request">Upstream: ${esc(f.url)} · ${f.tools.length} tools · guests: ${f.guests===null?"all approved":esc(f.guests.join(", ")||"none")}${f.scope?` · scope ${esc(f.scope)}`:""}<span class="mcp-endpoint">Friendzone URL for guest Cline: ${endpoint}</span></span><span>${status} <button data-mcp-review="${esc(f.name)}">Review tools / guests</button> <button data-mcp-connect="${esc(f.name)}">Connect from Cline</button> <button data-mcp-delete="${esc(f.name)}">Remove</button></span></div>`;
-  }).join("") || '<div class="log-row">No MCP forwards yet. Add or import one below; no broker restart needed.</div>';
+    return `<article class="mcp-card"><header class="mcp-card-heading"><h3>${esc(f.name)}</h3><span>${f.tools.length} allowed tools · guests: ${f.guests===null?"all approved":esc(f.guests.join(", ")||"none")}</span></header><div class="mcp-card-endpoint"><strong>URL to add in guest Cline</strong><div class="mcp-endpoint">${endpoint}</div><p class="meta">URL alone is not enough: <button type="button" data-mcp-connect="${esc(f.name)}">Copy Cline setup…</button> includes the guest Authorization header.</p></div><div class="mcp-card-auth">${status}${f.scope?`<p class="meta">OAuth scope: ${esc(f.scope)}</p>`:""}</div><div class="mcp-card-actions"><button type="button" data-mcp-review="${esc(f.name)}">Choose tools and guests</button><button type="button" class="quiet" data-mcp-delete="${esc(f.name)}">Remove</button></div><p class="mcp-upstream">Upstream (broker only): <code>${esc(f.url)}</code></p></article>`;
+  }).join("") || '<p class="mcp-empty">No MCP servers yet. Add or import one below, sign in, then choose what guests may use.</p>';
+  fitMcpEndpoints();
   document.querySelectorAll("[data-mcp-copy-url]").forEach(button => button.onclick = () => {
-    const input = button.closest(".log-row").querySelector("[data-mcp-endpoint]");
+    const input = button.closest(".mcp-card").querySelector("[data-mcp-endpoint]");
     return copyMcpText(input, $("#mcp-copy-status"), "Friendzone URL copied. Use Connect from Cline for the required guest Authorization header or complete JSON.", () => input.isConnected);
   });
   document.querySelectorAll("[data-mcp-connect]").forEach(button => button.onclick = () => {
@@ -163,22 +165,7 @@ async function renderSettings() {
     loadMcpConnection();
     $("#mcp-connect").scrollIntoView({behavior:"smooth", block:"start"});
   });
-  document.querySelectorAll("[data-mcp-review]").forEach(button => button.onclick = async () => {
-    try {
-      const configs = await (await fetch("/api/mcp/config")).json();
-      const config = configs.find(f=>f.name===button.dataset.mcpReview);
-      if (!config) throw new Error("Forward no longer exists");
-      reviewingMcp = config;
-      clineLink = config.cline || null; validatedMcp = null;
-      $("#mcp-name").value = config.name; $("#mcp-url").value = config.url;
-      $("#mcp-bearer").value = config.bearer_env || ""; $("#mcp-owned-oauth").checked = !!config.oauth;
-      $("#mcp-guests").value = config.guests?.join(", ") || "";
-      $("#mcp-source").textContent = config.oauth ? "Friendzone owns OAuth and refresh. Imported Cline credentials are not used." : "Reviewing the existing forward; validate before applying permissions.";
-      await $("#mcp-validate").onclick();
-      for (const checkbox of document.querySelectorAll("#mcp-tools input")) checkbox.checked = config.tools.includes(checkbox.value);
-      $("#mcp-name").scrollIntoView({behavior:"smooth",block:"center"});
-    } catch (error) { $("#mcp-form-status").textContent = String(error); }
-  });
+  document.querySelectorAll("[data-mcp-review]").forEach(button => button.onclick = () => reviewMcpAccess(button.dataset.mcpReview));
   document.querySelectorAll("[data-mcp-delete]").forEach(button => button.onclick = async () => {
     if (!confirm(`Remove '${button.dataset.mcpDelete}' for new requests? In-flight calls will finish.`)) return;
     try {
@@ -259,18 +246,41 @@ function cancelMcpOAuth(name) {
   mcpOAuthPolls.delete(name);
 }
 
+function fitMcpEndpoints() {
+  for (const input of document.querySelectorAll("[data-mcp-endpoint]")) {
+    input.style.height = "auto";
+    input.style.height = `${input.scrollHeight + 2}px`;
+  }
+}
+window.addEventListener("resize", fitMcpEndpoints);
+
+function mcpOAuthStatus(message) {
+  $("#mcp-oauth-status").textContent = message;
+  $("#mcp-form-status").textContent = message;
+}
+
 async function startMcpOAuth(name, scope) {
+  if (activeMcpOAuth && activeMcpOAuth !== name) cancelMcpOAuth(activeMcpOAuth);
+  activeMcpOAuth = name;
   cancelMcpOAuth(name);
   const attempt = {timer:null}; mcpOAuthPolls.set(name, attempt);
   const current = () => mcpOAuthPolls.get(name) === attempt;
-  $("#mcp-form-status").textContent = `Starting host OAuth for '${name}'…`;
+  $("#mcp-oauth-panel").hidden = false;
+  $("#mcp-oauth-panel").scrollIntoView({behavior:"smooth",block:"center"});
+  $("#mcp-oauth-url").value = ""; $("#mcp-oauth-redirect").value = "";
+  $("#mcp-oauth-link").hidden = true; $("#mcp-copy-oauth").disabled = true;
+  $("#mcp-oauth-next").hidden = true;
+  mcpOAuthStatus(`Starting host sign-in for '${name}'…`);
   try {
     const response = await fetch(`/api/mcp/${encodeURIComponent(name)}/oauth/start`, {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({scope})});
     if (!response.ok) throw new Error(await response.text());
-    const {authorize_url} = await response.json();
+    const {authorize_url, browser_opened} = await response.json();
     if (!current()) return;
     const link = $("#mcp-oauth-link"); link.href = authorize_url; link.hidden = false;
-    $("#mcp-form-status").textContent = "Complete authorization in the host browser. Use the link below if it did not open.";
+    $("#mcp-oauth-url").value = authorize_url;
+    $("#mcp-oauth-redirect").value = new URL(authorize_url).searchParams.get("redirect_uri") || "";
+    $("#mcp-copy-oauth").disabled = false;
+    mcpOAuthStatus(browser_opened === false ? "The browser could not be opened. Use Open sign-in page or Copy sign-in URL below." : "Complete sign-in in the host browser. If it opened a broken page, open or copy the FULL sign-in URL below.");
     const poll = async () => {
       try {
         const response = await fetch(`/api/mcp/${encodeURIComponent(name)}/oauth/status`);
@@ -279,20 +289,47 @@ async function startMcpOAuth(name, scope) {
         if (!current()) return;
         if (!status || status.state === "failed") {
           mcpOAuthPolls.delete(name); link.hidden = true;
-          $("#mcp-form-status").textContent = status?.message || "Authorization was cancelled or the forward changed. Start again.";
+          mcpOAuthStatus(status?.message || "Authorization was cancelled or the forward changed. Start again.");
+          $("#mcp-copy-oauth").disabled = true;
           await renderSettings(); return;
         }
         if (status.state === "connected") {
           mcpOAuthPolls.delete(name); link.hidden = true;
-          $("#mcp-form-status").textContent = `Connected '${name}'. Friendzone now refreshes its OAuth tokens. Use Validate / discover tools to review allowed tools.`;
+          $("#mcp-copy-oauth").disabled = true;
+          $("#mcp-oauth-next").hidden = false;
+          $("#mcp-oauth-next").onclick = () => reviewMcpAccess(name);
+          mcpOAuthStatus(`Signed in to '${name}'. Friendzone now refreshes its OAuth tokens. Next: choose the tools and guests you want to allow. Existing permissions are unchanged.`);
           await renderSettings(); return;
         }
         attempt.timer = setTimeout(poll, 1500);
-      } catch (error) { if (current()) { cancelMcpOAuth(name); $("#mcp-form-status").textContent = String(error); } }
+      } catch (error) { if (current()) { cancelMcpOAuth(name); mcpOAuthStatus(String(error)); } }
     };
     attempt.timer = setTimeout(poll, 1500);
     await renderSettings();
-  } catch (error) { if (current()) { cancelMcpOAuth(name); $("#mcp-form-status").textContent = `OAuth start failed: ${error}`; } }
+  } catch (error) { if (current()) { cancelMcpOAuth(name); mcpOAuthStatus(`Sign-in could not start: ${error}. The server is saved; retry Authorize in Friendzone on its card.`); } }
+}
+
+$("#mcp-copy-oauth").onclick = () => {
+  const input = $("#mcp-oauth-url"), value = input.value;
+  return copyMcpText(input, $("#mcp-oauth-status"), "Full sign-in URL copied. Paste it into the host browser address bar, not a terminal.", () => input.value === value);
+};
+
+async function reviewMcpAccess(name) {
+  try {
+    const configs = await (await fetch("/api/mcp/config")).json();
+    const config = configs.find(f=>f.name===name);
+    if (!config) throw new Error("Forward no longer exists");
+    reviewingMcp = config;
+    clineLink = config.cline || null; validatedMcp = null;
+    $("#mcp-name").value = config.name; $("#mcp-url").value = config.url;
+    $("#mcp-bearer").value = config.bearer_env || ""; $("#mcp-owned-oauth").checked = !!config.oauth;
+    $("#mcp-scope").value = config.scope || "";
+    $("#mcp-guests").value = config.guests?.join(", ") || "";
+    $("#mcp-source").textContent = `Editing access for '${config.name}'. Nothing changes until you click Save guest access.`;
+    $("#mcp-access").scrollIntoView({behavior:"smooth",block:"start"});
+    await $("#mcp-validate").onclick();
+    for (const checkbox of document.querySelectorAll("#mcp-tools input")) checkbox.checked = config.tools.includes(checkbox.value);
+  } catch (error) { $("#mcp-form-status").textContent = String(error); }
 }
 
 $("#mcp-save").onclick = async () => {
@@ -415,7 +452,8 @@ $("#mcp-preview").onclick = async () => {
           $("#mcp-owned-oauth").checked = true;
           $("#mcp-name").value = candidate.server.replace(/[^a-zA-Z0-9_-]/g, "-");
           $("#mcp-url").value = candidate.url; $("#mcp-bearer").value = ""; $("#mcp-tools").innerHTML = "";
-          $("#mcp-source").textContent = `Imported ${candidate.server} from ${path}. Recommended: Save for OAuth, then Authorize in Friendzone. Uncheck broker OAuth only to use Cline's credential link.`;
+          $("#mcp-scope").value = candidate.url.startsWith("https://mcp.linear.app/") ? "read" : "";
+          $("#mcp-source").textContent = `Imported ${candidate.server} from ${path}. Click Add & authorize to sign in, then choose guest access. Uncheck broker OAuth only to use Cline's credential link.`;
         };
         row.append(select);
       }
@@ -438,18 +476,24 @@ $("#mcp-validate").onclick = async () => {
       checkbox.type = "checkbox"; checkbox.value = name;
       label.append(checkbox, document.createTextNode(name)); $("#mcp-tools").append(label, document.createElement("br"));
     }
-    $("#mcp-form-status").textContent = `Validated. Select tools explicitly; none are allowed by default.${result.more?" Server has more pages; use the advanced editor for additional known tool names.":""}`;
+    $("#mcp-form-status").textContent = `Tools loaded. Choose tools and guests below, then Save guest access.${result.more?" Server has more pages; use the advanced editor for additional known tool names.":""}`;
   } catch (error) { $("#mcp-form-status").textContent = String(error); }
 };
 $("#mcp-save-oauth").onclick = async () => {
+  const button = $("#mcp-save-oauth"); button.disabled = true;
   try {
     const draft = mcpDraft(); draft.oauth = true; draft.bearer_env = "";
+    if (!draft.name || !draft.url) throw new Error("Select an imported server or enter a server name and upstream URL first.");
+    const scope = $("#mcp-scope").value.trim();
+    draft.scope = scope || null;
     const configs = await (await fetch("/api/mcp/config")).json();
     if (configs.some(f=>f.name===draft.name)) throw new Error("Forward already exists. Use Authorize in Friendzone on its row.");
     await saveMcp([...configs, draft]);
     $("#mcp-owned-oauth").checked = true;
-    $("#mcp-form-status").textContent = "Saved with no guest or tool access. Authorize in Friendzone on the new row, then validate and choose permissions.";
+    reviewingMcp = draft;
+    await startMcpOAuth(draft.name, scope);
   } catch (error) { $("#mcp-form-status").textContent = String(error); }
+  finally { button.disabled = false; }
 };
 $("#mcp-add").onclick = async () => {
   try {
@@ -465,7 +509,7 @@ $("#mcp-add").onclick = async () => {
       await saveMcp(configs.map(f=>f.name===draft.name?{...f,tools:draft.tools,guests:draft.guests}:f));
     } else await saveMcp([...configs, draft]);
     validatedMcp = null;
-    $("#mcp-form-status").textContent = "Applied live. No broker restart.";
+    $("#mcp-form-status").textContent = "Guest access saved. Use Copy Cline setup on the server card to connect the guest.";
   } catch (error) { $("#mcp-form-status").textContent = String(error); }
 };
 

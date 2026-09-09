@@ -621,8 +621,9 @@ async fn oauth_start(
         .await
     {
         Ok(url) => {
-            open_host_browser(&url);
-            Json(serde_json::json!({ "authorize_url": url })).into_response()
+            let browser_opened = open_host_browser(&url).await;
+            Json(serde_json::json!({ "authorize_url": url, "browser_opened": browser_opened }))
+                .into_response()
         }
         Err(error) => (StatusCode::BAD_GATEWAY, format!("{error:#}")).into_response(),
     }
@@ -672,7 +673,7 @@ async fn cline_oauth_start(
                 verification_uri, ..
             } = &login
             {
-                open_host_browser(verification_uri);
+                open_host_browser(verification_uri).await;
             }
             Json(serde_json::json!(login)).into_response()
         }
@@ -691,17 +692,13 @@ async fn cline_oauth_status(
     }
 }
 
-fn open_host_browser(url: &str) {
-    #[cfg(target_os = "windows")]
-    let result = std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn();
-    #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    let result = std::process::Command::new("xdg-open").arg(url).spawn();
-    if let Err(error) = result {
-        tracing::warn!(%error, "could not open host browser");
+async fn open_host_browser(url: &str) -> bool {
+    match crate::browser::open(url).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "could not open host browser");
+            false
+        }
     }
 }
 

@@ -3,6 +3,13 @@
 Cheat sheet: host first, then browser, then inside the container.
 `HOST_IP` below is the host's address on the VM-facing interface.
 
+**Before untrusted workloads:** this quickstart configures applications,
+not VM confinement. Read [Network isolation and recovery](NETWORK-ISOLATION.md).
+Build/test a clean image first, then enforce egress outside the guest: only
+the broker's proxy and bootstrap/MCP ports, never the UI or other egress.
+Keep host-console recovery available; do not lock down via your only SSH
+connection or reopen Internet access for a potentially compromised guest.
+
 ## 1. Host: start the broker
 
 ```powershell
@@ -17,6 +24,11 @@ Local demo without a VM? Use `127.0.0.1` everywhere `HOST_IP` appears.
 | proxy     | `HOST_IP:8080`    | containers (HTTP/HTTPS via `HTTP(S)_PROXY`)   |
 | UI        | `127.0.0.1:8081`  | you, in the host browser                      |
 | bootstrap | `HOST_IP:8082`    | containers (`fz` binary, CA, fakes, MCP)      |
+
+The broker rejects non-loopback UI binds and proxy traffic to its management
+port. Host/switch policy is still required. Hyper-V's Default Switch/NAT is
+convenient for clean-image setup but is not isolation; the linked guide uses
+a dedicated internal switch, static addresses, and explicit port ACLs.
 
 ## 2. Browser: open the UI and configure once
 
@@ -38,13 +50,14 @@ Open <http://127.0.0.1:8081>.
   the tokens in the background and auto-refreshes them. Edit fixes a wrong
   header/host without changing the fake; Delete removes the entry and
   its stored key together.
-- **Settings → MCP forwards** — add a streamable-HTTP server or preview
-  a host Cline MCP settings file, select a server, **Validate / discover
-  tools**, then explicitly select allowed tools and guests. **Add forward
-  & apply live** does not restart the broker. For an OAuth server, choose
-  **Save for OAuth** first (no tools or guests are granted), then
-  **Authorize in Friendzone** on its row. Complete login in the host browser,
-  then **Review tools / guests** to discover and select permissions.
+- **Settings → MCP forwards** — find a server in host Cline or enter its
+  name and upstream URL. **Add & authorize** creates it and starts host
+  sign-in in one step. Complete login, then **Next: choose tools and guests**
+  and **Save guest access**. Until that last step, a new server is private
+  (not shared with any guest). For existing servers, use **Authorize in
+  Friendzone** and **Choose tools and guests** on their card. Cancelling
+  login does not delete the server; retry from its card. No settings change
+  here requires restarting the broker.
 
 Optional, before starting: MCP forwards live in `mcp-forwards.json` in
 the broker data directory — the broker prints the exact path at startup
@@ -95,6 +108,17 @@ login cannot restore old credentials. Permission edits preserve the session.
 The browser callback requires a loopback UI listener. Servers requiring
 pre-registered/confidential clients are not supported by this flow yet.
 Legacy broker OAuth sessions without URL binding require reauthorization.
+
+### Sign-in opens a URL ending at `?response_type=code`
+
+Older Windows builds opened OAuth URLs with `cmd /C start`, which treated
+`&` query separators as command separators and dropped `redirect_uri` and
+the other required parameters. The fixed launcher passes the whole URL as
+data, not shell text. The sign-in panel also offers **Open sign-in page**,
+**Copy sign-in URL**, and the registered callback URL for diagnosis. Paste
+the full sign-in URL into the host browser address bar, not a terminal.
+If the provider still rejects it, compare the callback shown in the panel;
+do not substitute the guest MCP endpoint for an OAuth redirect URI.
 
 ## 3. Container: bootstrap
 
@@ -189,10 +213,10 @@ There is no need to disable TLS verification or globally bypass the proxy.
 
 ## 5. Container: point the agent at MCP forwards
 
-In the host UI, each MCP forward has **Copy Friendzone URL** next to its
+In the host UI, each MCP server card has **Copy URL** next to its
 guest-facing URL; copying it requires no guest selection. The upstream URL
 is Linear's (or another provider's) server, not the URL to add in guest Cline.
-Use **Settings → MCP forwards → Connect from Cline** for
+Use **Settings → MCP forwards → Copy Cline setup** for
 the guest endpoint and copyable Cline JSON for each forward. Select the
 guest and merge the generated entry into its Cline MCP settings; do not
 overwrite other servers. The broker host/port default comes from the

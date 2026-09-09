@@ -1,0 +1,115 @@
+// Optional real-browser layout test, with no browser automation dependency:
+// FZ_TEST_BROWSER=/absolute/path/to/chrome node --test tests/web_mcp_layout.test.cjs
+const assert = require("node:assert/strict");
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const http = require("node:http");
+const os = require("node:os");
+const path = require("node:path");
+const test = require("node:test");
+const { setTimeout: delay } = require("node:timers/promises");
+
+const web = path.join(__dirname, "../src/web");
+
+test("MCP cards show full URLs and usable actions at desktop and narrow widths", {
+  skip: !process.env.FZ_TEST_BROWSER, timeout: 30000,
+}, async () => {
+  const name = "Linear-" + "long-server-name-".repeat(12);
+  const endpoint = "http://172.31.208.1:8082/mcp/" + name;
+  const forward = { name, url: "https://mcp.linear.app/mcp", tools: ["list_issues"],
+    guests: ["scratch-kali"], auth: "oauth", guest_endpoint: endpoint };
+  const state = { containers: [{ id: "scratch-kali", name: "scratch-kali", approved: true,
+    state: "working", request_count: 0, last_activity: new Date().toISOString(), pinned_ip: null }], requests: [] };
+  const server = http.createServer((request, response) => {
+    const route = request.url.split("?")[0];
+    if (route === "/api/events") {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write("data: " + JSON.stringify(state) + "\n\n"); return;
+    }
+    const assets = { "/": ["index.html", "text/html"], "/app.js": ["app.js", "text/javascript"], "/app.css": ["app.css", "text/css"] };
+    if (assets[route]) {
+      response.writeHead(200, { "content-type": assets[route][1] });
+      response.end(fs.readFileSync(path.join(web, assets[route][0]), "utf8").replace("{{CLINE_MCP_SETTINGS_PATH}}", "C:/Users/host/.cline/data/settings/cline_mcp_settings.json")); return;
+    }
+    const replies = {
+      "/api/state": state, "/api/escrow": { entries: [] },
+      "/api/mcp": { forwards: [forward], guest_host: "172.31.208.1", guest_port: 8082 },
+      "/api/mcp/config": [], "/api/log": { requests: [], next_before: null, retained: 0, capacity: 10000, evicted: 0 },
+    };
+    if (route === "/api/guest-env") { response.end("# environment"); return; }
+    if (route.endsWith("/guest-config")) replies[route] = { endpoint, authorization: "Basic c2NyYXRjaC1rYWxpOng=", warnings: [], cline_config: { mcpServers: {} } };
+    response.writeHead(route in replies ? 200 : 404, { "content-type": "application/json" });
+    response.end(JSON.stringify(replies[route] || {}));
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "fz-browser-layout-"));
+  const browser = spawn(process.env.FZ_TEST_BROWSER, ["--headless=new", "--no-first-run", "--no-default-browser-check",
+    "--disable-background-networking", "--disable-extensions", "--remote-debugging-port=0",
+    "--remote-debugging-address=127.0.0.1", "--user-data-dir=" + profile, "about:blank"],
+    { windowsHide: true, stdio: "ignore" });
+  let socket;
+  try {
+    const portFile = path.join(profile, "DevToolsActivePort");
+    for (let i = 0; !fs.existsSync(portFile) && i < 100; i++) await delay(50);
+    assert.ok(fs.existsSync(portFile), "headless browser failed to start");
+    const port = fs.readFileSync(portFile, "utf8").split("\n")[0];
+    const pages = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+    socket = new WebSocket(pages.find(page => page.type === "page").webSocketDebuggerUrl);
+    await new Promise((resolve, reject) => { socket.onopen = resolve; socket.onerror = reject; });
+    let sequence = 0; const pending = new Map(); const errors = [];
+    socket.onmessage = event => {
+      const message = JSON.parse(event.data);
+      if (message.method === "Runtime.exceptionThrown") errors.push(message.params.exceptionDetails.text);
+      const call = pending.get(message.id);
+      if (call) { pending.delete(message.id); message.error ? call.reject(message.error) : call.resolve(message.result); }
+    };
+    const send = (method, params = {}) => new Promise((resolve, reject) => {
+      const id = ++sequence; pending.set(id, { resolve, reject }); socket.send(JSON.stringify({ id, method, params }));
+    });
+    const evaluate = async expression => {
+      const result = await send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
+      assert.equal(result.exceptionDetails, undefined, JSON.stringify(result.exceptionDetails));
+      return result.result.value;
+    };
+    await send("Runtime.enable"); await send("Page.enable");
+    await send("Page.navigate", { url: `http://127.0.0.1:${server.address().port}/` });
+    for (let i = 0; i < 100 && !await evaluate("!!document.querySelector('[data-view=settings]')?.onclick"); i++) await delay(25);
+    await evaluate("document.querySelector('[data-view=settings]').click()");
+    for (let i = 0; i < 100 && !await evaluate("!!document.querySelector('.mcp-card')"); i++) await delay(25);
+    for (const width of [1058, 480]) {
+      await send("Emulation.setDeviceMetricsOverride", { width, height: 1000, deviceScaleFactor: 1, mobile: false });
+      await delay(50);
+      const layout = await evaluate(`(() => {
+        const card = document.querySelector('.mcp-card'), url = card.querySelector('[data-mcp-endpoint]');
+        const copy = card.querySelector('[data-mcp-copy-url]'), rect = copy.getBoundingClientRect();
+        return {value:url.value, cardWidth:card.clientWidth, cardScroll:card.scrollWidth,
+          urlWidth:url.clientWidth, urlScroll:url.scrollWidth, urlHeight:url.clientHeight, urlScrollHeight:url.scrollHeight,
+          textOverflow:getComputedStyle(url).textOverflow, whiteSpace:getComputedStyle(url).whiteSpace,
+          copyText:copy.textContent, copyLeft:rect.left, copyRight:rect.right, viewport:innerWidth,
+          pageWidth:document.documentElement.scrollWidth};
+      })()`);
+      assert.equal(layout.value, endpoint);
+      assert.ok(layout.cardScroll <= layout.cardWidth + 1, JSON.stringify(layout));
+      assert.ok(layout.urlScroll <= layout.urlWidth + 1, JSON.stringify(layout));
+      assert.ok(layout.urlScrollHeight <= layout.urlHeight + 1, "full endpoint must be visible without vertical scrolling: " + JSON.stringify(layout));
+      assert.notEqual(layout.textOverflow, "ellipsis");
+      assert.equal(layout.whiteSpace, "pre-wrap");
+      assert.equal(layout.copyText, "Copy URL");
+      assert.ok(layout.copyLeft >= 0 && layout.copyRight <= width, JSON.stringify(layout));
+      assert.ok(layout.pageWidth <= width + 1, JSON.stringify(layout));
+      if (process.env.FZ_SCREENSHOT_DIR) {
+        fs.mkdirSync(process.env.FZ_SCREENSHOT_DIR, { recursive: true });
+        const shot = await send("Page.captureScreenshot", { format: "png", captureBeyondViewport: false });
+        fs.writeFileSync(path.join(process.env.FZ_SCREENSHOT_DIR, `mcp-${width}.png`), Buffer.from(shot.data, "base64"));
+      }
+    }
+    await evaluate("Object.defineProperty(navigator, 'clipboard', {value:{writeText:async text=>{window.copiedEndpoint=text}}, configurable:true}); document.querySelector('[data-mcp-copy-url]').click()");
+    assert.equal(await evaluate("window.copiedEndpoint"), endpoint);
+    assert.deepEqual(errors, []);
+  } finally {
+    socket?.close(); browser.kill();
+    server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
+    await delay(250);
+    fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});

@@ -20,15 +20,19 @@ pub struct EventHandler {
     /// Identity travels with that tunnel, never in an IP/port cache that
     /// could outlive a socket and authenticate a different connection.
     tunnel_identity: Option<String>,
+    /// Block this destination port globally, not by hostname: aliases and
+    /// DNS rebinding must not let guests reach the host's management API.
+    management_port: u16,
 }
 
 impl EventHandler {
-    pub fn new(state: AppState, settings: crate::settings::Settings) -> Self {
+    pub fn new(state: AppState, settings: crate::settings::Settings, management_port: u16) -> Self {
         Self {
             state,
             settings,
             pending: None,
             tunnel_identity: None,
+            management_port,
         }
     }
 
@@ -86,6 +90,29 @@ impl EventHandler {
                 .into();
         }
         let killed = self.state.is_killed(&container);
+        let destination_port = req
+            .uri()
+            .port_u16()
+            .or_else(|| match req.uri().scheme_str() {
+                Some("http") => Some(80),
+                Some("https") => Some(443),
+                _ => None,
+            });
+        if destination_port == Some(self.management_port) {
+            let reason = "friendzone: proxy access to the management UI port is forbidden";
+            let id = self.state.record(
+                container,
+                req.method().to_string(),
+                req.uri().to_string(),
+                Verdict::Blocked,
+            );
+            self.state.annotate(id, Some(403), Some(reason.into()));
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::from(reason))
+                .expect("static denial")
+                .into();
+        }
         if req.method() == hudsucker::hyper::Method::CONNECT && !killed {
             self.tunnel_identity = Some(container);
             // Successful CONNECTs are transport setup, not application
@@ -256,6 +283,153 @@ pub fn basic_username(value: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn management_port_is_denied_before_http_forwarding_or_connect() {
+        let dir = std::env::temp_dir().join(format!("fz-ui-gate-{}", uuid::Uuid::new_v4()));
+        let state = AppState::default();
+        state.add_container("guest");
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081);
+        let peer = "10.0.0.2:12345".parse().unwrap();
+        for host in [
+            "127.0.0.1",
+            "localhost",
+            "[::1]",
+            "[::ffff:127.0.0.1]",
+            "host-alias.example",
+            "2130706433",
+        ] {
+            for method in ["GET", "POST", "CONNECT"] {
+                let url = if method == "CONNECT" {
+                    format!("{host}:8081")
+                } else {
+                    format!("http://{host}:8081/api/containers")
+                };
+                assert_eq!(
+                    status(
+                        handler
+                            .handle_from_peer(peer, request(method, &url, Some("guest")))
+                            .await
+                    ),
+                    StatusCode::FORBIDDEN
+                );
+                assert!(
+                    state.view().requests[0]
+                        .detail
+                        .as_deref()
+                        .unwrap()
+                        .contains("management UI")
+                );
+            }
+        }
+        for (port, url) in [
+            (80, "http://localhost/api/state"),
+            (443, "https://localhost/api/state"),
+        ] {
+            let mut handler = EventHandler::new(state.clone(), settings.clone(), port);
+            assert_eq!(
+                status(
+                    handler
+                        .handle_from_peer(peer, request("GET", url, Some("guest")))
+                        .await
+                ),
+                StatusCode::FORBIDDEN
+            );
+        }
+        // This guard must not break recovery/bootstrap or direct MCP access.
+        assert!(matches!(
+            handler
+                .handle_from_peer(
+                    peer,
+                    request("GET", "http://10.0.0.1:8082/health", Some("guest"))
+                )
+                .await,
+            RequestOrResponse::Request(_)
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_proxy_cannot_reach_management_listener() {
+        use hudsucker::{Proxy, certificate_authority::RcgenAuthority, rustls::crypto::aws_lc_rs};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let dir = std::env::temp_dir().join(format!("fz-ui-isolation-{}", uuid::Uuid::new_v4()));
+        let files = crate::ca::AuthorityFiles::load_or_create(&dir).unwrap();
+        let state = AppState::default();
+        state.add_container("guest");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = hits.clone();
+        let ui_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ui_addr = ui_listener.local_addr().unwrap();
+        let ui = tokio::spawn(async move {
+            axum::serve(
+                ui_listener,
+                axum::Router::new().fallback(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    async { "management" }
+                }),
+            )
+            .await
+            .unwrap()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy = Proxy::builder()
+            .with_listener(listener)
+            .with_ca(RcgenAuthority::new(
+                files.issuer().unwrap(),
+                10,
+                aws_lc_rs::default_provider(),
+            ))
+            .with_rustls_connector(aws_lc_rs::default_provider())
+            .with_http_handler(EventHandler::new(
+                state,
+                crate::settings::Settings::load(&dir).unwrap(),
+                ui_addr.port(),
+            ))
+            .build()
+            .unwrap();
+        let task = tokio::spawn(proxy.start());
+        let client = reqwest::Client::builder()
+            .proxy(
+                reqwest::Proxy::all(format!("http://{address}"))
+                    .unwrap()
+                    .basic_auth("guest", "x"),
+            )
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let response = client
+            .post(format!("http://{ui_addr}/api/containers"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response.text().await.unwrap().contains("management UI"));
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket.write_all(format!("CONNECT {ui_addr} HTTP/1.1\r\nHost: {ui_addr}\r\nProxy-Authorization: Basic Z3Vlc3Q6eA==\r\n\r\n").as_bytes()).await.unwrap();
+        let mut bytes = [0; 1024];
+        let count =
+            tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(String::from_utf8_lossy(&bytes[..count]).starts_with("HTTP/1.1 403"));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no request reached the management listener"
+        );
+        task.abort();
+        ui.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn request(method: &str, url: &str, user: Option<&str>) -> Request<Body> {
         let mut builder = Request::builder().method(method).uri(url);
         if let Some(user) = user {
@@ -279,7 +453,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fz-proxy-{}", uuid::Uuid::new_v4()));
         let state = AppState::default();
         let settings = crate::settings::Settings::load(&dir).unwrap();
-        let mut handler = EventHandler::new(state.clone(), settings);
+        let mut handler = EventHandler::new(state.clone(), settings, 8081);
         let peer = "127.0.0.1:12345".parse().unwrap();
         let challenge = handler
             .handle_from_peer(peer, request("CONNECT", "github.com:443", None))
@@ -356,7 +530,7 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         state.set_killed("guest".into(), false);
-        let mut fresh = EventHandler::new(state.clone(), handler.settings.clone());
+        let mut fresh = EventHandler::new(state.clone(), handler.settings.clone(), 8081);
         assert_eq!(
             status(
                 fresh
@@ -400,6 +574,7 @@ mod tests {
             .with_http_handler(EventHandler::new(
                 state.clone(),
                 crate::settings::Settings::load(&dir).unwrap(),
+                8081,
             ))
             .build()
             .unwrap();

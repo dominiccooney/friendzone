@@ -1,3 +1,4 @@
+mod browser;
 mod ca;
 mod doctor;
 mod guest_http;
@@ -107,6 +108,7 @@ async fn run_broker(
     bootstrap_addr: SocketAddr,
     data_dir: PathBuf,
 ) -> Result<()> {
+    validate_listeners(proxy_addr, ui_addr, bootstrap_addr)?;
     let files = AuthorityFiles::load_or_create(&data_dir)?;
     let issuer = files.issuer()?;
     let state = AppState::default();
@@ -160,9 +162,50 @@ async fn run_broker(
 
     tokio::select! {
         _ = refresher => unreachable!("refresher loop never returns"),
-        result = proxy_server::serve(proxy_addr, state.clone(), issuer, settings.clone()) => result,
+        result = proxy_server::serve(proxy_addr, state.clone(), issuer, settings.clone(), ui_addr.port()) => result,
         result = web::serve_ui(ui_addr, state, settings.clone(), registry, bootstrap_addr) => result,
         result = web::serve_bootstrap(bootstrap_addr, files.cert_pem, mcp_state, settings, proxy_addr.port()) => result,
         signal = tokio::signal::ctrl_c() => signal.context("wait for Ctrl+C"),
+    }
+}
+
+fn validate_listeners(proxy: SocketAddr, ui: SocketAddr, bootstrap: SocketAddr) -> Result<()> {
+    if !ui.ip().is_loopback() {
+        anyhow::bail!(
+            "management UI must bind to loopback (127.0.0.1 or ::1); never expose it to guests"
+        );
+    }
+    if ui.port() == 0 || ui.port() == proxy.port() || ui.port() == bootstrap.port() {
+        anyhow::bail!(
+            "management UI requires a fixed port distinct from the proxy and bootstrap ports"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::*;
+
+    #[test]
+    fn management_listener_cannot_be_exposed_or_share_guest_ports() {
+        let proxy = "172.30.240.1:8080".parse().unwrap();
+        let bootstrap = "172.30.240.1:8082".parse().unwrap();
+        for ui in [
+            "0.0.0.0:8081",
+            "[::]:8081",
+            "172.30.240.1:8081",
+            "127.0.0.1:0",
+            "127.0.0.1:8080",
+            "127.0.0.1:8082",
+        ] {
+            assert!(
+                validate_listeners(proxy, ui.parse().unwrap(), bootstrap).is_err(),
+                "accepted {ui}"
+            );
+        }
+        for ui in ["127.0.0.1:8081", "[::1]:8081"] {
+            assert!(validate_listeners(proxy, ui.parse().unwrap(), bootstrap).is_ok());
+        }
     }
 }

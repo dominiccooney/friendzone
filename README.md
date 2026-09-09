@@ -8,6 +8,12 @@ and a web UI with settings.
 New here? See [QUICKSTART.md](QUICKSTART.md) for the run-this-open-that
 cheat sheet.
 
+**Security prerequisite:** proxy variables are not confinement. Before
+running untrusted agents, follow [NETWORK-ISOLATION.md](NETWORK-ISOLATION.md)
+for host-enforced egress restrictions, UI isolation, staged bootstrap,
+negative tests, and console-based recovery. The UI is privileged and not
+authenticated for guest access. Friendzone is not yet a hardened sandbox.
+
 ## Run the broker
 
 One broker serves any number of containers:
@@ -19,6 +25,12 @@ cargo run -- broker --proxy-addr HOST_VNIC_IP:8080 --ui-addr 127.0.0.1:8081 --bo
 Open <http://127.0.0.1:8081>. The CA certificate and private key are created
 under the operating system's local application-data directory in
 `friendzone/`. The private key is never served by the bootstrap endpoint.
+
+The UI must bind to loopback on its own fixed port. Proxying to that port is
+denied (including CONNECT and hostname aliases); guests must never receive
+network access or an alternate relay to the management API. Outside the VM,
+allow only the proxy and bootstrap/MCP ports on the broker's guest-facing IP.
+The separate bootstrap port must remain reachable for setup and recovery.
 
 ## Containers
 
@@ -154,9 +166,12 @@ calls finish with the old one. `guests: []` denies all; omitted/null means
 all approved guests for legacy configurations. Set a guest-name list for
 restricted sharing. Invalid configurations do not replace live forwards.
 
-For either an imported or standalone OAuth forward, use **Authorize in
-Friendzone** in Settings. New forwards can be **Saved for OAuth** with no
-tool/guest permissions before login; afterwards use **Review tools / guests**.
+For a new imported or standalone OAuth server, **Add & authorize** saves it
+and opens host sign-in in one step. After login, **Next: choose tools and
+guests**, then **Save guest access**. Until then, the new server is private.
+Existing server cards offer **Authorize in Friendzone** and **Choose tools
+and guests**, plus a full, wrapping guest endpoint with **Copy URL**.
+**Copy Cline setup** includes the required guest Authorization header.
 The broker discovers protected-resource and authorization-server metadata,
 registers a public client, uses PKCE S256 and a resource-bound grant, and
 stores its own session on the host. Concurrent requests share one refresh
@@ -178,6 +193,10 @@ reconfiguration and superseded callbacks cannot resurrect them. Permissions
 are not expanded by login. This OAuth implementation requires dynamic
 public-client registration and a loopback host UI callback; confidential or
 pre-registered clients and stdio/SSE imports are not supported yet.
+
+The Windows browser launcher passes URLs as data so OAuth query parameters
+are not split at `&`. The sign-in panel retains the complete URL with Open
+and Copy actions, plus the registered callback for troubleshooting.
 
 Guests use the generated Basic `Authorization` header, not upstream OAuth.
 An old guest Cline entry showing “OAuth required” should be replaced with the
