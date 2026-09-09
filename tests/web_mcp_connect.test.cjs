@@ -19,6 +19,7 @@ function fixture() {
     select() { this.selected = true; },
   }]));
   const calls = [];
+  const timers = [];
   const sandbox = {
     document: {
       querySelector(selector) {
@@ -30,9 +31,10 @@ function fixture() {
     localStorage: { getItem() { return null; } },
     EventSource: class {},
     window: {}, navigator: {}, URLSearchParams, console,
-    setTimeout, clearTimeout,
-    fetch(url) {
-      return new Promise(resolve => calls.push({url, resolve}));
+    setTimeout(callback) { const timer = {callback, cancelled:false}; timers.push(timer); return timer; },
+    clearTimeout(timer) { if (timer) timer.cancelled = true; },
+    fetch(url, options) {
+      return new Promise(resolve => calls.push({url, options, resolve}));
     },
   };
   const context = vm.createContext(sandbox);
@@ -57,8 +59,46 @@ function fixture() {
       }}}},
     }),
   });
-  return {run, element, sandbox, calls, seed, reply};
+  return {run, element, sandbox, calls, seed, reply, timers};
 }
+
+async function resolveSettings(f) {
+  await new Promise(setImmediate);
+  f.calls.filter(c=>c.url==="/api/escrow").at(-1).resolve({json:async()=>({entries:[]})});
+  f.calls.filter(c=>c.url==="/api/mcp").at(-1).resolve({json:async()=>({forwards:[],guest_host:"172.31.208.1",guest_port:8082})});
+  f.calls.filter(c=>c.url==="/api/guest-env").at(-1).resolve({text:async()=>"# environment"});
+}
+
+test("broker OAuth posts selected scope and reports completion without guest login", async () => {
+  const f=fixture();
+  const start=f.run('startMcpOAuth("Linear", "read")');
+  const call=f.calls.at(-1);
+  assert.equal(call.url,"/api/mcp/Linear/oauth/start");
+  assert.equal(call.options.method,"POST");
+  assert.deepEqual(JSON.parse(call.options.body),{scope:"read"});
+  call.resolve({ok:true,json:async()=>({authorize_url:"https://auth.example/authorize"})});
+  await resolveSettings(f); await start;
+  assert.equal(f.element("oauth-link").href,"https://auth.example/authorize");
+  const poll=f.timers.at(-1).callback();
+  f.calls.at(-1).resolve({ok:true,json:async()=>({state:"connected"})});
+  await resolveSettings(f); await poll;
+  assert.equal(f.element("oauth-link").hidden,true);
+  assert.match(f.element("form-status").textContent,/Friendzone now refreshes/);
+});
+
+test("cancelled OAuth polling cannot restore a waiting or success state", async () => {
+  const f=fixture();
+  const start=f.run('startMcpOAuth("Linear", "read")');
+  f.calls.at(-1).resolve({ok:true,json:async()=>({authorize_url:"https://auth.example/authorize"})});
+  await resolveSettings(f); await start;
+  const poll=f.timers.at(-1).callback();
+  const request=f.calls.at(-1);
+  f.run('cancelMcpOAuth("Linear")');
+  const count=f.timers.length;
+  request.resolve({ok:true,json:async()=>({state:"waiting_for_user"})}); await poll;
+  assert.equal(f.timers.length,count,"stale poll must not schedule itself again");
+  assert.equal(f.run('mcpOAuthPolls.has("Linear")'),false);
+});
 
 test("guest change discards stale instructions and copies the current config", async () => {
   const f = fixture(); f.seed();

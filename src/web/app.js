@@ -3,6 +3,8 @@ let snapshot = { containers: [], requests: [] };
 let logRows = [], logCursor = null, logPaused = false, logGeneration = 0, logTimer;
 let order = JSON.parse(localStorage.getItem("fz-order") || "[]");
 let mcpConnectData = null, mcpHostInitialized = false, mcpConnectGeneration = 0, mcpGuestSignature = "";
+const mcpOAuthPolls = new Map();
+let reviewingMcp = null;
 
 function esc(value) { return String(value).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;"); }
 function displayTime(value) { return new Date(value).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"}); }
@@ -143,16 +145,32 @@ async function renderSettings() {
   }).join("") || '<div class="log-row">No escrow entries yet.</div>';
   $("#mcp-list").innerHTML = mcp.forwards.map(f=>{
     const expiry = f.expires_at ? ` · expires ${new Date(f.expires_at*1000).toLocaleString()}${f.refreshable?" (auto-refresh)":""}` : "";
-    const status = f.auth==="cline-link" ? '<span class="verdict allowed">Cline link</span> · reconnect/refresh in host Cline'
-      : f.auth==="oauth" ? `<span class="verdict allowed">OAuth</span>${esc(expiry)} <button class="quiet" data-oauth="${esc(f.name)}">Reauthorize…</button> <button class="quiet" data-oauth-disconnect="${esc(f.name)}">Disconnect</button>`
+    const status = f.auth==="cline-link" ? `<span class="verdict">Cline credentials (not broker-owned)</span> <button class="quiet" data-oauth="${esc(f.name)}">Authorize in Friendzone…</button>`
+      : f.auth==="oauth" ? `<span class="verdict allowed">Friendzone OAuth</span>${esc(expiry)} <button class="quiet" data-oauth="${esc(f.name)}">Reauthorize in Friendzone…</button> <button class="quiet" data-oauth-disconnect="${esc(f.name)}">Disconnect</button>`
       : f.auth==="stored-key" || f.auth==="env-key" ? `<span class="verdict allowed">${esc(f.auth)}</span> <button class="quiet" data-oauth="${esc(f.name)}">Switch to OAuth…</button>`
-      : `<button class="quiet" data-oauth="${esc(f.name)}">Connect (OAuth)…</button>`;
-    return `<div class="log-row"><span>${esc(f.name)}</span><span class="request">Upstream: ${esc(f.url)} · ${f.tools.length} tools · guests: ${f.guests===null?"all approved":esc(f.guests.join(", ")||"none")}${f.scope?` · scope ${esc(f.scope)}`:""}<span class="mcp-endpoint">Guest endpoint: <code>${esc(f.guest_endpoint || `/mcp/${encodeURIComponent(f.name)} — choose the broker host below`)}</code></span></span><span>${status} <button data-mcp-connect="${esc(f.name)}">Connect from Cline</button> <button data-mcp-delete="${esc(f.name)}">Remove</button></span></div>`;
+      : `<button class="quiet" data-oauth="${esc(f.name)}">Authorize in Friendzone…</button>`;
+    return `<div class="log-row"><span>${esc(f.name)}</span><span class="request">Upstream: ${esc(f.url)} · ${f.tools.length} tools · guests: ${f.guests===null?"all approved":esc(f.guests.join(", ")||"none")}${f.scope?` · scope ${esc(f.scope)}`:""}<span class="mcp-endpoint">Guest endpoint: <code>${esc(f.guest_endpoint || `/mcp/${encodeURIComponent(f.name)} — choose the broker host below`)}</code></span></span><span>${status} <button data-mcp-review="${esc(f.name)}">Review tools / guests</button> <button data-mcp-connect="${esc(f.name)}">Connect from Cline</button> <button data-mcp-delete="${esc(f.name)}">Remove</button></span></div>`;
   }).join("") || '<div class="log-row">No MCP forwards yet. Add or import one below; no broker restart needed.</div>';
   document.querySelectorAll("[data-mcp-connect]").forEach(button => button.onclick = () => {
     $("#mcp-connect-forward").value = button.dataset.mcpConnect;
     loadMcpConnection();
     $("#mcp-connect").scrollIntoView({behavior:"smooth", block:"start"});
+  });
+  document.querySelectorAll("[data-mcp-review]").forEach(button => button.onclick = async () => {
+    try {
+      const configs = await (await fetch("/api/mcp/config")).json();
+      const config = configs.find(f=>f.name===button.dataset.mcpReview);
+      if (!config) throw new Error("Forward no longer exists");
+      reviewingMcp = config;
+      clineLink = config.cline || null; validatedMcp = null;
+      $("#mcp-name").value = config.name; $("#mcp-url").value = config.url;
+      $("#mcp-bearer").value = config.bearer_env || ""; $("#mcp-owned-oauth").checked = !!config.oauth;
+      $("#mcp-guests").value = config.guests?.join(", ") || "";
+      $("#mcp-source").textContent = config.oauth ? "Friendzone owns OAuth and refresh. Imported Cline credentials are not used." : "Reviewing the existing forward; validate before applying permissions.";
+      await $("#mcp-validate").onclick();
+      for (const checkbox of document.querySelectorAll("#mcp-tools input")) checkbox.checked = config.tools.includes(checkbox.value);
+      $("#mcp-name").scrollIntoView({behavior:"smooth",block:"center"});
+    } catch (error) { $("#mcp-form-status").textContent = String(error); }
   });
   document.querySelectorAll("[data-mcp-delete]").forEach(button => button.onclick = async () => {
     if (!confirm(`Remove '${button.dataset.mcpDelete}' for new requests? In-flight calls will finish.`)) return;
@@ -213,16 +231,61 @@ async function renderSettings() {
   });
   document.querySelectorAll("[data-oauth-disconnect]").forEach(b=>b.onclick=async()=>{
     if (!confirm(`Disconnect OAuth for '${b.dataset.oauthDisconnect}'?`)) return;
-    await fetch(`/api/mcp/${encodeURIComponent(b.dataset.oauthDisconnect)}/oauth`,{method:"DELETE"});
+    const name = b.dataset.oauthDisconnect;
+    cancelMcpOAuth(name);
+    const response = await fetch(`/api/mcp/${encodeURIComponent(name)}/oauth`,{method:"DELETE"});
+    if (!response.ok) { $("#mcp-form-status").textContent = await response.text(); return; }
     renderSettings();
   });
   document.querySelectorAll("[data-oauth]").forEach(b=>b.onclick=async()=>{
-    const r = await fetch(`/api/mcp/${encodeURIComponent(b.dataset.oauth)}/oauth/start`,{method:"POST"});
-    if (!r.ok) { alert(`OAuth start failed: ${await r.text()}`); return; }
-    const {authorize_url} = await r.json();
-    alert(`Complete the login in your browser.\nIf it did not open: ${authorize_url}`);
-    setTimeout(renderSettings, 3000);
+    const name = b.dataset.oauth, forward = mcp.forwards.find(f=>f.name===name);
+    const scope = prompt("OAuth scopes (space-separated). For Linear, 'read' is read-only; use 'read write' only if needed. Empty uses the server default. This does not expand Friendzone tool or guest permissions.", forward?.scope || (forward?.url.startsWith("https://mcp.linear.app/")?"read":""));
+    if (scope === null) return;
+    if (forward?.auth === "cline-link" && !confirm("Switch this forward to Friendzone-owned OAuth? Its current Cline credential link will stop being used. Cline's files and tokens stay untouched; tools and guest permissions are preserved.")) return;
+    await startMcpOAuth(name, scope);
   });
+}
+
+function cancelMcpOAuth(name) {
+  const poll = mcpOAuthPolls.get(name);
+  if (poll) clearTimeout(poll.timer);
+  mcpOAuthPolls.delete(name);
+}
+
+async function startMcpOAuth(name, scope) {
+  cancelMcpOAuth(name);
+  const attempt = {timer:null}; mcpOAuthPolls.set(name, attempt);
+  const current = () => mcpOAuthPolls.get(name) === attempt;
+  $("#mcp-form-status").textContent = `Starting host OAuth for '${name}'…`;
+  try {
+    const response = await fetch(`/api/mcp/${encodeURIComponent(name)}/oauth/start`, {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({scope})});
+    if (!response.ok) throw new Error(await response.text());
+    const {authorize_url} = await response.json();
+    if (!current()) return;
+    const link = $("#mcp-oauth-link"); link.href = authorize_url; link.hidden = false;
+    $("#mcp-form-status").textContent = "Complete authorization in the host browser. Use the link below if it did not open.";
+    const poll = async () => {
+      try {
+        const response = await fetch(`/api/mcp/${encodeURIComponent(name)}/oauth/status`);
+        if (!response.ok) throw new Error(await response.text());
+        const status = await response.json();
+        if (!current()) return;
+        if (!status || status.state === "failed") {
+          mcpOAuthPolls.delete(name); link.hidden = true;
+          $("#mcp-form-status").textContent = status?.message || "Authorization was cancelled or the forward changed. Start again.";
+          await renderSettings(); return;
+        }
+        if (status.state === "connected") {
+          mcpOAuthPolls.delete(name); link.hidden = true;
+          $("#mcp-form-status").textContent = `Connected '${name}'. Friendzone now refreshes its OAuth tokens. Use Validate / discover tools to review allowed tools.`;
+          await renderSettings(); return;
+        }
+        attempt.timer = setTimeout(poll, 1500);
+      } catch (error) { if (current()) { cancelMcpOAuth(name); $("#mcp-form-status").textContent = String(error); } }
+    };
+    attempt.timer = setTimeout(poll, 1500);
+    await renderSettings();
+  } catch (error) { if (current()) { cancelMcpOAuth(name); $("#mcp-form-status").textContent = `OAuth start failed: ${error}`; } }
 }
 
 $("#mcp-save").onclick = async () => {
@@ -283,6 +346,7 @@ async function loadMcpConnection() {
     const forward = mcpConnectData?.forwards.find(f=>f.name===name);
     const warnings = [...result.warnings];
     if (forward && !forward.tools.length) warnings.push("No tools are allowed yet. Select tools for this forward and apply.");
+    if (forward?.auth === "oauth-required") warnings.push("Upstream OAuth is not connected. Use Authorize in Friendzone on the host, not in guest Cline.");
     $("#mcp-connect-warning").textContent = warnings.join("\n");
     $("#mcp-connect-status").textContent = `Configuration for '${name}' as '${guest}'. This is not a connectivity test.`;
     for (const id of ["url", "auth", "json"]) $("#mcp-copy-"+id).disabled = false;
@@ -308,7 +372,7 @@ for (const id of ["url", "auth", "json"]) $("#mcp-copy-"+id).onclick = async () 
 
 let clineLink = null, validatedMcp = null;
 function mcpDraft() {
-  return {name:$("#mcp-name").value.trim(), url:$("#mcp-url").value.trim(), bearer_env:$("#mcp-bearer").value.trim(), scope:null, tools:[], guests:[], cline:clineLink};
+  return {name:$("#mcp-name").value.trim(), url:$("#mcp-url").value.trim(), bearer_env:$("#mcp-bearer").value.trim(), scope:null, tools:[], guests:[], cline:clineLink, oauth:$("#mcp-owned-oauth").checked};
 }
 async function saveMcp(configs) {
   const response = await fetch("/api/mcp/config", {method:"PUT", headers:{"content-type":"application/json"}, body:JSON.stringify(configs)});
@@ -317,7 +381,9 @@ async function saveMcp(configs) {
   await renderSettings();
 }
 $("#mcp-clear-link").onclick = () => {
+  reviewingMcp = null;
   clineLink = null; validatedMcp = null; $("#mcp-tools").innerHTML = "";
+  $("#mcp-owned-oauth").checked = false;
   $("#mcp-source").textContent = "Standalone server (no Cline link).";
 };
 $("#mcp-preview").onclick = async () => {
@@ -333,10 +399,12 @@ $("#mcp-preview").onclick = async () => {
       if (candidate.supported) {
         const select = document.createElement("button"); select.textContent = "Select";
         select.onclick = () => {
+          reviewingMcp = null;
           clineLink = {path, server:candidate.server}; validatedMcp = null;
+          $("#mcp-owned-oauth").checked = true;
           $("#mcp-name").value = candidate.server.replace(/[^a-zA-Z0-9_-]/g, "-");
           $("#mcp-url").value = candidate.url; $("#mcp-bearer").value = ""; $("#mcp-tools").innerHTML = "";
-          $("#mcp-source").textContent = `Read-only link: ${candidate.server} in ${path}. Cline owns refresh; no secrets copied.`;
+          $("#mcp-source").textContent = `Imported ${candidate.server} from ${path}. Recommended: Save for OAuth, then Authorize in Friendzone. Uncheck broker OAuth only to use Cline's credential link.`;
         };
         row.append(select);
       }
@@ -362,6 +430,16 @@ $("#mcp-validate").onclick = async () => {
     $("#mcp-form-status").textContent = `Validated. Select tools explicitly; none are allowed by default.${result.more?" Server has more pages; use the advanced editor for additional known tool names.":""}`;
   } catch (error) { $("#mcp-form-status").textContent = String(error); }
 };
+$("#mcp-save-oauth").onclick = async () => {
+  try {
+    const draft = mcpDraft(); draft.oauth = true; draft.bearer_env = "";
+    const configs = await (await fetch("/api/mcp/config")).json();
+    if (configs.some(f=>f.name===draft.name)) throw new Error("Forward already exists. Use Authorize in Friendzone on its row.");
+    await saveMcp([...configs, draft]);
+    $("#mcp-owned-oauth").checked = true;
+    $("#mcp-form-status").textContent = "Saved with no guest or tool access. Authorize in Friendzone on the new row, then validate and choose permissions.";
+  } catch (error) { $("#mcp-form-status").textContent = String(error); }
+};
 $("#mcp-add").onclick = async () => {
   try {
     const draft = mcpDraft();
@@ -369,8 +447,12 @@ $("#mcp-add").onclick = async () => {
     draft.tools = [...document.querySelectorAll("#mcp-tools input:checked")].map(input=>input.value);
     draft.guests = $("#mcp-guests").value.split(",").map(s=>s.trim()).filter(Boolean);
     const configs = await (await fetch("/api/mcp/config")).json();
-    if (configs.some(f=>f.name===draft.name)) throw new Error("That name already exists. Use the advanced editor to update it.");
-    await saveMcp([...configs, draft]);
+    const existing = configs.find(f=>f.name===draft.name);
+    if (existing && !(reviewingMcp?.name === existing.name && existing.url === draft.url && !!existing.oauth === draft.oauth)) throw new Error("That name already exists or changed. Use Review tools / guests on its row before updating permissions.");
+    if (existing) {
+      if (!confirm("Apply these selected tool and guest permissions to the existing forward?")) return;
+      await saveMcp(configs.map(f=>f.name===draft.name?{...f,tools:draft.tools,guests:draft.guests}:f));
+    } else await saveMcp([...configs, draft]);
     validatedMcp = null;
     $("#mcp-form-status").textContent = "Applied live. No broker restart.";
   } catch (error) { $("#mcp-form-status").textContent = String(error); }

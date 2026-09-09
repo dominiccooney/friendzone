@@ -41,8 +41,10 @@ Open <http://127.0.0.1:8081>.
 - **Settings → MCP forwards** — add a streamable-HTTP server or preview
   a host Cline MCP settings file, select a server, **Validate / discover
   tools**, then explicitly select allowed tools and guests. **Add forward
-  & apply live** does not restart the broker. For standalone OAuth servers,
-  use the advanced editor to add the forward, then Connect (OAuth).
+  & apply live** does not restart the broker. For an OAuth server, choose
+  **Save for OAuth** first (no tools or guests are granted), then
+  **Authorize in Friendzone** on its row. Complete login in the host browser,
+  then **Review tools / guests** to discover and select permissions.
 
 Optional, before starting: MCP forwards live in `mcp-forwards.json` in
 the broker data directory — the broker prints the exact path at startup
@@ -56,7 +58,7 @@ the broker data directory — the broker prints the exact path at startup
   {
     "name": "linear",
     "url": "https://mcp.linear.app/mcp",
-    "bearer_env": "FZ_LINEAR_TOKEN",
+    "oauth": true,
     "scope": "read",
     "tools": ["list_issues", "get_issue", "list_comments"]
   }
@@ -76,10 +78,23 @@ streamable-HTTP entries. The path is prefilled from the broker user's Cline
 settings location, honoring `CLINE_MCP_SETTINGS_PATH`, `CLINE_DATA_DIR`,
 and `CLINE_DIR` in that order; edit it for another profile. It links the
 **absolute host path**, reads current
-headers/access tokens per request, and does not copy secrets or execute
-commands. Cline retains OAuth refresh ownership: reconnect/refresh in host
-Cline when needed. Removing/disabling the source or changing its URL fails
-closed until reviewed. Stdio and SSE entries are explicitly unsupported.
+headers/access tokens per request when using the optional Cline credential
+link. That link leaves refresh ownership in Cline. The recommended OAuth
+mode is **Authorize in Friendzone**: it creates a separate broker-owned
+session, never copies Cline's refresh token, and no longer reads Cline's
+credentials. Existing tool/guest permissions and Cline's own setup remain
+unchanged. Stdio and SSE entries are explicitly unsupported.
+
+Friendzone MCP OAuth supports protected-resource discovery (including the
+WWW-Authenticate metadata hint), authorization-server metadata, dynamic
+public-client registration, PKCE S256, the `resource` parameter, and
+serialized token refresh with one retry after upstream 401. Tokens are
+bound to the exact upstream URL and stored atomically on the host; a changed
+URL, disconnect, removed forward, expired/replayed callback, or superseded
+login cannot restore old credentials. Permission edits preserve the session.
+The browser callback requires a loopback UI listener. Servers requiring
+pre-registered/confidential clients are not supported by this flow yet.
+Legacy broker OAuth sessions without URL binding require reauthorization.
 
 ## 3. Container: bootstrap
 
@@ -206,6 +221,18 @@ substitute for its `Authorization` header. Cline guest settings example
 
 Approval, IP pinning, kill state, forward guest allowlist, and tool allowlist
 all apply. No upstream credential is given to the guest.
+
+### Guest Cline says “requires OAuth authorization”
+
+That can be a missing guest `Authorization` header, not missing Linear OAuth.
+Older Friendzone returned 401 for missing Basic credentials, which Cline
+interprets as an OAuth server. The current broker returns a clear 403 instead.
+Copy the whole guest configuration from **Connect from Cline**, including
+the header, not just the URL. If reusing an old Cline entry, remove its
+`oauth` and `oauthClient` fields (or add the generated entry under its new
+name), then reconnect. Do not run `authorizeMcpServerOAuth` for Friendzone
+inside the container. Authorize the **upstream** in the host Friendzone UI.
+Forward paths are case-sensitive: `Linear` uses `/mcp/Linear`.
 
 ## 6. Smoke test — what should happen
 

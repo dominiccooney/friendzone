@@ -18,7 +18,7 @@ struct UiState {
     app: AppState,
     settings: crate::settings::Settings,
     registry: crate::mcp::ForwardRegistry,
-    oauth: crate::oauth::OauthFlows,
+    oauth: crate::mcp_oauth::OauthFlows,
     cline: crate::oauth::ClineFlows,
     ui_addr: SocketAddr,
     bootstrap_addr: SocketAddr,
@@ -71,7 +71,7 @@ pub async fn serve_ui(
             app: state,
             settings,
             registry,
-            oauth: crate::oauth::OauthFlows::default(),
+            oauth: crate::mcp_oauth::OauthFlows::default(),
             cline: crate::oauth::ClineFlows::default(),
             ui_addr: addr,
             bootstrap_addr,
@@ -151,6 +151,7 @@ fn ui_router(state: UiState) -> Router {
         .route("/api/mcp/validate", post(validate_mcp))
         .route("/api/mcp/{name}/guest-config", get(mcp_guest_config))
         .route("/api/mcp/{name}/oauth/start", post(oauth_start))
+        .route("/api/mcp/{name}/oauth/status", get(mcp_oauth_status))
         .route(
             "/api/mcp/{name}/oauth",
             axum::routing::delete(oauth_disconnect),
@@ -318,15 +319,19 @@ async fn list_forwards(State(state): State<UiState>) -> Json<serde_json::Value> 
         .configs()
         .iter()
         .map(|f| {
-            let session = crate::oauth::TokenRecord::load(&state.settings, &f.name);
+            let session = crate::mcp_oauth::TokenRecord::load(&state.settings, &f.name)
+                .filter(|record| record.server_url == f.url);
             let (auth, expires_at, refreshable) = match &session {
+                Some(record) if f.oauth => {
+                    ("oauth", record.expires_at, record.refresh_token.is_some())
+                }
+                _ if f.oauth => ("oauth-required", None, false),
                 _ if f.cline.is_some() => ("cline-link", None, false),
-                Some(record) => ("oauth", record.expires_at, record.refresh_token.is_some()),
                 None if state.settings.secret(&format!("mcp:{}", f.name)).is_some() => {
                     ("stored-key", None, false)
                 }
                 None if std::env::var(&f.bearer_env).is_ok() => ("env-key", None, false),
-                None => ("none", None, false),
+                _ => ("none", None, false),
             };
             serde_json::json!({
                 "name": f.name,
@@ -335,7 +340,7 @@ async fn list_forwards(State(state): State<UiState>) -> Json<serde_json::Value> 
                 "tools": f.tools,
                 "scope": f.scope,
                 "guests": f.guests,
-                "connected": auth != "none",
+                "connected": auth != "none" && auth != "oauth-required",
                 "auth": auth,
                 "expires_at": expires_at,
                 "refreshable": refreshable,
@@ -514,7 +519,10 @@ async fn validate_mcp(
     }
     // Use the real upstream path, including initialization and auth. This
     // discovers tools but does not publish a forward or call any tools.
-    let forward = crate::mcp::Forward::new(config, state.settings);
+    let forward = match state.registry.validation_forward(config) {
+        Ok(forward) => forward,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(20),
         forward.call_upstream(
@@ -560,7 +568,10 @@ async fn oauth_disconnect(
     State(state): State<UiState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    match crate::oauth::disconnect(&state.settings, &name) {
+    let Some(forward) = state.registry.get(&name) else {
+        return (StatusCode::NOT_FOUND, "unknown MCP forward").into_response();
+    };
+    match forward.oauth_session.disconnect() {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
@@ -569,22 +580,44 @@ async fn oauth_disconnect(
 /// Kicks off host-side OAuth: builds the authorization URL and opens
 /// the host browser. Returns the URL too, in case the browser did not
 /// open.
-async fn oauth_start(State(state): State<UiState>, Path(name): Path<String>) -> impl IntoResponse {
+#[derive(Default, Deserialize)]
+struct OAuthStartRequest {
+    scope: Option<String>,
+}
+
+async fn oauth_start(
+    State(state): State<UiState>,
+    Path(name): Path<String>,
+    request: Option<Json<OAuthStartRequest>>,
+) -> impl IntoResponse {
     let configs = state.registry.configs();
     let Some(forward) = configs.iter().find(|f| f.name == name) else {
         return (StatusCode::NOT_FOUND, format!("unknown forward '{name}'")).into_response();
     };
-    if forward.cline.is_some() {
+    let mut callback_addr = state.ui_addr;
+    if callback_addr.ip().is_unspecified() {
+        callback_addr.set_ip("127.0.0.1".parse().expect("loopback"));
+    }
+    if !callback_addr.ip().is_loopback() {
         return (
-            StatusCode::CONFLICT,
-            "This forward links Cline authentication; reconnect it in host Cline.",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Broker OAuth requires a loopback UI listener for the browser callback",
         )
             .into_response();
     }
-    let redirect_uri = format!("http://{}/oauth/callback", state.ui_addr);
+    let scope = request
+        .and_then(|r| r.0.scope)
+        .or_else(|| forward.scope.clone())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    let forward = match state.registry.enable_oauth(&name, scope.clone()) {
+        Ok(forward) => forward,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+    let redirect_uri = format!("http://{callback_addr}/oauth/callback");
     match state
         .oauth
-        .start(&name, &forward.url, &redirect_uri, forward.scope.as_deref())
+        .start(forward.oauth_session.clone(), &redirect_uri, scope)
         .await
     {
         Ok(url) => {
@@ -595,10 +628,21 @@ async fn oauth_start(State(state): State<UiState>, Path(name): Path<String>) -> 
     }
 }
 
+async fn mcp_oauth_status(
+    State(state): State<UiState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let Some(forward) = state.registry.get(&name) else {
+        return (StatusCode::NOT_FOUND, "unknown MCP forward").into_response();
+    };
+    Json(state.oauth.status(&forward.oauth_session)).into_response()
+}
+
 #[derive(Deserialize)]
 struct OauthCallback {
     state: String,
-    code: String,
+    code: Option<String>,
+    error: Option<String>,
 }
 
 async fn oauth_callback(
@@ -607,13 +651,10 @@ async fn oauth_callback(
 ) -> impl IntoResponse {
     match state
         .oauth
-        .finish(&query.state, &query.code, &state.settings)
+        .finish(&query.state, query.code.as_deref(), query.error.as_deref())
         .await
     {
-        Ok(name) => Html(format!(
-            "<h1>Connected</h1><p>MCP forward '{name}' is authorized. You can close this tab.</p>"
-        ))
-        .into_response(),
+        Ok(_) => Html("<h1>Connected to Friendzone</h1><p>Upstream OAuth is now owned and refreshed by the broker. Return to Friendzone Settings to discover/select tools and guest permissions. You can close this tab.</p>").into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
     }
 }
@@ -727,12 +768,9 @@ async fn mcp_message(
         .and_then(|value| value.to_str().ok())
         .and_then(crate::proxy::basic_username)
     else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"Friendzone MCP\"")],
-            "MCP guest credentials required",
-        )
-            .into_response();
+        // Cline interprets every 401 as OAuth. This endpoint uses guest
+        // Basic identity, not OAuth; return a clear denial, not discovery.
+        return (StatusCode::FORBIDDEN, "Friendzone guest Authorization header is missing or invalid. Copy Cline JSON from the host UI's Connect from Cline panel. Do not authorize Linear OAuth in the guest; remove stale oauth/oauthClient fields from this guest entry.").into_response();
     };
     let response =
         crate::mcp::handle_message(&state.mcp, &name, &container, peer.ip(), message).await;
@@ -1069,6 +1107,145 @@ mod tests {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
+    #[tokio::test]
+    async fn host_oauth_callback_enables_guest_forward_without_exposing_tokens() {
+        let fixture = crate::mcp_oauth::tests::Fixture::new().await;
+        let settings = fixture.settings.clone();
+        let registry =
+            crate::mcp::ForwardRegistry::load(settings.data_dir(), settings.clone()).unwrap();
+        registry
+            .save(
+                serde_json::from_value(serde_json::json!([{
+                    "name":"Linear", "url":fixture.url, "oauth":true,
+                    "tools":["read"], "guests":["scratch-kali"]
+                }]))
+                .unwrap(),
+            )
+            .unwrap();
+        let app = AppState::default();
+        app.add_container("scratch-kali");
+        let oauth = crate::mcp_oauth::OauthFlows::default();
+        let forward = registry.get("Linear").unwrap();
+        let url = oauth
+            .start(
+                forward.oauth_session.clone(),
+                "http://127.0.0.1:8081/oauth/callback",
+                Some("read".into()),
+            )
+            .await
+            .unwrap();
+        let authorize = reqwest::Url::parse(&url).unwrap();
+        let state_id = authorize
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        let ui = ui_router(UiState {
+            app: app.clone(),
+            settings: settings.clone(),
+            registry: registry.clone(),
+            oauth,
+            cline: crate::oauth::ClineFlows::default(),
+            ui_addr: "127.0.0.1:8081".parse().unwrap(),
+            bootstrap_addr: "172.31.208.1:8082".parse().unwrap(),
+        });
+        let request = |uri: String| Request::get(uri).body(Body::empty()).unwrap();
+        let callback = ui
+            .clone()
+            .oneshot(request(format!(
+                "/oauth/callback?state={state_id}&code=authorization-code"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(callback.status(), StatusCode::OK);
+        let callback_text = axum::body::to_bytes(callback.into_body(), 8192)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&callback_text).contains("access-1"));
+        let status = ui
+            .clone()
+            .oneshot(request("/api/mcp/Linear/oauth/status".into()))
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(status.into_body(), 8192)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["state"], "connected");
+        let bootstrap = bootstrap_router(BootstrapState {
+            cert: Arc::new(String::new()),
+            binary: Arc::new(vec![]),
+            guest_binaries: Arc::default(),
+            mcp: crate::mcp::McpState::new(app, registry),
+            settings,
+            proxy_port: 8080,
+        });
+        let make_guest = |auth: bool| {
+            let mut builder =
+                Request::post("/mcp/Linear").header("content-type", "application/json");
+            if auth {
+                builder = builder.header("authorization", "Basic c2NyYXRjaC1rYWxpOng=");
+            }
+            let mut request = builder
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                ))
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                "127.0.0.1:2345".parse::<SocketAddr>().unwrap(),
+            ));
+            request
+        };
+        let guest = bootstrap.clone().oneshot(make_guest(true)).await.unwrap();
+        let text = axum::body::to_bytes(guest.into_body(), 8192).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&text).unwrap()["result"]["tools"],
+            serde_json::json!([{"name":"read"}])
+        );
+        assert!(!String::from_utf8_lossy(&text).contains("access-1"));
+        let missing = bootstrap.clone().oneshot(make_guest(false)).await.unwrap();
+        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+        assert!(!missing.headers().contains_key(header::WWW_AUTHENTICATE));
+        let text = axum::body::to_bytes(missing.into_body(), 8192)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&text).contains("Copy Cline JSON"));
+        assert_eq!(
+            ui.clone()
+                .oneshot(request(format!(
+                    "/oauth/callback?state={state_id}&code=replay"
+                )))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let disconnected = ui
+            .clone()
+            .oneshot(
+                Request::delete("/api/mcp/Linear/oauth")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disconnected.status(), StatusCode::NO_CONTENT);
+        let guest = bootstrap.oneshot(make_guest(true)).await.unwrap();
+        assert_eq!(
+            guest.status(),
+            StatusCode::OK,
+            "upstream missing OAuth is a JSON-RPC error, not guest OAuth challenge"
+        );
+        let text = axum::body::to_bytes(guest.into_body(), 8192).await.unwrap();
+        assert!(String::from_utf8_lossy(&text).contains("Authorize in Friendzone"));
+        let list = ui.oneshot(request("/api/mcp".into())).await.unwrap();
+        let text = axum::body::to_bytes(list.into_body(), 8192).await.unwrap();
+        assert!(!String::from_utf8_lossy(&text).contains("refresh-1"));
+    }
+
     #[test]
     fn guest_endpoints_use_bootstrap_address_and_one_path_per_forward() {
         let addr = "172.31.208.1:9092".parse().unwrap();
@@ -1149,7 +1326,7 @@ mod tests {
             app: app.clone(),
             settings: settings.clone(),
             registry: registry.clone(),
-            oauth: crate::oauth::OauthFlows::default(),
+            oauth: crate::mcp_oauth::OauthFlows::default(),
             cline: crate::oauth::ClineFlows::default(),
             ui_addr: "127.0.0.1:8081".parse().unwrap(),
             bootstrap_addr: "172.31.208.1:8082".parse().unwrap(),
@@ -1244,7 +1421,7 @@ mod tests {
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::UNAUTHORIZED
+            StatusCode::FORBIDDEN
         );
         let allowed = bootstrap
             .clone()
@@ -1336,7 +1513,7 @@ mod tests {
             app: app.clone(),
             settings: settings.clone(),
             registry: registry.clone(),
-            oauth: crate::oauth::OauthFlows::default(),
+            oauth: crate::mcp_oauth::OauthFlows::default(),
             cline: crate::oauth::ClineFlows::default(),
             ui_addr: "127.0.0.1:8081".parse().unwrap(),
             bootstrap_addr: "0.0.0.0:9082".parse().unwrap(),

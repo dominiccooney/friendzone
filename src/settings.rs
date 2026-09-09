@@ -118,8 +118,11 @@ impl Settings {
 
     pub fn set_secret(&self, name: &str, value: &str) -> Result<()> {
         let mut secrets = self.0.secrets.write().expect("settings lock");
-        secrets.insert(name.to_owned(), value.to_owned());
-        write_json_private(&self.0.data_dir.join("secrets.json"), &*secrets)
+        let mut updated = secrets.clone();
+        updated.insert(name.to_owned(), value.to_owned());
+        write_json_private(&self.0.data_dir.join("secrets.json"), &updated)?;
+        *secrets = updated;
+        Ok(())
     }
 
     pub fn secret(&self, name: &str) -> Option<String> {
@@ -133,8 +136,11 @@ impl Settings {
 
     pub fn remove_secret(&self, name: &str) -> Result<()> {
         let mut secrets = self.0.secrets.write().expect("settings lock");
-        secrets.remove(name);
-        write_json_private(&self.0.data_dir.join("secrets.json"), &*secrets)
+        let mut updated = secrets.clone();
+        updated.remove(name);
+        write_json_private(&self.0.data_dir.join("secrets.json"), &updated)?;
+        *secrets = updated;
+        Ok(())
     }
 
     /// Real value for an entry: secrets store first, then env fallback.
@@ -237,22 +243,30 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .with_context(|| format!("write {}", path.display()))
 }
 
-#[cfg(unix)]
 fn write_json_private<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    write_json(path, value)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("restrict {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn write_json_private<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    write_json(path, value)
+    // Stage owner-only on Unix and rename atomically. Concurrent refreshes
+    // cannot expose a partial secrets file or publish failed disk writes.
+    crate::storage::atomic_write(path, &serde_json::to_vec_pretty(value)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_secret_write_keeps_last_good_memory_value() {
+        let dir = std::env::temp_dir().join(format!("fz-secret-failure-{}", Uuid::new_v4()));
+        let settings = Settings::load(&dir).unwrap();
+        settings.set_secret("test", "last-good").unwrap();
+        let path = dir.join("secrets.json");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap(); // Atomic replacement must fail, without publishing.
+        assert!(settings.set_secret("test", "new").is_err());
+        assert_eq!(settings.secret("test").as_deref(), Some("last-good"));
+        assert!(settings.remove_secret("test").is_err());
+        assert_eq!(settings.secret("test").as_deref(), Some("last-good"));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn cline_oauth_substitution_uses_workos_prefix_but_static_keys_do_not() {

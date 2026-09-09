@@ -3,6 +3,7 @@ mod doctor;
 mod guest_http;
 mod mcp;
 mod mcp_import;
+mod mcp_oauth;
 mod oauth;
 mod policy;
 mod proxy;

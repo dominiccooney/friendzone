@@ -154,13 +154,14 @@ calls finish with the old one. `guests: []` denies all; omitted/null means
 all approved guests for legacy configurations. Set a guest-name list for
 restricted sharing. Invalid configurations do not replace live forwards.
 
-For a standalone OAuth forward, authorize it in the UI: Settings → MCP forwards → "Connect
-(OAuth)". The broker discovers the server's OAuth endpoints, registers
-itself, opens your browser to log in, and stores the session on the
-host — no pasting secrets. Sessions carry the refresh token: the broker
-refreshes near expiry and retries once on an upstream 401, so agents
-never see a reauth seam. The settings page shows the session's expiry
-and offers Reauthorize and Disconnect. An optional `"scope"` field on
+For either an imported or standalone OAuth forward, use **Authorize in
+Friendzone** in Settings. New forwards can be **Saved for OAuth** with no
+tool/guest permissions before login; afterwards use **Review tools / guests**.
+The broker discovers protected-resource and authorization-server metadata,
+registers a public client, uses PKCE S256 and a resource-bound grant, and
+stores its own session on the host. Concurrent requests share one refresh
+operation and retry once after an upstream 401. The settings page reports
+login completion/failure and offers Reauthorize and Disconnect. A `"scope"` field on
 the forward requests a narrower grant (e.g. `"read"` for Linear
 read-only). Alternatively set the `bearer_env` variable to an API key.
 Containers connect a streamable-HTTP MCP client to
@@ -168,11 +169,20 @@ Containers connect a streamable-HTTP MCP client to
 allowlist) and allowlisted `tools/call` reach upstream; the token never
 enters the container.
 
-Cline-linked forwards instead read the selected server's current headers
-and access token from its host settings file for each request. Cline owns
-refresh; Friendzone neither copies refresh tokens nor writes Cline's file.
-A moved URL, removed server or disabled server fails closed. Stdio/SSE
-import and autonomous migration of Cline OAuth sessions are not supported.
+The optional Cline credential-link mode still reads current headers/access
+tokens from its host file, with Cline owning refresh. **Authorize in
+Friendzone** switches the forward to `"oauth": true`: Cline remains import
+provenance only, with no credential fallback. Its refresh tokens/files are
+never copied or modified. Tokens are pinned to the upstream URL; disconnect,
+reconfiguration and superseded callbacks cannot resurrect them. Permissions
+are not expanded by login. This OAuth implementation requires dynamic
+public-client registration and a loopback host UI callback; confidential or
+pre-registered clients and stdio/SSE imports are not supported yet.
+
+Guests use the generated Basic `Authorization` header, not upstream OAuth.
+An old guest Cline entry showing “OAuth required” should be replaced with the
+generated transport configuration and have stale `oauth`/`oauthClient`
+fields removed. See [QUICKSTART.md](QUICKSTART.md) for recovery steps.
 
 ## Credential escrow (inference and other APIs)
 

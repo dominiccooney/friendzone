@@ -37,6 +37,10 @@ pub struct ForwardConfig {
     /// Read-only link to a host Cline server; credentials are never copied.
     #[serde(default)]
     pub cline: Option<crate::mcp_import::ClineSource>,
+    /// Explicit broker-owned OAuth. Cline is provenance only in this mode;
+    /// its credentials are never read or used as fallback.
+    #[serde(default)]
+    pub oauth: bool,
 }
 
 pub fn validate_configs(configs: &[ForwardConfig]) -> Result<()> {
@@ -74,7 +78,7 @@ pub fn validate_configs(configs: &[ForwardConfig]) -> Result<()> {
             if !Path::new(&source.path).is_absolute() || source.server.is_empty() {
                 anyhow::bail!("Cline link requires an absolute host path and server name");
             }
-            if !config.bearer_env.is_empty() || config.scope.is_some() {
+            if !config.oauth && (!config.bearer_env.is_empty() || config.scope.is_some()) {
                 anyhow::bail!(
                     "Cline-linked authentication is owned by Cline; do not also set bearer_env or scope"
                 );
@@ -104,12 +108,18 @@ pub struct Forward {
     config: ForwardConfig,
     settings: crate::settings::Settings,
     /// Upstream Mcp-Session-Id once initialized.
-    session: Arc<Mutex<Option<String>>>,
+    session: Arc<Mutex<Option<(uuid::Uuid, String)>>>,
     client: reqwest::Client,
+    pub oauth_session: Arc<crate::mcp_oauth::Session>,
 }
 
 impl Forward {
     pub fn new(config: ForwardConfig, settings: crate::settings::Settings) -> Self {
+        let oauth_session = Arc::new(crate::mcp_oauth::Session::new(
+            config.name.clone(),
+            config.url.clone(),
+            settings.clone(),
+        ));
         Self {
             config,
             settings,
@@ -119,6 +129,7 @@ impl Forward {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("MCP HTTP client"),
+            oauth_session,
         }
     }
 
@@ -140,18 +151,21 @@ impl Forward {
             && self.config.bearer_env == config.bearer_env
             && self.config.scope == config.scope
             && self.config.cline == config.cline
+            && self.config.oauth == config.oauth
     }
 
     async fn authenticate(
         &self,
         mut request: reqwest::RequestBuilder,
-    ) -> Result<reqwest::RequestBuilder> {
-        if let Some(source) = &self.config.cline {
+    ) -> Result<(reqwest::RequestBuilder, Option<String>)> {
+        if self.config.oauth {
+            let token = self.oauth_session.token(None).await?;
+            return Ok((request.bearer_auth(&token), Some(token)));
+        } else if let Some(source) = &self.config.cline {
             for (name, value) in crate::mcp_import::headers(source, &self.config.url)? {
                 request = request.header(name, value);
             }
         } else if !self.config.bearer_env.is_empty()
-            || crate::oauth::TokenRecord::load(&self.settings, &self.config.name).is_some()
             || self
                 .settings
                 .secret(&format!("mcp:{}", self.config.name))
@@ -159,7 +173,7 @@ impl Forward {
         {
             request = request.bearer_auth(self.bearer().await?);
         }
-        Ok(request)
+        Ok((request, None))
     }
 
     /// Removes disallowed tools from an upstream tools/list result.
@@ -173,20 +187,9 @@ impl Forward {
         }
     }
 
-    /// Bearer resolution: OAuth session (refreshed just-in-time when
-    /// near expiry) first, plain stored secret next, env var last.
+    /// Legacy static credential resolution; broker OAuth never falls back
+    /// to these values or imported Cline credentials after disconnect.
     async fn bearer(&self) -> Result<String> {
-        if let Some(record) = crate::oauth::TokenRecord::load(&self.settings, &self.config.name) {
-            if record.expires_soon() && record.refresh_token.is_some() {
-                match crate::oauth::refresh(&self.settings, &self.config.name).await {
-                    Ok(token) => return Ok(token),
-                    Err(error) => {
-                        tracing::warn!(%error, forward = %self.config.name, "token refresh failed");
-                    }
-                }
-            }
-            return Ok(record.access_token);
-        }
         if let Some(token) = self.settings.secret(&format!("mcp:{}", self.config.name)) {
             return Ok(token);
         }
@@ -204,10 +207,14 @@ impl Forward {
     /// first use. Returns the parsed JSON-RPC response.
     pub async fn call_upstream(&self, message: Value) -> Result<Value> {
         let mut session = self.session.lock().await;
-        if session.is_none() {
-            *session = Some(self.initialize_upstream().await?);
+        let generation = self.oauth_session.connection_epoch();
+        if session
+            .as_ref()
+            .is_none_or(|(epoch, _)| *epoch != generation)
+        {
+            *session = Some((generation, self.initialize_upstream().await?));
         }
-        let session_id = session.clone().expect("session just initialized");
+        let (_, session_id) = session.clone().expect("session just initialized");
         drop(session);
         self.post(message, Some(&session_id)).await
     }
@@ -240,7 +247,9 @@ impl Forward {
         let initialized = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
         self.post_raw(initialized, Some(&session_id))
             .await
-            .context("upstream initialized notification")?;
+            .context("upstream initialized notification")?
+            .error_for_status()
+            .context("upstream rejected initialized notification")?;
         Ok(session_id)
     }
 
@@ -254,14 +263,14 @@ impl Forward {
         message: Value,
         session_id: Option<&str>,
     ) -> Result<reqwest::Response> {
-        let response = self.post_once(&message, session_id, None).await?;
+        let (response, sent_token) = self.post_once(&message, session_id, None).await?;
         // Expired-token 401: refresh once and retry, so agents never
         // see a reauth seam.
         if response.status() == reqwest::StatusCode::UNAUTHORIZED
-            && self.config.cline.is_none()
-            && let Ok(token) = crate::oauth::refresh(&self.settings, &self.config.name).await
+            && let Some(sent_token) = sent_token
         {
-            return self.post_once(&message, session_id, Some(token)).await;
+            let token = self.oauth_session.token(Some(&sent_token)).await?;
+            return Ok(self.post_once(&message, session_id, Some(token)).await?.0);
         }
         Ok(response)
     }
@@ -271,21 +280,25 @@ impl Forward {
         message: &Value,
         session_id: Option<&str>,
         bearer: Option<String>,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<(reqwest::Response, Option<String>)> {
         let mut request = self
             .client
             .post(&self.config.url)
             .header("Accept", "application/json, text/event-stream")
             .header("MCP-Protocol-Version", PROTOCOL_VERSION)
             .json(message);
-        request = match bearer {
-            Some(token) => request.bearer_auth(token),
+        let (authenticated, sent_token) = match bearer {
+            Some(token) => (request.bearer_auth(&token), Some(token)),
             None => self.authenticate(request).await?,
         };
+        request = authenticated;
         if let Some(id) = session_id.filter(|id| !id.is_empty()) {
             request = request.header("Mcp-Session-Id", id);
         }
-        request.send().await.context("upstream MCP request")
+        Ok((
+            request.send().await.context("upstream MCP request")?,
+            sent_token,
+        ))
     }
 }
 
@@ -304,7 +317,7 @@ async fn parse_body(response: reqwest::Response) -> Result<Value> {
         // Upstreams may echo credentials in errors; never expose bodies
         // to the guest or host UI. Cline-linked sessions refresh in Cline.
         anyhow::bail!(
-            "upstream returned {status}; check host authentication (Cline links: reconnect in Cline)"
+            "upstream returned {status}; authorize this forward in the host Friendzone UI, not in the guest"
         );
     }
     if content_type.starts_with("text/event-stream") {
@@ -378,6 +391,7 @@ impl ForwardRegistry {
                                 settings: self.settings.clone(),
                                 session: old.session.clone(),
                                 client: old.client.clone(),
+                                oauth_session: old.oauth_session.clone(),
                             }),
                         );
                     }
@@ -389,6 +403,14 @@ impl ForwardRegistry {
             })
             .collect();
         let count = rebuilt.len();
+        for (name, old) in current.iter() {
+            if rebuilt
+                .get(name)
+                .is_none_or(|new| !Arc::ptr_eq(&old.oauth_session, &new.oauth_session))
+            {
+                old.oauth_session.retire()?;
+            }
+        }
         *current = rebuilt;
         Ok(count)
     }
@@ -399,6 +421,37 @@ impl ForwardRegistry {
             .expect("forwards lock")
             .get(name)
             .cloned()
+    }
+
+    pub fn enable_oauth(&self, name: &str, scope: Option<String>) -> Result<Arc<Forward>> {
+        let _update = self.update.lock().expect("registry update lock");
+        let mut configs = self.configs();
+        let config = configs
+            .iter_mut()
+            .find(|config| config.name == name)
+            .context("unknown MCP forward")?;
+        config.oauth = true;
+        config.bearer_env.clear();
+        config.scope = scope;
+        validate_configs(&configs)?;
+        crate::storage::atomic_write(&self.config_path(), &serde_json::to_vec_pretty(&configs)?)?;
+        self.publish(configs)?;
+        self.get(name).context("forward disappeared")
+    }
+
+    pub fn validation_forward(&self, config: ForwardConfig) -> Result<Arc<Forward>> {
+        validate_configs(std::slice::from_ref(&config))?;
+        if config.oauth {
+            // Validation and guest calls must share the refresh lock and
+            // lifecycle. Never construct a second OAuth owner for one name.
+            return self
+                .get(&config.name)
+                .filter(|forward| forward.config.oauth && forward.config.url == config.url)
+                .context(
+                    "Save this forward for OAuth and authorize it in Friendzone before validation",
+                );
+        }
+        Ok(Arc::new(Forward::new(config, self.settings.clone())))
     }
 
     pub fn configs(&self) -> Vec<ForwardConfig> {
@@ -559,7 +612,8 @@ mod tests {
         config.guests = Some(vec!["guest".into()]);
         registry.save(vec![config.clone()]).unwrap();
         let before = registry.get("linear").unwrap();
-        *before.session.lock().await = Some("session-1".into());
+        *before.session.lock().await =
+            Some((before.oauth_session.connection_epoch(), "session-1".into()));
         registry.reload().unwrap();
         assert!(Arc::ptr_eq(&before, &registry.get("linear").unwrap()));
         let app = AppState::default();
@@ -659,6 +713,7 @@ mod tests {
                     path: path.to_str().unwrap().into(),
                     server: "test".into(),
                 }),
+                oauth: false,
             }])
             .unwrap();
         let app = AppState::default();
@@ -719,6 +774,7 @@ mod tests {
                 tools: vec!["list_issues".into(), "get_issue".into()],
                 guests: None,
                 cline: None,
+                oauth: false,
             },
             settings,
         )
