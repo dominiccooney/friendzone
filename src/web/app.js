@@ -1,5 +1,6 @@
 const $ = (s) => document.querySelector(s);
 let snapshot = { containers: [], requests: [] };
+let logRows = [], logCursor = null, logPaused = false, logGeneration = 0, logTimer;
 let order = JSON.parse(localStorage.getItem("fz-order") || "[]");
 
 function esc(value) { return String(value).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;"); }
@@ -55,20 +56,42 @@ function renderContainers() {
 }
 
 function renderLog() {
-  const query = $("#search").value.trim().toLowerCase(), container=$("#container-filter").value, verdict=$("#verdict-filter").value;
-  $("#requests").innerHTML = snapshot.requests
-    .filter(r => (!container||r.container===container)
-      && (!verdict||r.verdict===verdict)
-      && (!query||`${r.container} ${r.method} ${r.url} ${r.status??""} ${r.detail??""} ${r.verdict}`.toLowerCase().includes(query)))
+  $("#requests").innerHTML = logRows
     .map(r=>{
       const status = r.status ? `<span class="verdict ${r.status<400?"allowed":"blocked"}">${r.status}</span> ` : "";
       const detail = r.detail ? `<div class="meta">${esc(r.detail)}</div>` : "";
       return `<div class="log-row"><span>${displayTime(r.at)}</span><span class="container-id">${esc(r.container)}</span><span class="request">${status}<span class="method">${esc(r.method)}</span>${esc(r.url)}${detail}</span><span class="verdict ${r.verdict}">${esc(r.verdict)}</span></div>`;
     }).join("") || '<div class="log-row">No matching requests.</div>';
-  const selected=$("#container-filter").value; $("#container-filter").innerHTML='<option value="">All containers</option>'+snapshot.containers.map(c=>`<option value="${esc(c.id)}">${esc(c.name)}</option>`).join(""); $("#container-filter").value=selected;
+  const selected=$("#container-filter").value;
+  const names = [...new Set([...snapshot.containers.map(c=>c.id), ...logRows.map(r=>r.container), ...(selected?[selected]:[])])];
+  $("#container-filter").innerHTML='<option value="">All containers</option>'+names.map(id=>`<option value="${esc(id)}">${esc(id)}</option>`).join(""); $("#container-filter").value=selected;
 }
 
-async function refresh() { try { const response=await fetch("/api/state"); snapshot=await response.json(); renderContainers(); renderLog(); } catch(e) { console.error(e); } }
+async function loadLog(older = false) {
+  const generation = ++logGeneration;
+  const query = new URLSearchParams({search:$("#search").value, container:$("#container-filter").value, verdict:$("#verdict-filter").value});
+  if (older && logCursor !== null) query.set("before", logCursor);
+  try {
+    const response = await fetch(`/api/log?${query}`);
+    if (!response.ok) throw new Error(await response.text());
+    const page = await response.json();
+    if (generation !== logGeneration) return;
+    logRows = older ? [...logRows, ...page.requests] : page.requests;
+    logCursor = page.next_before;
+    $("#log-more").disabled = logCursor === null;
+    $("#log-status").textContent = `${page.retained}/${page.capacity} retained · ${page.evicted} evicted · ${logPaused?"history paused":"live"}`;
+    renderLog();
+  } catch (error) { $("#log-status").textContent = String(error); }
+}
+
+function scheduleLog() {
+  if (logPaused || logTimer) return;
+  logTimer = setTimeout(() => { logTimer = null; loadLog(); }, 500);
+}
+$("#log-more").onclick = () => { logPaused = true; clearTimeout(logTimer); logTimer = null; loadLog(true); };
+$("#log-live").onclick = () => { logPaused = false; loadLog(); };
+
+async function refresh() { try { const response=await fetch("/api/state"); snapshot=await response.json(); renderContainers(); scheduleLog(); } catch(e) { console.error(e); } }
 
 const PROVIDER_PRESETS = {
   anthropic: {
@@ -109,11 +132,19 @@ async function renderSettings() {
   }).join("") || '<div class="log-row">No escrow entries yet.</div>';
   $("#mcp-list").innerHTML = mcp.forwards.map(f=>{
     const expiry = f.expires_at ? ` · expires ${new Date(f.expires_at*1000).toLocaleString()}${f.refreshable?" (auto-refresh)":""}` : "";
-    const status = f.auth==="oauth" ? `<span class="verdict allowed">OAuth</span>${esc(expiry)} <button class="quiet" data-oauth="${esc(f.name)}">Reauthorize…</button> <button class="quiet" data-oauth-disconnect="${esc(f.name)}">Disconnect</button>`
+    const status = f.auth==="cline-link" ? '<span class="verdict allowed">Cline link</span> · reconnect/refresh in host Cline'
+      : f.auth==="oauth" ? `<span class="verdict allowed">OAuth</span>${esc(expiry)} <button class="quiet" data-oauth="${esc(f.name)}">Reauthorize…</button> <button class="quiet" data-oauth-disconnect="${esc(f.name)}">Disconnect</button>`
       : f.auth==="stored-key" || f.auth==="env-key" ? `<span class="verdict allowed">${esc(f.auth)}</span> <button class="quiet" data-oauth="${esc(f.name)}">Switch to OAuth…</button>`
       : `<button class="quiet" data-oauth="${esc(f.name)}">Connect (OAuth)…</button>`;
-    return `<div class="log-row"><span>${esc(f.name)}</span><span class="request">${esc(f.url)} · ${f.tools.length} tools${f.scope?` · scope ${esc(f.scope)}`:""}</span><span>${status}</span></div>`;
-  }).join("") || `<div class="log-row">No MCP forwards configured. Create <code>${esc(mcp.config_path)}</code> (see README for the format), then restart the broker.</div>`;
+    return `<div class="log-row"><span>${esc(f.name)}</span><span class="request">${esc(f.url)} · ${f.tools.length} tools · guests: ${f.guests===null?"all approved":esc(f.guests.join(", ")||"none")}${f.scope?` · scope ${esc(f.scope)}`:""}</span><span>${status} <button data-mcp-delete="${esc(f.name)}">Remove</button></span></div>`;
+  }).join("") || '<div class="log-row">No MCP forwards yet. Add or import one below; no broker restart needed.</div>';
+  document.querySelectorAll("[data-mcp-delete]").forEach(button => button.onclick = async () => {
+    if (!confirm(`Remove '${button.dataset.mcpDelete}' for new requests? In-flight calls will finish.`)) return;
+    try {
+      const configs = await (await fetch("/api/mcp/config")).json();
+      await saveMcp(configs.filter(f=>f.name!==button.dataset.mcpDelete));
+    } catch (error) { $("#mcp-form-status").textContent = String(error); }
+  });
   const [curlLine, ...envRest] = env.split("\n");
   $("#guest-env-curl").textContent = curlLine.replace(/^# Fetch from a guest: /, "");
   $("#guest-env").textContent = envRest.join("\n");
@@ -196,6 +227,76 @@ $("#mcp-reload").onclick = async () => {
   renderSettings();
 };
 
+let clineLink = null, validatedMcp = null;
+function mcpDraft() {
+  return {name:$("#mcp-name").value.trim(), url:$("#mcp-url").value.trim(), bearer_env:$("#mcp-bearer").value.trim(), scope:null, tools:[], guests:[], cline:clineLink};
+}
+async function saveMcp(configs) {
+  const response = await fetch("/api/mcp/config", {method:"PUT", headers:{"content-type":"application/json"}, body:JSON.stringify(configs)});
+  if (!response.ok) throw new Error(await response.text());
+  $("#mcp-editor").value = JSON.stringify(configs, null, 2);
+  await renderSettings();
+}
+$("#mcp-clear-link").onclick = () => {
+  clineLink = null; validatedMcp = null; $("#mcp-tools").innerHTML = "";
+  $("#mcp-source").textContent = "Standalone server (no Cline link).";
+};
+$("#mcp-preview").onclick = async () => {
+  const path = $("#mcp-cline-path").value.trim();
+  try {
+    const response = await fetch("/api/mcp/import/cline", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify({path})});
+    if (!response.ok) throw new Error(await response.text());
+    const candidates = await response.json();
+    $("#mcp-candidates").innerHTML = "";
+    for (const candidate of candidates) {
+      const row = document.createElement("p");
+      row.textContent = `${candidate.server}: ${candidate.reason} `;
+      if (candidate.supported) {
+        const select = document.createElement("button"); select.textContent = "Select";
+        select.onclick = () => {
+          clineLink = {path, server:candidate.server}; validatedMcp = null;
+          $("#mcp-name").value = candidate.server.replace(/[^a-zA-Z0-9_-]/g, "-");
+          $("#mcp-url").value = candidate.url; $("#mcp-bearer").value = ""; $("#mcp-tools").innerHTML = "";
+          $("#mcp-source").textContent = `Read-only link: ${candidate.server} in ${path}. Cline owns refresh; no secrets copied.`;
+        };
+        row.append(select);
+      }
+      $("#mcp-candidates").append(row);
+    }
+  } catch (error) { $("#mcp-form-status").textContent = String(error); }
+};
+$("#mcp-validate").onclick = async () => {
+  validatedMcp = null; $("#mcp-tools").innerHTML = "";
+  $("#mcp-form-status").textContent = "Connecting and listing tools (no tools called)…";
+  try {
+    const draft = mcpDraft();
+    const response = await fetch("/api/mcp/validate", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(draft)});
+    if (!response.ok) throw new Error(await response.text());
+    const result = await response.json();
+    if (JSON.stringify(draft) !== JSON.stringify(mcpDraft())) throw new Error("Configuration changed; validate again.");
+    validatedMcp = JSON.stringify(draft);
+    for (const name of result.tools) {
+      const label = document.createElement("label"), checkbox = document.createElement("input");
+      checkbox.type = "checkbox"; checkbox.value = name;
+      label.append(checkbox, document.createTextNode(name)); $("#mcp-tools").append(label, document.createElement("br"));
+    }
+    $("#mcp-form-status").textContent = `Validated. Select tools explicitly; none are allowed by default.${result.more?" Server has more pages; use the advanced editor for additional known tool names.":""}`;
+  } catch (error) { $("#mcp-form-status").textContent = String(error); }
+};
+$("#mcp-add").onclick = async () => {
+  try {
+    const draft = mcpDraft();
+    if (validatedMcp !== JSON.stringify(draft)) throw new Error("Validate this configuration before adding it.");
+    draft.tools = [...document.querySelectorAll("#mcp-tools input:checked")].map(input=>input.value);
+    draft.guests = $("#mcp-guests").value.split(",").map(s=>s.trim()).filter(Boolean);
+    const configs = await (await fetch("/api/mcp/config")).json();
+    if (configs.some(f=>f.name===draft.name)) throw new Error("That name already exists. Use the advanced editor to update it.");
+    await saveMcp([...configs, draft]);
+    validatedMcp = null;
+    $("#mcp-form-status").textContent = "Applied live. No broker restart.";
+  } catch (error) { $("#mcp-form-status").textContent = String(error); }
+};
+
 $("#add-container").onsubmit = async (e) => {
   e.preventDefault();
   const r = await fetch("/api/containers",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name:$("#new-container-name").value})});
@@ -229,12 +330,12 @@ $("#escrow-form").onsubmit = async (e) => {
 };
 
 document.querySelectorAll(".nav").forEach(button=>button.onclick=()=>{document.querySelectorAll(".nav,.view").forEach(n=>n.classList.remove("active"));button.classList.add("active");$(`#${button.dataset.view}-view`).classList.add("active");if(button.dataset.view==="settings")renderSettings().catch(console.error);});
-$("#refresh").onclick=refresh; ["#search","#container-filter","#verdict-filter"].forEach(s=>$(s).addEventListener("input",renderLog));
+$("#refresh").onclick=refresh; ["#search","#container-filter","#verdict-filter"].forEach(s=>$(s).addEventListener("input",()=>{logPaused=false;loadLog();}));
 
 // Live updates over SSE: the broker pushes a full snapshot on every
 // change; EventSource reconnects on its own. The initial fetch covers
 // the gap before the stream opens.
 refresh();
 const events = new EventSource("/api/events");
-events.onmessage = (e) => { snapshot = JSON.parse(e.data); renderContainers(); renderLog(); };
+events.onmessage = (e) => { snapshot = JSON.parse(e.data); renderContainers(); scheduleLog(); };
 events.onerror = () => setTimeout(refresh, 3000); // bridge reconnect gaps

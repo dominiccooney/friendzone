@@ -12,8 +12,11 @@ pub async fn run(
     install: bool,
     container: Option<String>,
 ) -> Result<()> {
+    let client = crate::guest_http::broker_client()?;
     let url = format!("{}/bootstrap/ca.pem", broker.trim_end_matches('/'));
-    let cert = reqwest::get(&url)
+    let cert = client
+        .get(&url)
+        .send()
         .await
         .with_context(|| format!("fetch {url}"))?
         .error_for_status()
@@ -30,7 +33,7 @@ pub async fn run(
     target.adopt(&path);
     println!("Saved Friendzone CA to {}", path.display());
     let container = container.unwrap_or_else(guest_hostname);
-    fetch_guest_env(broker, &path, &container, &target).await?;
+    fetch_guest_env(&client, broker, &path, &container, &target).await?;
     if install {
         install_ca(&path)?;
     } else {
@@ -121,18 +124,62 @@ fn guest_hostname() -> String {
         .unwrap_or_else(|| "guest".to_owned())
 }
 
-/// Broker host as the guest reaches it: the authority of --broker.
-fn broker_host(broker: &str) -> String {
-    let rest = broker
-        .strip_prefix("http://")
-        .or_else(|| broker.strip_prefix("https://"))
-        .unwrap_or(broker);
-    let authority = rest.split('/').next().unwrap_or(rest);
-    authority
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(authority)
-        .to_owned()
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn guest_environment(
+    broker: &str,
+    port: u16,
+    container: &str,
+    cert: &Path,
+    fakes: &str,
+) -> Result<String> {
+    let broker = reqwest::Url::parse(broker).context("parse broker URL")?;
+    let host = broker.host_str().context("broker URL has no host")?;
+    let host = host.trim_matches(['[', ']']);
+    let mut proxy = broker.clone();
+    proxy
+        .set_scheme("http")
+        .map_err(|_| anyhow::anyhow!("invalid proxy scheme"))?;
+    proxy
+        .set_port(Some(port))
+        .map_err(|_| anyhow::anyhow!("invalid proxy port"))?;
+    proxy
+        .set_username(container)
+        .map_err(|_| anyhow::anyhow!("invalid container name"))?;
+    proxy
+        .set_password(Some("x"))
+        .map_err(|_| anyhow::anyhow!("invalid proxy credentials"))?;
+    proxy.set_path("");
+    proxy.set_query(None);
+    proxy.set_fragment(None);
+    let proxy = shell_quote(proxy.as_str().trim_end_matches('/'));
+    let host = shell_quote(host);
+    let cert = shell_quote(&cert.to_string_lossy());
+    Ok(format!(
+        "# Friendzone guest environment; source this in the agent's shell.\n\
+         export FZ_HOST={host}\n\
+         export FZ_BROKER={}\n\
+         export HTTP_PROXY={proxy}\n\
+         export HTTPS_PROXY={proxy}\n\
+         export http_proxy={proxy}\n\
+         export https_proxy={proxy}\n\
+         # Bypass only the broker host; preserve the user's existing exclusions.\n\
+         export NO_PROXY=\"${{NO_PROXY:-${{no_proxy:-}}}}\"\n\
+         case ,$NO_PROXY, in\n\
+           *,\"$FZ_HOST\",*) ;;\n\
+           *) export NO_PROXY=\"$FZ_HOST${{NO_PROXY:+,$NO_PROXY}}\" ;;\n\
+         esac\n\
+         export no_proxy=\"$NO_PROXY\"\n\
+         export NODE_EXTRA_CA_CERTS={cert}\n\
+         export REQUESTS_CA_BUNDLE={cert}\n\
+         export SSL_CERT_FILE={cert}\n\
+         export GIT_SSL_CAINFO={cert}\n\
+         export GIT_PROXY_SSL_CAINFO={cert}\n\
+         {fakes}",
+        shell_quote(broker.as_str().trim_end_matches('/')),
+    ))
 }
 
 /// Pulls the fake credentials and proxy facts from the broker and
@@ -140,6 +187,7 @@ fn broker_host(broker: &str) -> String {
 /// container's identity), CA bundles for common runtimes, and the fake
 /// keys. Fakes only; reals never leave the host.
 async fn fetch_guest_env(
+    client: &reqwest::Client,
     broker: &str,
     cert_path: &Path,
     container: &str,
@@ -147,14 +195,18 @@ async fn fetch_guest_env(
 ) -> Result<()> {
     let base = broker.trim_end_matches('/');
     let url = format!("{base}/bootstrap/env");
-    let fakes = reqwest::get(&url)
+    let fakes = client
+        .get(&url)
+        .send()
         .await
         .with_context(|| format!("fetch {url}"))?
         .error_for_status()
         .context("broker rejected env request")?
         .text()
         .await?;
-    let info: serde_json::Value = reqwest::get(format!("{base}/bootstrap/info"))
+    let info: serde_json::Value = client
+        .get(format!("{base}/bootstrap/info"))
+        .send()
         .await
         .context("fetch broker info")?
         .json()
@@ -164,20 +216,8 @@ async fn fetch_guest_env(
         .get("proxy_port")
         .and_then(serde_json::Value::as_u64)
         .context("no proxy_port in broker info")?;
-    let proxy_url = format!("http://{container}:x@{}:{proxy_port}", broker_host(base));
-    let env = format!(
-        "# Friendzone guest environment; source this in the agent's shell.\n\
-         export HTTP_PROXY={proxy_url}\n\
-         export HTTPS_PROXY={proxy_url}\n\
-         export http_proxy={proxy_url}\n\
-         export https_proxy={proxy_url}\n\
-         export NODE_EXTRA_CA_CERTS={cert}\n\
-         export REQUESTS_CA_BUNDLE={cert}\n\
-         export SSL_CERT_FILE={cert}\n\
-         export GIT_PROXY_SSL_CAINFO={cert}\n\
-         {fakes}",
-        cert = cert_path.display(),
-    );
+    let proxy_port = u16::try_from(proxy_port).context("invalid proxy_port")?;
+    let env = guest_environment(base, proxy_port, container, cert_path, &fakes)?;
     let env_path = cert_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -185,12 +225,14 @@ async fn fetch_guest_env(
     fs::write(&env_path, &env).with_context(|| format!("write {}", env_path.display()))?;
     target.adopt(&env_path);
     // Announce this guest so a join request appears in the UI now.
-    let approved = reqwest::get(format!(
-        "{base}/bootstrap/hello?container={}",
-        urlencoding_min(container)
-    ))
-    .await
-    .ok();
+    let approved = client
+        .get(format!(
+            "{base}/bootstrap/hello?container={}",
+            urlencoding_min(container)
+        ))
+        .send()
+        .await
+        .ok();
     let approved = match approved {
         Some(response) => response
             .json::<serde_json::Value>()
@@ -231,7 +273,17 @@ async fn fetch_guest_env(
                         _ => break,
                     }
                 }
-                println!("Configured Cline inference (fake key) in {}", path.display());
+                // Merging can preserve credentials for other providers;
+                // unlike the CA/env, providers.json is not public data.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+                }
+                println!(
+                    "Configured Cline inference (fake key) in {}",
+                    path.display()
+                );
             }
             Err(error) => println!("Could not configure Cline settings: {error:#}"),
         }
@@ -260,14 +312,10 @@ fn env_export_value(env: &str, name: &str) -> Option<String> {
     })
 }
 
-/// Writes the Cline provider settings the CLI/IDE/SDK all read
-/// (`~/.cline/data/settings/providers.json`; shape from cline/cline
-/// sdk/packages/core/src/services/llms/provider-settings.ts and
-/// .../storage/provider-settings-manager.ts): registers the `cline`
-/// provider with the fake key so inference works through the broker
-/// with no `cline auth`. Merge-safe: existing providers are kept, an
-/// existing `cline` entry is only updated in its `apiKey`, and
-/// `lastUsedProvider` is set only when absent.
+/// Cline v1 store contract: cline/cline b18de090, core/src/types/provider-settings.ts.
+/// Invalid metadata causes Cline to discard the entire store. Use static
+/// apiKey auth: OAuth refresh belongs to the broker, never to the guest.
+/// Run setup while the guest's Cline is stopped to avoid competing writers.
 fn write_cline_provider_settings(home: &Path, fake_key: &str) -> Result<PathBuf> {
     let settings_dir = home.join(".cline").join("data").join("settings");
     fs::create_dir_all(&settings_dir)
@@ -277,8 +325,21 @@ fn write_cline_provider_settings(home: &Path, fake_key: &str) -> Result<PathBuf>
         serde_json::from_str(&fs::read_to_string(&path)?)
             .with_context(|| format!("parse {}", path.display()))?
     } else {
-        serde_json::json!({ "providers": {} })
+        serde_json::json!({ "version": 1, "modes": {}, "providers": {} })
     };
+    let object = root
+        .as_object_mut()
+        .context("providers.json is not an object")?;
+    if object
+        .get("version")
+        .is_some_and(|v| v != &serde_json::json!(1))
+    {
+        anyhow::bail!("unsupported Cline providers.json version; leaving it unchanged");
+    }
+    object.insert("version".into(), serde_json::json!(1));
+    object
+        .entry("modes")
+        .or_insert_with(|| serde_json::json!({}));
     let providers = root
         .as_object_mut()
         .context("providers.json is not an object")?
@@ -295,14 +356,22 @@ fn write_cline_provider_settings(home: &Path, fake_key: &str) -> Result<PathBuf>
                 .and_then(|s| s.as_object_mut())
                 .context("cline provider settings is not an object")?
                 .insert("apiKey".into(), serde_json::json!(fake_key));
+            let settings = existing["settings"].as_object_mut().expect("checked above");
+            // A stale OAuth access token takes precedence over apiKey.
+            // Explicit guest setup switches this provider to broker auth.
+            settings.remove("auth");
+            existing["tokenSource"] = serde_json::json!("manual");
+            existing["updatedAt"] = serde_json::json!(
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            );
         }
         None => {
             providers.insert(
                 "cline".into(),
                 serde_json::json!({
                     "settings": { "provider": "cline", "apiKey": fake_key },
-                    "updatedAt": chrono::Utc::now().to_rfc3339(),
-                    "tokenSource": "friendzone",
+                    "updatedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    "tokenSource": "manual",
                 }),
             );
         }
@@ -311,8 +380,7 @@ fn write_cline_provider_settings(home: &Path, fake_key: &str) -> Result<PathBuf>
     root_object
         .entry("lastUsedProvider")
         .or_insert_with(|| serde_json::json!("cline"));
-    fs::write(&path, serde_json::to_string_pretty(&root)?)
-        .with_context(|| format!("write {}", path.display()))?;
+    crate::storage::atomic_write(&path, serde_json::to_string_pretty(&root)?.as_bytes())?;
     Ok(path)
 }
 
@@ -356,10 +424,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn broker_host_extraction() {
-        assert_eq!(broker_host("http://172.31.208.1:8082"), "172.31.208.1");
-        assert_eq!(broker_host("http://172.31.208.1:8082/"), "172.31.208.1");
-        assert_eq!(broker_host("http://broker.local"), "broker.local");
+    fn source_guest_env_preserves_exclusions_and_is_idempotent() {
+        #[cfg(windows)]
+        let shell = "C:/Program Files/Git/bin/bash.exe";
+        #[cfg(not(windows))]
+        let shell = "/bin/sh";
+        if !Path::new(shell).exists() {
+            eprintln!("shell integration unavailable: {shell}");
+            return;
+        }
+        let env = guest_environment(
+            "http://172.31.208.1:8082",
+            8080,
+            "scratch-kali",
+            Path::new("/tmp/a b'c.pem"),
+            "",
+        )
+        .unwrap();
+        for initial in [
+            "unset NO_PROXY; export no_proxy=localhost",
+            "export NO_PROXY=localhost; unset no_proxy",
+            "unset NO_PROXY no_proxy",
+        ] {
+            let script = format!(
+                "set -eu\n{initial}\n{env}\n{env}\nprintf '%s\\n' \"$FZ_HOST\" \"$NO_PROXY\" \"$no_proxy\" \"$GIT_SSL_CAINFO\" \"$HTTPS_PROXY\"\n"
+            );
+            let output = Command::new(shell).args(["-c", &script]).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8(output.stdout).unwrap();
+            let lines: Vec<_> = text.lines().collect();
+            assert_eq!(lines[0], "172.31.208.1");
+            assert_eq!(
+                lines[1],
+                if initial.contains("localhost") {
+                    "172.31.208.1,localhost"
+                } else {
+                    "172.31.208.1"
+                }
+            );
+            assert_eq!(lines[1], lines[2]);
+            assert_eq!(lines[3], "/tmp/a b'c.pem");
+            assert_eq!(lines[4], "http://scratch-kali:x@172.31.208.1:8080");
+        }
+    }
+
+    #[test]
+    fn guest_env_quotes_values_and_supports_ipv6() {
+        let env = guest_environment(
+            "http://[::1]:8082/",
+            8080,
+            "guest",
+            Path::new("/tmp/a b'c.pem"),
+            "",
+        )
+        .unwrap();
+        assert!(env.contains("export FZ_HOST='::1'"));
+        assert!(env.contains("export HTTPS_PROXY='http://guest:x@[::1]:8080'"));
+        assert!(env.contains("export GIT_SSL_CAINFO='/tmp/a b'\"'\"'c.pem'"));
+        assert!(env.contains("export no_proxy=\"$NO_PROXY\""));
     }
 
     #[test]
@@ -384,26 +510,41 @@ mod tests {
         assert_eq!(root["providers"]["cline"]["settings"]["provider"], "cline");
         assert_eq!(root["providers"]["cline"]["settings"]["apiKey"], "fake-1");
         assert_eq!(root["lastUsedProvider"], "cline");
+        assert_eq!(root["version"], 1);
+        assert_eq!(root["modes"], serde_json::json!({}));
+        assert_eq!(root["providers"]["cline"]["tokenSource"], "manual");
+        assert!(
+            root["providers"]["cline"]["updatedAt"]
+                .as_str()
+                .unwrap()
+                .ends_with('Z')
+        );
 
         // Simulate user edits: another provider, a model choice, and a
         // different lastUsedProvider — all must survive a re-run.
         let mut root: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         root["providers"]["anthropic"] = serde_json::json!({"settings": {"provider": "anthropic"}});
-        root["providers"]["cline"]["settings"]["model"] = serde_json::json!("x-ai/grok-code-fast-1");
+        root["providers"]["cline"]["settings"]["model"] =
+            serde_json::json!("x-ai/grok-code-fast-1");
         root["lastUsedProvider"] = serde_json::json!("anthropic");
+        root["providers"]["cline"]["settings"]["auth"] =
+            serde_json::json!({"accessToken": "stale", "refreshToken": "stale"});
         fs::write(&path, serde_json::to_string_pretty(&root).unwrap()).unwrap();
 
         write_cline_provider_settings(&home, "fake-2").unwrap();
         let root: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(root["providers"]["cline"]["settings"]["apiKey"], "fake-2");
+        assert!(root["providers"]["cline"]["settings"].get("auth").is_none());
         assert_eq!(
-            root["providers"]["cline"]["settings"]["model"],
-            "x-ai/grok-code-fast-1",
+            root["providers"]["cline"]["settings"]["model"], "x-ai/grok-code-fast-1",
             "user's model choice survives"
         );
-        assert_eq!(root["providers"]["anthropic"]["settings"]["provider"], "anthropic");
+        assert_eq!(
+            root["providers"]["anthropic"]["settings"]["provider"],
+            "anthropic"
+        );
         assert_eq!(root["lastUsedProvider"], "anthropic", "user's choice kept");
         fs::remove_dir_all(home).unwrap();
     }

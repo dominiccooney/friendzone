@@ -1,8 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet},
-    net::{IpAddr, SocketAddr},
+    collections::{HashMap, HashSet, VecDeque},
+    net::IpAddr,
     sync::{Arc, RwLock},
-    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
@@ -19,6 +18,7 @@ pub enum Verdict {
 #[derive(Clone, Debug, Serialize)]
 pub struct RequestEvent {
     pub id: Uuid,
+    pub sequence: u64,
     pub at: DateTime<Utc>,
     pub container: String,
     pub method: String,
@@ -73,13 +73,36 @@ struct ContainerRecord {
 
 #[derive(Default)]
 struct StateData {
-    requests: Vec<RequestEvent>,
+    requests: VecDeque<RequestEvent>,
+    next_sequence: u64,
     killed: HashSet<String>,
     /// First-class container registry: containers appear on first
     /// traffic or explicit add, and exist independently of the request
     /// log's retention.
     containers: HashMap<String, ContainerRecord>,
-    connection_identities: HashMap<SocketAddr, (String, Instant)>,
+}
+
+pub const LOG_CAPACITY: usize = 10_000;
+
+#[derive(Default, serde::Deserialize)]
+pub struct LogQuery {
+    #[serde(default)]
+    pub search: String,
+    #[serde(default)]
+    pub container: String,
+    #[serde(default)]
+    pub verdict: String,
+    pub before: Option<u64>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct LogPage {
+    pub requests: Vec<RequestEvent>,
+    pub next_before: Option<u64>,
+    pub retained: usize,
+    pub capacity: usize,
+    pub evicted: u64,
 }
 
 impl StateData {
@@ -136,8 +159,11 @@ impl AppState {
         let mut state = self.data.write().expect("state lock poisoned");
         state.touch_container(&container, None);
         let id = Uuid::new_v4();
-        state.requests.push(RequestEvent {
+        state.next_sequence += 1;
+        let sequence = state.next_sequence;
+        state.requests.push_back(RequestEvent {
             id,
+            sequence,
             at: Utc::now(),
             container,
             method,
@@ -146,8 +172,8 @@ impl AppState {
             status: None,
             detail: None,
         });
-        if state.requests.len() > 1000 {
-            state.requests.drain(..100);
+        if state.requests.len() > LOG_CAPACITY {
+            state.requests.pop_front();
         }
         drop(state);
         self.notify();
@@ -169,29 +195,55 @@ impl AppState {
         self.notify();
     }
 
-    pub fn identify_connection(
-        &self,
-        peer: SocketAddr,
-        presented_username: Option<String>,
-    ) -> String {
+    pub fn mark_blocked(&self, id: Uuid, status: u16, detail: String) {
         let mut state = self.data.write().expect("state lock poisoned");
-        if let Some(username) = presented_username {
-            state.touch_container(&username, Some(peer.ip()));
-            state
-                .connection_identities
-                .insert(peer, (username.clone(), Instant::now()));
-            if state.connection_identities.len() > 4096 {
-                state
-                    .connection_identities
-                    .retain(|_, (_, seen)| seen.elapsed() < Duration::from_secs(60 * 60));
-            }
-            username
-        } else {
-            state
-                .connection_identities
-                .get(&peer)
-                .map(|(username, _)| username.clone())
-                .unwrap_or_else(|| peer.ip().to_string())
+        if let Some(event) = state.requests.iter_mut().rev().find(|e| e.id == id) {
+            event.verdict = Verdict::Blocked;
+            event.status = Some(status);
+            event.detail = Some(detail);
+        }
+        drop(state);
+        self.notify();
+    }
+
+    /// Search the retained history before paginating, not just the live
+    /// snapshot. Sequence cursors stay stable when new traffic arrives.
+    pub fn log_page(&self, query: &LogQuery) -> LogPage {
+        let state = self.data.read().expect("state lock poisoned");
+        let search = query.search.to_lowercase();
+        let limit = query.limit.unwrap_or(200).clamp(1, 500);
+        let mut matches = state.requests.iter().rev().filter(|event| {
+            let verdict = match event.verdict {
+                Verdict::Allowed => "allowed",
+                Verdict::Blocked => "blocked",
+            };
+            query.before.is_none_or(|before| event.sequence < before)
+                && (query.container.is_empty() || query.container == event.container)
+                && (query.verdict.is_empty() || query.verdict == verdict)
+                && (search.is_empty()
+                    || format!(
+                        "{} {} {} {} {}",
+                        event.container,
+                        event.method,
+                        event.url,
+                        event.status.map(|s| s.to_string()).unwrap_or_default(),
+                        event.detail.as_deref().unwrap_or_default()
+                    )
+                    .to_lowercase()
+                    .contains(&search))
+        });
+        let requests: Vec<_> = matches.by_ref().take(limit).cloned().collect();
+        let next_before = matches
+            .next()
+            .and_then(|_| requests.last().map(|r| r.sequence));
+        LogPage {
+            requests,
+            next_before,
+            retained: state.requests.len(),
+            capacity: LOG_CAPACITY,
+            evicted: state
+                .next_sequence
+                .saturating_sub(state.requests.len() as u64),
         }
     }
 
@@ -213,17 +265,6 @@ impl AppState {
         // A pending gate check is a join request appearing: wake the UI.
         self.notify();
         verdict
-    }
-
-    /// Approval check without an address (used where the peer IP is
-    /// not available, e.g. the MCP endpoint).
-    pub fn is_approved(&self, container: &str) -> bool {
-        self.data
-            .read()
-            .expect("state lock poisoned")
-            .containers
-            .get(container)
-            .is_some_and(|record| record.approved)
     }
 
     /// Registers a pre-approved container from the UI (wildcard IP
@@ -271,9 +312,6 @@ impl AppState {
         let mut state = self.data.write().expect("state lock poisoned");
         state.containers.remove(name);
         state.killed.remove(name);
-        state
-            .connection_identities
-            .retain(|_, (identity, _)| identity != name);
         drop(state);
         self.notify();
     }
@@ -338,13 +376,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retained_log_searches_before_paging_with_stable_cursors() {
+        let state = AppState::default();
+        for index in 0..(LOG_CAPACITY + 50) {
+            let id = state.record(
+                "guest".into(),
+                "GET".into(),
+                format!("https://example.test/{index}"),
+                Verdict::Allowed,
+            );
+            if index == 100 {
+                state.mark_blocked(id, 403, "unique denial".into());
+            }
+        }
+        let found = state.log_page(&LogQuery {
+            search: "unique denial".into(),
+            verdict: "blocked".into(),
+            ..Default::default()
+        });
+        assert_eq!(found.requests.len(), 1);
+        assert_eq!(found.retained, LOG_CAPACITY);
+        assert_eq!(found.evicted, 50);
+        let first = state.log_page(&LogQuery {
+            limit: Some(2),
+            ..Default::default()
+        });
+        state.record("guest".into(), "GET".into(), "new".into(), Verdict::Allowed);
+        let next = state.log_page(&LogQuery {
+            before: first.next_before,
+            limit: Some(2),
+            ..Default::default()
+        });
+        assert_eq!(next.requests[0].sequence + 1, first.requests[1].sequence);
+        assert_eq!(
+            state
+                .log_page(&LogQuery {
+                    search: "https://example.test/0".into(),
+                    ..Default::default()
+                })
+                .requests
+                .len(),
+            0
+        );
+    }
+
+    #[test]
     fn container_gate_denies_unknown_and_wrong_ip() {
         let state = AppState::default();
         let ip1: IpAddr = "10.0.0.5".parse().unwrap();
         let ip2: IpAddr = "10.0.0.6".parse().unwrap();
         // Unknown container: pending join request, denied.
         assert_eq!(state.authorize("stranger", ip1), Authorization::Pending);
-        assert!(state.view().containers.iter().any(|c| c.id == "stranger" && c.state == "pending"));
+        assert!(
+            state
+                .view()
+                .containers
+                .iter()
+                .any(|c| c.id == "stranger" && c.state == "pending")
+        );
         // Approve and pin to the IP it came from.
         state.approve_container("stranger", true);
         assert_eq!(state.authorize("stranger", ip1), Authorization::Allowed);
@@ -363,7 +452,12 @@ mod tests {
         let state = AppState::default();
         // Appear via explicit add and via traffic, independently.
         state.add_container("reviewer");
-        state.record("triager".into(), "GET".into(), "https://x/".into(), Verdict::Allowed);
+        state.record(
+            "triager".into(),
+            "GET".into(),
+            "https://x/".into(),
+            Verdict::Allowed,
+        );
         let view = state.view();
         let names: Vec<&str> = view.containers.iter().map(|c| c.id.as_str()).collect();
         assert!(names.contains(&"reviewer") && names.contains(&"triager"));

@@ -126,6 +126,7 @@ fn ui_router(state: UiState) -> Router {
         .route("/app.css", get(css))
         .route("/app.js", get(js))
         .route("/api/state", get(api_state))
+        .route("/api/log", get(api_log))
         .route("/api/events", get(state_events))
         .route("/api/containers", post(add_container))
         .route(
@@ -145,11 +146,22 @@ fn ui_router(state: UiState) -> Router {
         .route("/api/mcp", get(list_forwards))
         .route("/api/mcp/config", get(get_mcp_config).put(put_mcp_config))
         .route("/api/mcp/reload", post(reload_mcp_config))
+        .route("/api/mcp/import/cline", post(preview_cline_mcp))
+        .route("/api/mcp/validate", post(validate_mcp))
         .route("/api/mcp/{name}/oauth/start", post(oauth_start))
-        .route("/api/mcp/{name}/oauth", axum::routing::delete(oauth_disconnect))
+        .route(
+            "/api/mcp/{name}/oauth",
+            axum::routing::delete(oauth_disconnect),
+        )
         .route("/oauth/callback", get(oauth_callback))
-        .route("/api/escrow/{name}/cline-oauth/start", post(cline_oauth_start))
-        .route("/api/escrow/{name}/cline-oauth/status", get(cline_oauth_status))
+        .route(
+            "/api/escrow/{name}/cline-oauth/start",
+            post(cline_oauth_start),
+        )
+        .route(
+            "/api/escrow/{name}/cline-oauth/status",
+            get(cline_oauth_status),
+        )
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
 }
@@ -306,11 +318,8 @@ async fn list_forwards(State(state): State<UiState>) -> Json<serde_json::Value> 
         .map(|f| {
             let session = crate::oauth::TokenRecord::load(&state.settings, &f.name);
             let (auth, expires_at, refreshable) = match &session {
-                Some(record) => (
-                    "oauth",
-                    record.expires_at,
-                    record.refresh_token.is_some(),
-                ),
+                _ if f.cline.is_some() => ("cline-link", None, false),
+                Some(record) => ("oauth", record.expires_at, record.refresh_token.is_some()),
                 None if state.settings.secret(&format!("mcp:{}", f.name)).is_some() => {
                     ("stored-key", None, false)
                 }
@@ -322,6 +331,7 @@ async fn list_forwards(State(state): State<UiState>) -> Json<serde_json::Value> 
                 "url": f.url,
                 "tools": f.tools,
                 "scope": f.scope,
+                "guests": f.guests,
                 "connected": auth != "none",
                 "auth": auth,
                 "expires_at": expires_at,
@@ -337,31 +347,79 @@ async fn list_forwards(State(state): State<UiState>) -> Json<serde_json::Value> 
 
 /// The raw mcp-forwards.json for in-UI editing.
 async fn get_mcp_config(State(state): State<UiState>) -> impl IntoResponse {
-    let path = state.registry.config_path();
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| "[]".to_owned());
-    ([(header::CONTENT_TYPE, "application/json; charset=utf-8")], text)
+    Json(state.registry.configs())
 }
 
 /// Saves mcp-forwards.json (validated first) and reloads the forwards.
 async fn put_mcp_config(State(state): State<UiState>, body: String) -> impl IntoResponse {
-    if let Err(error) = serde_json::from_str::<Vec<crate::mcp::ForwardConfig>>(&body) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("not a valid forwards config: {error}"),
-        )
-            .into_response();
-    }
-    let path = state.registry.config_path();
-    if let Err(error) = std::fs::write(&path, &body) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("write {}: {error}", path.display()),
-        )
-            .into_response();
-    }
-    match state.registry.reload() {
+    let configs = match serde_json::from_str::<Vec<crate::mcp::ForwardConfig>>(&body) {
+        Ok(configs) => configs,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("not a valid forwards config: {error}"),
+            )
+                .into_response();
+        }
+    };
+    match state.registry.save(configs) {
         Ok(count) => Json(serde_json::json!({ "forwards": count })).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ClineImportRequest {
+    path: String,
+}
+
+async fn preview_cline_mcp(Json(request): Json<ClineImportRequest>) -> impl IntoResponse {
+    // Management listener only; preview never returns headers or tokens.
+    match crate::mcp_import::preview(&request.path) {
+        Ok(candidates) => Json(candidates).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+async fn validate_mcp(
+    State(state): State<UiState>,
+    Json(config): Json<crate::mcp::ForwardConfig>,
+) -> impl IntoResponse {
+    if let Err(error) = crate::mcp::validate_configs(std::slice::from_ref(&config)) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response();
+    }
+    // Use the real upstream path, including initialization and auth. This
+    // discovers tools but does not publish a forward or call any tools.
+    let forward = crate::mcp::Forward::new(config, state.settings);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        forward.call_upstream(
+            serde_json::json!({"jsonrpc":"2.0", "id":"fz-validate", "method":"tools/list"}),
+        ),
+    )
+    .await;
+    match result {
+        Ok(Ok(value))
+            if value
+                .pointer("/result/tools")
+                .and_then(serde_json::Value::as_array)
+                .is_some() =>
+        {
+            let tools: Vec<_> = value["result"]["tools"]
+                .as_array()
+                .expect("checked")
+                .iter()
+                .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+                .collect();
+            Json(serde_json::json!({"tools":tools, "more":value.pointer("/result/nextCursor").is_some()})).into_response()
+        }
+        Ok(Ok(_)) => (
+            StatusCode::BAD_GATEWAY,
+            "upstream did not return a valid tools/list result",
+        )
+            .into_response(),
+        Ok(Err(error)) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, "MCP validation timed out").into_response(),
     }
 }
 
@@ -392,6 +450,13 @@ async fn oauth_start(State(state): State<UiState>, Path(name): Path<String>) -> 
     let Some(forward) = configs.iter().find(|f| f.name == name) else {
         return (StatusCode::NOT_FOUND, format!("unknown forward '{name}'")).into_response();
     };
+    if forward.cline.is_some() {
+        return (
+            StatusCode::CONFLICT,
+            "This forward links Cline authentication; reconnect it in host Cline.",
+        )
+            .into_response();
+    }
     let redirect_uri = format!("http://{}/oauth/callback", state.ui_addr);
     match state
         .oauth
@@ -529,15 +594,24 @@ async fn bootstrap_env(State(state): State<BootstrapState>) -> impl IntoResponse
 async fn mcp_message(
     State(state): State<BootstrapState>,
     Path(name): Path<String>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     Json(message): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let container = headers
+    let Some(container) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(crate::proxy::basic_username)
-        .unwrap_or_else(|| "unidentified".to_owned());
-    let response = crate::mcp::handle_message(&state.mcp, &name, &container, message).await;
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Basic realm=\"Friendzone MCP\"")],
+            "MCP guest credentials required",
+        )
+            .into_response();
+    };
+    let response =
+        crate::mcp::handle_message(&state.mcp, &name, &container, peer.ip(), message).await;
     if response.is_null() {
         // Notification: no JSON-RPC response body.
         StatusCode::ACCEPTED.into_response()
@@ -566,6 +640,13 @@ async fn js() -> impl IntoResponse {
 
 async fn api_state(State(state): State<UiState>) -> Json<StateView> {
     Json(state.app.view())
+}
+
+async fn api_log(
+    State(state): State<UiState>,
+    axum::extract::Query(query): axum::extract::Query<crate::state::LogQuery>,
+) -> Json<crate::state::LogPage> {
+    Json(state.app.log_page(&query))
 }
 
 /// Live state over SSE: a full `StateView` snapshot on connect and on
@@ -633,10 +714,7 @@ async fn add_container(
 
 /// Unregisters a container. Log rows remain for audit; a reconnecting
 /// guest re-appears as a new container.
-async fn remove_container(
-    State(state): State<UiState>,
-    Path(id): Path<String>,
-) -> StatusCode {
+async fn remove_container(State(state): State<UiState>, Path(id): Path<String>) -> StatusCode {
     state.app.remove_container(&id);
     StatusCode::NO_CONTENT
 }
@@ -850,6 +928,138 @@ mod tests {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
+    #[tokio::test]
+    async fn management_save_and_guest_auth_share_the_live_registry() {
+        let settings = test_settings();
+        let registry =
+            crate::mcp::ForwardRegistry::load(settings.data_dir(), settings.clone()).unwrap();
+        let app = AppState::default();
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        app.authorize("guest", peer.ip());
+        app.approve_container("guest", true);
+        let ui = ui_router(UiState {
+            app: app.clone(),
+            settings: settings.clone(),
+            registry: registry.clone(),
+            oauth: crate::oauth::OauthFlows::default(),
+            cline: crate::oauth::ClineFlows::default(),
+            ui_addr: "127.0.0.1:8081".parse().unwrap(),
+            bootstrap_port: 8082,
+        });
+        let bootstrap = bootstrap_router(BootstrapState {
+            cert: Arc::new(String::new()),
+            binary: Arc::new(vec![]),
+            guest_binaries: Arc::default(),
+            mcp: crate::mcp::McpState::new(app.clone(), registry.clone()),
+            settings: settings.clone(),
+            proxy_port: 8080,
+        });
+        let config = serde_json::json!([{"name":"test", "url":"https://example.invalid/mcp", "tools":[], "guests":["guest"]}]);
+        let saved = ui
+            .clone()
+            .oneshot(
+                Request::put("/api/mcp/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(config.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        let request = |auth: bool, address: SocketAddr| {
+            let mut builder = Request::post("/mcp/test").header("content-type", "application/json");
+            if auth {
+                builder = builder.header("authorization", "Basic Z3Vlc3Q6eA==");
+            }
+            let mut request = builder
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                ))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(address));
+            request
+        };
+        assert_eq!(
+            bootstrap
+                .clone()
+                .oneshot(request(false, peer))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let allowed = bootstrap
+            .clone()
+            .oneshot(request(true, peer))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(allowed.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .unwrap()
+                .get("result")
+                .is_some()
+        );
+        let wrong_ip = bootstrap
+            .clone()
+            .oneshot(request(true, "127.0.0.2:12345".parse().unwrap()))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(wrong_ip.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .unwrap()
+                .get("error")
+                .is_some()
+        );
+        let invalid = ui
+            .clone()
+            .oneshot(
+                Request::put("/api/mcp/config")
+                    .body(Body::from("[null]"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(registry.configs().len(), 1);
+        let page = ui
+            .oneshot(
+                Request::get("/api/log?search=IP%20pin&verdict=blocked")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(page.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["requests"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            bootstrap
+                .oneshot(
+                    Request::get("/api/mcp/import/cline")
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        std::fs::remove_dir_all(settings.data_dir()).unwrap();
+    }
+
     fn test_settings() -> crate::settings::Settings {
         let dir = std::env::temp_dir().join(format!("fz-web-{}", uuid::Uuid::new_v4()));
         crate::settings::Settings::load(&dir).unwrap()
@@ -902,19 +1112,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("fz-linux-x86_64"), "404 names what exists: {text}");
+        assert!(
+            text.contains("fz-linux-x86_64"),
+            "404 names what exists: {text}"
+        );
     }
 
     #[tokio::test]
     async fn targets_manifest_names_host_and_guests() {
         let response = bootstrap_app()
-            .oneshot(Request::get("/bootstrap/targets").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/bootstrap/targets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["guest_binaries"][0], "/bootstrap/fz/fz-linux-x86_64");
         assert!(json["host_platform"].as_str().unwrap().contains('-'));

@@ -123,7 +123,12 @@ impl Settings {
     }
 
     pub fn secret(&self, name: &str) -> Option<String> {
-        self.0.secrets.read().expect("settings lock").get(name).cloned()
+        self.0
+            .secrets
+            .read()
+            .expect("settings lock")
+            .get(name)
+            .cloned()
     }
 
     pub fn remove_secret(&self, name: &str) -> Result<()> {
@@ -134,13 +139,30 @@ impl Settings {
 
     /// Real value for an entry: secrets store first, then env fallback.
     pub fn real_value(&self, entry: &EscrowEntry) -> Option<String> {
-        self.secret(&entry.name)
-            .or_else(|| entry.real_env.as_ref().and_then(|var| std::env::var(var).ok()))
+        let value = self.secret(&entry.name).or_else(|| {
+            entry
+                .real_env
+                .as_ref()
+                .and_then(|var| std::env::var(var).ok())
+        })?;
+        // Cline's auth adapter prefixes OAuth access tokens with workos:.
+        // Static API keys remain unchanged. Handle existing stored sessions
+        // too, without requiring a new login after upgrading the broker.
+        Some(
+            if crate::oauth::ClineSession::load(self, &entry.name).is_some()
+                && !value.to_ascii_lowercase().starts_with("workos:")
+            {
+                format!("workos:{value}")
+            } else {
+                value
+            },
+        )
     }
 
     /// Shell lines the guest sources: fake keys under their guest names.
     pub fn guest_env_lines(&self) -> String {
-        let mut out = String::from("# Friendzone fake credentials; real values stay on the host.\n");
+        let mut out =
+            String::from("# Friendzone fake credentials; real values stay on the host.\n");
         for entry in self.entries() {
             if let Some(var) = &entry.guest_env {
                 out.push_str(&format!("export {var}={}\n", entry.fake));
@@ -166,7 +188,11 @@ impl Settings {
     /// The single substitution resolver. Looks for each entry's exact
     /// fake in its declared header; only an exact match substitutes,
     /// and only toward a pinned host.
-    pub fn substitute(&self, host: &str, get_header: impl Fn(&str) -> Option<String>) -> Substitution {
+    pub fn substitute(
+        &self,
+        host: &str,
+        get_header: impl Fn(&str) -> Option<String>,
+    ) -> Substitution {
         for entry in self.entries() {
             let Some(value) = get_header(&entry.header) else {
                 continue;
@@ -201,9 +227,9 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
         return Ok(None);
     }
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    Ok(Some(serde_json::from_str(&text).with_context(|| {
-        format!("parse {}", path.display())
-    })?))
+    Ok(Some(
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?,
+    ))
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -227,6 +253,25 @@ fn write_json_private<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cline_oauth_substitution_uses_workos_prefix_but_static_keys_do_not() {
+        let (settings, dir) = temp_settings();
+        let entry = settings.entries().pop().unwrap();
+        settings.set_secret(&entry.name, "access").unwrap();
+        assert_eq!(settings.real_value(&entry).as_deref(), Some("access"));
+        settings.set_secret(&crate::oauth::ClineSession::secret_name(&entry.name), &serde_json::json!({"refresh_token":"refresh", "expires_at":4_000_000_000_i64, "api_base_url":"https://api.cline.bot"}).to_string()).unwrap();
+        assert_eq!(
+            settings.real_value(&entry).as_deref(),
+            Some("workos:access")
+        );
+        settings.set_secret(&entry.name, "workos:access").unwrap();
+        assert_eq!(
+            settings.real_value(&entry).as_deref(),
+            Some("workos:access")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn temp_settings() -> (Settings, PathBuf) {
         let dir = std::env::temp_dir().join(format!("fz-settings-{}", Uuid::new_v4()));
@@ -297,7 +342,10 @@ mod tests {
                 Some("ANTHROPIC_API_KEY".into()),
             )
             .unwrap();
-        assert_eq!(updated.fake, fake_before, "guests keep their fake across edits");
+        assert_eq!(
+            updated.fake, fake_before,
+            "guests keep their fake across edits"
+        );
         assert_eq!(updated.header, "x-api-key");
         // Editing routing fields must never touch the stored real key:
         // an edit with no key pasted keeps the credential working.
@@ -306,7 +354,11 @@ mod tests {
             Some("sk-ant-real"),
             "real key survives an edit"
         );
-        assert!(settings.update_entry("missing", vec![], "h".into(), String::new(), None).is_err());
+        assert!(
+            settings
+                .update_entry("missing", vec![], "h".into(), String::new(), None)
+                .is_err()
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -316,7 +368,10 @@ mod tests {
         assert!(settings.secret("anthropic").is_some());
         settings.remove_entry("anthropic").unwrap();
         assert!(settings.entries().is_empty());
-        assert!(settings.secret("anthropic").is_none(), "secret must not orphan");
+        assert!(
+            settings.secret("anthropic").is_none(),
+            "secret must not orphan"
+        );
         // Removal persists across reload.
         let reloaded = Settings::load(&dir).unwrap();
         assert!(reloaded.entries().is_empty());

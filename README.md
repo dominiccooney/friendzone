@@ -116,7 +116,13 @@ exists. Other origins are logged and unpoliced.
 
 ## MCP forwarding (read tools)
 
-Create `mcp-forwards.json` in the broker data directory — the same
+Use **Settings → MCP forwards** to add, validate and apply a forward live,
+or link a selected streamable-HTTP server from a host Cline settings file.
+Select allowed tools and guests explicitly; the import grants neither by
+default and never executes host commands. See [QUICKSTART.md](QUICKSTART.md)
+for the flow and guest authentication example.
+
+Advanced configuration lives in `mcp-forwards.json` in the broker data directory — the same
 directory that holds the CA files. The broker prints the exact path at
 startup ("Friendzone data: …" / "MCP forwards: none (to add some,
 create …)"), and the Settings page shows it when no forwards exist.
@@ -141,7 +147,14 @@ Defaults per OS:
 ]
 ```
 
-Then authorize it in the UI: Settings → MCP forwards → "Connect
+Use **Save & apply** (or **Reload from disk** for external edits), not a
+broker restart. Unchanged upstream sessions survive, including tool/guest
+permission changes; new requests acquire the new snapshot and in-flight
+calls finish with the old one. `guests: []` denies all; omitted/null means
+all approved guests for legacy configurations. Set a guest-name list for
+restricted sharing. Invalid configurations do not replace live forwards.
+
+For a standalone OAuth forward, authorize it in the UI: Settings → MCP forwards → "Connect
 (OAuth)". The broker discovers the server's OAuth endpoints, registers
 itself, opens your browser to log in, and stores the session on the
 host — no pasting secrets. Sessions carry the refresh token: the broker
@@ -154,6 +167,12 @@ Containers connect a streamable-HTTP MCP client to
 `http://HOST_IP:8082/mcp/linear`. Only `tools/list` (filtered to the
 allowlist) and allowlisted `tools/call` reach upstream; the token never
 enters the container.
+
+Cline-linked forwards instead read the selected server's current headers
+and access token from its host settings file for each request. Cline owns
+refresh; Friendzone neither copies refresh tokens nor writes Cline's file.
+A moved URL, removed server or disabled server fails closed. Stdio/SSE
+import and autonomous migration of Cline OAuth sessions are not supported.
 
 ## Credential escrow (inference and other APIs)
 
@@ -181,8 +200,14 @@ setup also writes `~/.cline/data/settings/providers.json` (the settings
 file Cline's CLI, IDE extension, and SDK share) registering the `cline`
 provider with the fake key, so Cline inference works in the guest with
 no `cline auth`. The write is merge-safe: other providers, the user's
-model choice, and `lastUsedProvider` are preserved; only the `cline`
-provider's key is set.
+model choice, and `lastUsedProvider` are preserved. The `cline` provider is
+switched to a fake static `apiKey` (stale OAuth fields are removed), with
+valid v1 store metadata and `tokenSource: "manual"`. Run setup while guest
+Cline is stopped. Real OAuth refresh stays in the broker; substitution
+adds Cline's `workos:` prefix to broker-owned OAuth access tokens.
+
+The environment includes `FZ_HOST`, `FZ_BROKER`, host-only `NO_PROXY` and
+`no_proxy` exclusions, and `GIT_SSL_CAINFO` as well as runtime CA variables.
 
 Substitution requires an exact fake match on a pinned host: a random
 key passes through untouched, and a fake sent toward any non-pinned
@@ -195,7 +220,9 @@ through untouched.
 Working now: multi-container identity with join-request approval, IP
 pinning, dynamic add/remove, and a
 reversible kill switch; request log with HTTP status, inference token
-counts, and working search; in-UI MCP forwards editing with live
+counts, 10,000-event in-memory retention, server-side search and pagination;
+407 proxy authentication negotiation, CONNECT identity propagation and
+decrypted GitHub policy; in-UI MCP forwards editing with live
 reload; GitHub read/write policy (reads flow, writes
 block with a note); credential escrow with exact-fake-match,
 host-pinned substitution and leak blocking, provider presets, and

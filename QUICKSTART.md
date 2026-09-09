@@ -38,10 +38,11 @@ Open <http://127.0.0.1:8081>.
   the tokens in the background and auto-refreshes them. Edit fixes a wrong
   header/host without changing the fake; Delete removes the entry and
   its stored key together.
-- **Settings → MCP forwards → Connect (OAuth)** — if you configured
-  `mcp-forwards.json` (see below), click Connect; log in when the
-  browser opens. Done — the session stays on the host and auto-refreshes
-  near expiry. Reauthorize/Disconnect from the same row.
+- **Settings → MCP forwards** — add a streamable-HTTP server or preview
+  a host Cline MCP settings file, select a server, **Validate / discover
+  tools**, then explicitly select allowed tools and guests. **Add forward
+  & apply live** does not restart the broker. For standalone OAuth servers,
+  use the advanced editor to add the forward, then Connect (OAuth).
 
 Optional, before starting: MCP forwards live in `mcp-forwards.json` in
 the broker data directory — the broker prints the exact path at startup
@@ -62,7 +63,20 @@ the broker data directory — the broker prints the exact path at startup
 ]
 ```
 
-Restart the broker after editing it.
+Use **Save & apply** in the UI, or **Reload from disk** after an external
+edit. Neither restarts the broker. Invalid configurations leave the active
+forwards untouched; unchanged upstream sessions survive permission edits.
+New requests use new permissions; already admitted calls finish under the
+old snapshot. Add `"guests": ["scratch-kali"]` to restrict a forward;
+`"guests": []` denies everyone, while omitted/null retains legacy sharing
+with all approved guests. An empty `tools` list denies all tool calls.
+
+Cline import accepts nested `transport.type: "streamableHttp"` and legacy
+streamable-HTTP entries. It links the **absolute host path**, reads current
+headers/access tokens per request, and does not copy secrets or execute
+commands. Cline retains OAuth refresh ownership: reconnect/refresh in host
+Cline when needed. Removing/disabling the source or changing its URL fails
+closed until reviewed. Stdio and SSE entries are explicitly unsupported.
 
 ## 3. Container: bootstrap
 
@@ -87,7 +101,8 @@ sudo ./fz setup --broker http://HOST_IP:8082 --install
 Running under `sudo` is fine: setup detects the invoking user and
 writes the CA, env file, and Cline settings into *their* home
 (`~/.config/friendzone/`, `~/.cline/`), owned by them and
-world-readable — only the CA trust-store install needs root.
+readable by that user — only the CA trust-store install needs root.
+The CA/env are public; the merged Cline provider file is owner-only.
 
 This installs the CA into the trust store and writes two files next to
 each other (path is printed; typically `~/.config/friendzone/`):
@@ -98,7 +113,12 @@ each other (path is printed; typically `~/.config/friendzone/`):
 If a `CLINE_API_KEY` fake exists, setup also writes
 `~/.cline/data/settings/providers.json` registering the `cline`
 provider with the fake key — Cline CLI/IDE inference works immediately,
-no `cline auth`. Existing Cline settings are merged, never clobbered.
+no guest OAuth login. Run setup while guest Cline is stopped: model choice,
+other providers and last-used choice are preserved, but this provider's
+OAuth fields are removed so stale access tokens cannot override the fake.
+The v1 store includes `version`, `modes`, UTC `updatedAt`, and a valid
+`tokenSource: "manual"`. Older setup output lacked valid metadata, causing
+Cline to discard the store; rerun the updated setup to repair it.
 
 ## 4. Container: agent shell environment
 
@@ -109,6 +129,11 @@ CA bundle vars, and the fake keys — into one file. Activate it:
 . ~/.config/friendzone/friendzone-env.sh
 ```
 
+The file also exports `FZ_HOST` and `FZ_BROKER`, both proxy-variable cases,
+and `NO_PROXY`/`no_proxy` for the broker host only (preserving existing
+exclusions). `GIT_SSL_CAINFO` trusts the intercepted origin certificate;
+`GIT_PROXY_SSL_CAINFO` alone was not sufficient for an HTTP proxy.
+
 Add that line to the agent's shell profile so it persists. The
 container identity defaults to the guest hostname; pass
 `--container reviewer` to `fz setup` to match a name you added in the
@@ -118,14 +143,56 @@ UI. Then check everything:
 ./fz doctor --broker http://HOST_IP:8082 --proxy http://reviewer:x@HOST_IP:8080
 ```
 
-## 5. Container: point the agent at MCP forwards
+Doctor checks broker health **directly**, ignoring proxy environment
+variables. Its proxy reachability check is **TCP only**: a pass does not
+verify container approval, proxy forwarding, or CA trust. If setup says
+"awaiting approval", open the **host's** UI at <http://127.0.0.1:8081> and
+approve the container in the Inbox before trying agent traffic.
 
-Any streamable-HTTP MCP client works; the URL is
-`http://HOST_IP:8082/mcp/<name>`. Claude Code example:
+### Troubleshooting: doctor reports 403 after sourcing the env file
+
+Older builds sent even the broker health check through `HTTP_PROXY`, so
+an unapproved container produced a misleading "broker reachable" failure.
+Compare the direct and proxied paths (use your actual container name):
 
 ```sh
-claude mcp add --transport http linear http://HOST_IP:8082/mcp/linear
+# Expect HTTP 200 and "ok", even before approval.
+curl --noproxy '*' -i http://HOST_IP:8082/health
+
+# A 403 body explains the proxy denial: pending approval, wrong IP pin, etc.
+curl --noproxy '' --proxy http://reviewer:x@HOST_IP:8080 -i http://HOST_IP:8082/health
 ```
+
+Approve the name in the host Inbox; if already approved, check its IP pin
+and Kill/Resume state. Rebuild the guest binary with `cargo build --release`
+after updating it to include the fix. `fz setup` also contacts the broker
+directly, so rerunning setup after sourcing the env works before approval.
+There is no need to disable TLS verification or globally bypass the proxy.
+
+## 5. Container: point the agent at MCP forwards
+
+Use a streamable-HTTP MCP client with explicit guest Basic authorization.
+The endpoint is `$FZ_BROKER/mcp/<name>`; proxy credentials are not a
+substitute for its `Authorization` header. Cline guest settings example
+(replace the URL and choose the matching guest name; the base64 below is
+`scratch-kali:x`, not a secret):
+
+```json
+{
+  "mcpServers": {
+    "linear-via-friendzone": {
+      "transport": {
+        "type": "streamableHttp",
+        "url": "http://172.31.208.1:8082/mcp/linear",
+        "headers": { "Authorization": "Basic c2NyYXRjaC1rYWxpOng=" }
+      }
+    }
+  }
+}
+```
+
+Approval, IP pinning, kill state, forward guest allowlist, and tool allowlist
+all apply. No upstream credential is given to the guest.
 
 ## 6. Smoke test — what should happen
 
@@ -150,6 +217,14 @@ curl https://example.com/ -H "x-api-key: $ANTHROPIC_API_KEY"   # 403
 
 Watch it all live at <http://127.0.0.1:8081> → Log. Kill/Resume the
 container from Inbox.
+
+The log retains 10,000 application events in memory, with server-side
+search and **Older matches** pagination. Counts show eviction; restart
+clears history. Successful CONNECT handshakes and normal 407 challenges
+are omitted, while authorization/policy denials carry a status and reason.
+Git's initial anonymous proxy probe now receives 407 (not a new IP-named
+guest); its authenticated CONNECT is intercepted, and decrypted Git reads
+flow while writes remain gated.
 
 ## Recap card
 

@@ -1,6 +1,8 @@
 mod ca;
 mod doctor;
+mod guest_http;
 mod mcp;
+mod mcp_import;
 mod oauth;
 mod policy;
 mod proxy;
@@ -8,6 +10,7 @@ mod proxy_server;
 mod settings;
 mod setup;
 mod state;
+mod storage;
 mod web;
 
 use std::{net::SocketAddr, path::PathBuf};

@@ -33,6 +33,12 @@ const GITHUB_HOSTS: &[&str] = &[
 ];
 
 pub fn classify(req: &Request<Body>) -> Decision {
+    // CONNECT admits interception, not an upstream operation. The proxy
+    // still applies identity/approval/IP/kill gates before this, and this
+    // classifier runs again on every decrypted request inside the tunnel.
+    if req.method() == hudsucker::hyper::Method::CONNECT {
+        return Decision::Unpoliced;
+    }
     let Some(host) = req.uri().host() else {
         return Decision::Unpoliced;
     };
@@ -79,6 +85,10 @@ mod tests {
 
     #[test]
     fn github_reads_flow() {
+        assert_eq!(
+            classify(&req("CONNECT", "github.com:443")),
+            Decision::Unpoliced
+        );
         assert_eq!(
             classify(&req("GET", "https://api.github.com/repos/x/y/pulls/1")),
             Decision::AllowRead

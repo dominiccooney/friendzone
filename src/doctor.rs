@@ -7,14 +7,19 @@ use anyhow::Result;
 
 pub async fn run(broker: &str, proxy: &str) -> Result<()> {
     println!("Friendzone doctor\n");
+    let client = crate::guest_http::broker_client()?;
     let mut failed = false;
     check_http(
-        "broker reachable",
+        &client,
+        "broker reachable (direct, without proxy)",
         format!("{}/health", broker.trim_end_matches('/')),
         &mut failed,
     )
     .await;
     check_proxy(proxy, &mut failed);
+    println!(
+        "[INFO] container approval and proxy forwarding are not tested yet; approve this container in the host UI inbox"
+    );
     println!("[INFO] CA trust per language runtime is not tested yet");
     println!(
         "[INFO] UDP, DNS, and direct-IP bypass tests require platform network setup and are not tested yet"
@@ -26,8 +31,13 @@ pub async fn run(broker: &str, proxy: &str) -> Result<()> {
     Ok(())
 }
 
-async fn check_http(name: &str, url: String, failed: &mut bool) {
-    match reqwest::get(&url).await.and_then(|r| r.error_for_status()) {
+async fn check_http(client: &reqwest::Client, name: &str, url: String, failed: &mut bool) {
+    match client
+        .get(&url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+    {
         Ok(_) => println!("[PASS] {name}"),
         Err(error) => {
             println!("[FAIL] {name}: {error}");
@@ -49,7 +59,7 @@ fn check_proxy(proxy: &str, failed: &mut bool) {
         .ok()
         .and_then(|mut values| values.next());
     match address.and_then(connect) {
-        Some(Ok(())) => println!("[PASS] proxy reachable at {authority}"),
+        Some(Ok(())) => println!("[PASS] proxy reachable at {authority} (TCP only)"),
         Some(Err(error)) => {
             println!("[FAIL] proxy reachable: {error}");
             *failed = true;
