@@ -189,7 +189,10 @@ There is no need to disable TLS verification or globally bypass the proxy.
 
 ## 5. Container: point the agent at MCP forwards
 
-In the host UI, **Settings → MCP forwards → Connect from Cline** shows
+In the host UI, each MCP forward has **Copy Friendzone URL** next to its
+guest-facing URL; copying it requires no guest selection. The upstream URL
+is Linear's (or another provider's) server, not the URL to add in guest Cline.
+Use **Settings → MCP forwards → Connect from Cline** for
 the guest endpoint and copyable Cline JSON for each forward. Select the
 guest and merge the generated entry into its Cline MCP settings; do not
 overwrite other servers. The broker host/port default comes from the
@@ -197,6 +200,13 @@ bootstrap listener, not the UI address. For wildcard binds enter the host
 IP/DNS name reachable from the guest. The panel warns about missing
 approval, sharing, tools, killed guests and loopback-only listeners;
 generating/copying a configuration does not grant access.
+
+**Uses host Cline's credentials** means Friendzone reads the token saved by
+host Cline and relies on Cline to refresh it. **Authorize in Friendzone**
+switches the forward to an independent broker-owned OAuth session. Neither
+mode requires an upstream OAuth login in the guest. If the browser still
+shows the old “Cline link” wording after updating/restarting the broker,
+reload the page (hard-refresh if necessary).
 
 There is **one endpoint per forwarded server**, not one combined endpoint.
 Use a streamable-HTTP MCP client with explicit guest Basic authorization.

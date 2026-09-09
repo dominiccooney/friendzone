@@ -145,12 +145,19 @@ async function renderSettings() {
   }).join("") || '<div class="log-row">No escrow entries yet.</div>';
   $("#mcp-list").innerHTML = mcp.forwards.map(f=>{
     const expiry = f.expires_at ? ` · expires ${new Date(f.expires_at*1000).toLocaleString()}${f.refreshable?" (auto-refresh)":""}` : "";
-    const status = f.auth==="cline-link" ? `<span class="verdict">Cline credentials (not broker-owned)</span> <button class="quiet" data-oauth="${esc(f.name)}">Authorize in Friendzone…</button>`
-      : f.auth==="oauth" ? `<span class="verdict allowed">Friendzone OAuth</span>${esc(expiry)} <button class="quiet" data-oauth="${esc(f.name)}">Reauthorize in Friendzone…</button> <button class="quiet" data-oauth-disconnect="${esc(f.name)}">Disconnect</button>`
+    const status = f.auth==="cline-link" ? `<span class="verdict">Uses host Cline's credentials</span><p class="meta">Friendzone reads the saved token; host Cline must refresh it. For independent login and refresh, authorize in Friendzone. No guest OAuth login is needed.</p> <button class="quiet" data-oauth="${esc(f.name)}">Authorize in Friendzone…</button>`
+      : f.auth==="oauth" ? `<span class="verdict allowed">Friendzone manages OAuth</span>${esc(expiry)} <button class="quiet" data-oauth="${esc(f.name)}">Reauthorize in Friendzone…</button> <button class="quiet" data-oauth-disconnect="${esc(f.name)}">Disconnect</button>`
       : f.auth==="stored-key" || f.auth==="env-key" ? `<span class="verdict allowed">${esc(f.auth)}</span> <button class="quiet" data-oauth="${esc(f.name)}">Switch to OAuth…</button>`
       : `<button class="quiet" data-oauth="${esc(f.name)}">Authorize in Friendzone…</button>`;
-    return `<div class="log-row"><span>${esc(f.name)}</span><span class="request">Upstream: ${esc(f.url)} · ${f.tools.length} tools · guests: ${f.guests===null?"all approved":esc(f.guests.join(", ")||"none")}${f.scope?` · scope ${esc(f.scope)}`:""}<span class="mcp-endpoint">Guest endpoint: <code>${esc(f.guest_endpoint || `/mcp/${encodeURIComponent(f.name)} — choose the broker host below`)}</code></span></span><span>${status} <button data-mcp-review="${esc(f.name)}">Review tools / guests</button> <button data-mcp-connect="${esc(f.name)}">Connect from Cline</button> <button data-mcp-delete="${esc(f.name)}">Remove</button></span></div>`;
+    const endpoint = f.guest_endpoint
+      ? `<input data-mcp-endpoint readonly aria-label="Friendzone URL for ${esc(f.name)}" value="${esc(f.guest_endpoint)}"><button type="button" data-mcp-copy-url="${esc(f.name)}">Copy Friendzone URL</button>`
+      : `<code>/mcp/${esc(encodeURIComponent(f.name))}</code> — set the broker host in Connect from Cline below to get a complete URL.`;
+    return `<div class="log-row"><span>${esc(f.name)}</span><span class="request">Upstream: ${esc(f.url)} · ${f.tools.length} tools · guests: ${f.guests===null?"all approved":esc(f.guests.join(", ")||"none")}${f.scope?` · scope ${esc(f.scope)}`:""}<span class="mcp-endpoint">Friendzone URL for guest Cline: ${endpoint}</span></span><span>${status} <button data-mcp-review="${esc(f.name)}">Review tools / guests</button> <button data-mcp-connect="${esc(f.name)}">Connect from Cline</button> <button data-mcp-delete="${esc(f.name)}">Remove</button></span></div>`;
   }).join("") || '<div class="log-row">No MCP forwards yet. Add or import one below; no broker restart needed.</div>';
+  document.querySelectorAll("[data-mcp-copy-url]").forEach(button => button.onclick = () => {
+    const input = button.closest(".log-row").querySelector("[data-mcp-endpoint]");
+    return copyMcpText(input, $("#mcp-copy-status"), "Friendzone URL copied. Use Connect from Cline for the required guest Authorization header or complete JSON.", () => input.isConnected);
+  });
   document.querySelectorAll("[data-mcp-connect]").forEach(button => button.onclick = () => {
     $("#mcp-connect-forward").value = button.dataset.mcpConnect;
     loadMcpConnection();
@@ -359,16 +366,20 @@ for (const id of ["forward", "guest"]) $("#mcp-connect-"+id).addEventListener("c
 $("#mcp-connect-host").addEventListener("input", () => {mcpHostInitialized=true;loadMcpConnection();});
 for (const id of ["url", "auth", "json"]) $("#mcp-copy-"+id).onclick = async () => {
   const input = $("#mcp-connect-"+id), generation = mcpConnectGeneration;
+  await copyMcpText(input, $("#mcp-connect-status"), "Copied. Paste into guest Cline, not the host's upstream server settings.", () => generation === mcpConnectGeneration);
+};
+
+async function copyMcpText(input, status, successMessage, isCurrent) {
   if (!input.value) return;
   try {
     await navigator.clipboard.writeText(input.value);
-    if (generation === mcpConnectGeneration) $("#mcp-connect-status").textContent = "Copied. Paste into guest Cline, not the host's upstream server settings.";
+    if (isCurrent()) status.textContent = successMessage;
   } catch {
-    if (generation !== mcpConnectGeneration) return;
+    if (!isCurrent()) return;
     input.focus(); input.select();
-    $("#mcp-connect-status").textContent = "Clipboard access unavailable. Text selected; press Ctrl+C / Cmd+C to copy.";
+    status.textContent = "Clipboard access unavailable. Text selected; press Ctrl+C / Cmd+C to copy.";
   }
-};
+}
 
 let clineLink = null, validatedMcp = null;
 function mcpDraft() {

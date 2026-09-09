@@ -20,13 +20,26 @@ function fixture() {
   }]));
   const calls = [];
   const timers = [];
+  let copyButtons = [];
   const sandbox = {
     document: {
       querySelector(selector) {
         assert.ok(elements.has(selector), `HTML is missing ${selector}`);
         return elements.get(selector);
       },
-      querySelectorAll() { return []; },
+      querySelectorAll(selector) {
+        if (selector !== "[data-mcp-copy-url]") return [];
+        // Model row-level controls from the real rendered markup so tests
+        // exercise both button wiring and choosing the guest (not upstream) URL.
+        for (const button of copyButtons) button.input.isConnected = false;
+        const markup = elements.get("#mcp-list").innerHTML;
+        const values = [...markup.matchAll(/<input data-mcp-endpoint[^>]* value="([^"]*)"/g)].map(match=>match[1]);
+        copyButtons = [...markup.matchAll(/data-mcp-copy-url="([^"]*)"/g)].map((match, index) => {
+          const input = {value:values[index], isConnected:true, focus(){this.focused=true;}, select(){this.selected=true;}};
+          return {input, dataset:{mcpCopyUrl:match[1]}, closest(selector){assert.equal(selector,".log-row");return {querySelector(selector){assert.equal(selector,"[data-mcp-endpoint]");return input;}};}};
+        });
+        return copyButtons;
+      },
     },
     localStorage: { getItem() { return null; } },
     EventSource: class {},
@@ -59,15 +72,50 @@ function fixture() {
       }}}},
     }),
   });
-  return {run, element, sandbox, calls, seed, reply, timers};
+  return {run, element, sandbox, calls, seed, reply, timers, copyButtons:()=>copyButtons};
 }
 
-async function resolveSettings(f) {
+async function resolveSettings(f, forwards = []) {
   await new Promise(setImmediate);
   f.calls.filter(c=>c.url==="/api/escrow").at(-1).resolve({json:async()=>({entries:[]})});
-  f.calls.filter(c=>c.url==="/api/mcp").at(-1).resolve({json:async()=>({forwards:[],guest_host:"172.31.208.1",guest_port:8082})});
+  f.calls.filter(c=>c.url==="/api/mcp").at(-1).resolve({json:async()=>({forwards,guest_host:"172.31.208.1",guest_port:8082})});
   f.calls.filter(c=>c.url==="/api/guest-env").at(-1).resolve({text:async()=>"# environment"});
 }
+
+const linearForward = {
+  name:"Linear", url:"https://mcp.linear.app/mcp", tools:["read"], guests:["scratch-kali"],
+  auth:"cline-link", guest_endpoint:"http://172.31.208.1:8082/mcp/Linear",
+};
+
+test("forward row explains Cline credential ownership and copies the Friendzone URL without a guest", async () => {
+  const f=fixture();
+  const render=f.run("renderSettings()"); await resolveSettings(f, [linearForward]); await render;
+  assert.match(f.element("list").innerHTML, /Uses host Cline's credentials/);
+  assert.match(f.element("list").innerHTML, /host Cline must refresh it/);
+  assert.match(f.element("list").innerHTML, /Authorize in Friendzone/);
+  assert.equal(f.element("connect-guest").value, "");
+  let copied;
+  f.sandbox.navigator.clipboard={async writeText(value){copied=value;}};
+  const [button]=f.copyButtons();
+  await button.onclick();
+  assert.equal(copied, linearForward.guest_endpoint);
+  assert.notEqual(copied, linearForward.url);
+  assert.match(f.element("copy-status").textContent, /required guest Authorization header/);
+  assert.ok(!f.calls.some(call=>call.url.includes("guest-config")), "URL copy does not need credentials or guest selection");
+  delete f.sandbox.navigator.clipboard;
+  await button.onclick();
+  assert.equal(button.input.selected,true);
+  assert.match(f.element("copy-status").textContent,/Ctrl\+C/);
+});
+
+test("wildcard endpoint does not offer to copy a partial URL and broker OAuth is clearly labeled", async () => {
+  const f=fixture();
+  const render=f.run("renderSettings()");
+  await resolveSettings(f, [{...linearForward, auth:"oauth", guest_endpoint:null}]); await render;
+  assert.match(f.element("list").innerHTML, /Friendzone manages OAuth/);
+  assert.match(f.element("list").innerHTML, /set the broker host/);
+  assert.equal(f.copyButtons().length,0);
+});
 
 test("broker OAuth posts selected scope and reports completion without guest login", async () => {
   const f=fixture();
