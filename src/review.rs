@@ -1,7 +1,7 @@
 //! One-shot review of immutable, inspectable HTTP requests. Only the waiting
 //! proxy future owns the request bytes; this queue never executes/replays one.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -19,6 +19,29 @@ pub const MAX_HEADERS: usize = 16 * 1024;
 pub const MAX_PENDING: usize = 32;
 pub const MAX_PER_GUEST: usize = 8;
 pub const WAIT_LIMIT: Duration = Duration::from_secs(120);
+pub const HISTORY_LIMIT: usize = 100;
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    Pending,
+    Approved,
+    Sending,
+    ResponseReceived,
+    GraphqlError,
+    Denied,
+    Expired,
+    Cancelled,
+    Blocked,
+    UpstreamError,
+    Unknown,
+}
+
+impl Status {
+    fn active(self) -> bool {
+        matches!(self, Self::Pending | Self::Approved | Self::Sending)
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Summary {
@@ -31,6 +54,10 @@ pub struct Summary {
     pub fingerprint: String,
     pub body_bytes: usize,
     pub reason: String,
+    pub status: Status,
+    pub updated_at: DateTime<Utc>,
+    pub http_status: Option<u16>,
+    pub outcome: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -148,9 +175,9 @@ impl Detail {
             }
         });
         let reason = if is_graphql {
-            "GitHub GraphQL: supported queries flow automatically. This request requires review (mutation, subscription, or unclassified/unsupported query transport). PR creation and review comments are permitted with Approve once; inspect all inputs before approving."
+            "GitHub GraphQL operation requires approval."
         } else {
-            "GitHub operation requires one-shot approval. Review the full destination and payload; this does not grant future requests."
+            "GitHub operation requires approval."
         };
         Ok(Self {
             summary: Summary {
@@ -163,6 +190,10 @@ impl Detail {
                 fingerprint: format!("{:x}", hash.finalize()),
                 body_bytes: bytes.len(),
                 reason: reason.into(),
+                status: Status::Pending,
+                updated_at: created_at,
+                http_status: None,
+                outcome: None,
             },
             headers,
             body: body.into(),
@@ -188,8 +219,34 @@ struct Entry {
     sender: oneshot::Sender<Decision>,
     deadline: tokio::time::Instant,
 }
+#[derive(Default)]
+struct QueueData {
+    pending: HashMap<Uuid, Entry>,
+    recent: VecDeque<Detail>,
+}
+impl QueueData {
+    fn archive(
+        &mut self,
+        id: Uuid,
+        status: Status,
+        outcome: &str,
+    ) -> Option<oneshot::Sender<Decision>> {
+        let mut entry = self.pending.remove(&id)?;
+        entry.detail.summary.status = status;
+        entry.detail.summary.updated_at = Utc::now();
+        entry.detail.summary.outcome = Some(outcome.into());
+        // Retained snapshots are read-only: never a source of new grants.
+        entry.detail.comment_context = None;
+        entry.detail.comment_permission_supported = false;
+        self.recent.push_back(entry.detail);
+        while self.recent.len() > HISTORY_LIMIT {
+            self.recent.pop_front();
+        }
+        Some(entry.sender)
+    }
+}
 struct Inner {
-    entries: Mutex<HashMap<Uuid, Entry>>,
+    entries: Mutex<QueueData>,
     changes: watch::Sender<u64>,
     capacity: usize,
     per_guest: usize,
@@ -203,7 +260,7 @@ impl Queue {
     }
     fn with_limits(changes: watch::Sender<u64>, capacity: usize, per_guest: usize) -> Self {
         Self(Arc::new(Inner {
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(QueueData::default()),
             changes,
             capacity,
             per_guest,
@@ -216,11 +273,17 @@ impl Queue {
     }
     pub fn enqueue(&self, detail: Detail) -> Result<Ticket> {
         let mut entries = self.0.entries.lock().expect("review queue");
-        if entries.contains_key(&detail.summary.id) {
+        if entries.pending.contains_key(&detail.summary.id)
+            || entries
+                .recent
+                .iter()
+                .any(|item| item.summary.id == detail.summary.id)
+        {
             bail!("request is already waiting; cannot replace its snapshot");
         }
-        if entries.len() >= self.0.capacity
+        if entries.pending.len() >= self.0.capacity
             || entries
+                .pending
                 .values()
                 .filter(|entry| entry.detail.summary.container == detail.summary.container)
                 .count()
@@ -233,7 +296,7 @@ impl Queue {
         let (sender, receiver) = oneshot::channel();
         let id = detail.summary.id;
         let deadline = tokio::time::Instant::now() + WAIT_LIMIT;
-        entries.insert(
+        entries.pending.insert(
             id,
             Entry {
                 detail,
@@ -250,12 +313,14 @@ impl Queue {
             deadline,
         })
     }
+    #[cfg(test)]
     pub fn summaries(&self) -> Vec<Summary> {
         let mut summaries: Vec<_> = self
             .0
             .entries
             .lock()
             .expect("review queue")
+            .pending
             .values()
             .map(|entry| entry.detail.summary.clone())
             .collect();
@@ -267,33 +332,150 @@ impl Queue {
             .entries
             .lock()
             .expect("review queue")
+            .pending
             .get(&id)
             .filter(|entry| {
                 entry.deadline > tokio::time::Instant::now() && !entry.sender.is_closed()
             })
             .map(|entry| entry.detail.clone())
     }
+    /// UI reads may inspect retained snapshots; grant/resolve callers must
+    /// continue using detail(), which only returns live pending requests.
+    pub fn inspect(&self, id: Uuid) -> Option<Detail> {
+        let entries = self.0.entries.lock().expect("review queue");
+        entries
+            .pending
+            .get(&id)
+            .map(|entry| entry.detail.clone())
+            .or_else(|| {
+                entries
+                    .recent
+                    .iter()
+                    .find(|item| item.summary.id == id)
+                    .cloned()
+            })
+    }
+    #[cfg(test)]
+    pub fn recent(&self) -> Vec<Summary> {
+        self.0
+            .entries
+            .lock()
+            .expect("review queue")
+            .recent
+            .iter()
+            .rev()
+            .map(|item| item.summary.clone())
+            .collect()
+    }
+    pub fn view(&self) -> (Vec<Summary>, Vec<Summary>) {
+        let entries = self.0.entries.lock().expect("review queue");
+        let mut pending: Vec<_> = entries
+            .pending
+            .values()
+            .map(|entry| entry.detail.summary.clone())
+            .collect();
+        pending.sort_by_key(|item| item.created_at);
+        let recent = entries
+            .recent
+            .iter()
+            .rev()
+            .map(|item| item.summary.clone())
+            .collect();
+        (pending, recent)
+    }
+    pub fn tracks_response(&self, id: Uuid) -> bool {
+        self.0
+            .entries
+            .lock()
+            .expect("review queue")
+            .recent
+            .iter()
+            .any(|item| item.summary.id == id && item.graphql.is_some())
+    }
+    pub fn response_detail(&self, id: Uuid, status: Status, outcome: &str) {
+        let mut entries = self.0.entries.lock().expect("review queue");
+        let Some(detail) = entries.recent.iter_mut().find(|item| item.summary.id == id) else {
+            return;
+        };
+        if detail.summary.status != Status::ResponseReceived {
+            return;
+        }
+        detail.summary.status = status;
+        detail.summary.outcome = Some(outcome.into());
+        detail.summary.updated_at = Utc::now();
+        drop(entries);
+        self.notify();
+    }
+    /// Decision removal and outcome publication share the queue lock. Later
+    /// proxy observations refine only nonterminal outcomes; late callbacks or
+    /// cleanup cannot turn Denied/Expired into Approved or erase a response.
+    pub fn observe(&self, id: Uuid, status: Status, http_status: Option<u16>, outcome: &str) {
+        let mut entries = self.0.entries.lock().expect("review queue");
+        let Some(detail) = entries.recent.iter_mut().find(|item| item.summary.id == id) else {
+            return;
+        };
+        if !detail.summary.status.active() {
+            return;
+        }
+        detail.summary.status = status;
+        detail.summary.updated_at = Utc::now();
+        detail.summary.http_status = http_status;
+        detail.summary.outcome = Some(outcome.into());
+        drop(entries);
+        self.notify();
+    }
+    fn cancel_pending(&self, id: Uuid, status: Status, outcome: &str) {
+        let mut entries = self.0.entries.lock().expect("review queue");
+        if entries.archive(id, status, outcome).is_none() {
+            return;
+        }
+        drop(entries);
+        self.notify();
+    }
     pub fn decide(&self, id: Uuid, fingerprint: &str, decision: Decision) -> Result<()> {
         let mut entries = self.0.entries.lock().expect("review queue");
-        let entry = entries.get(&id).ok_or_else(|| {
+        let entry = entries.pending.get(&id).ok_or_else(|| {
             anyhow::anyhow!("request is no longer waiting (decided, cancelled or expired)")
         })?;
         if entry.detail.summary.fingerprint != fingerprint {
             bail!("request fingerprint mismatch; reload the review");
         }
         if entry.deadline <= tokio::time::Instant::now() || entry.sender.is_closed() {
-            entries.remove(&id);
+            let status = if entry.deadline <= tokio::time::Instant::now() {
+                Status::Expired
+            } else {
+                Status::Cancelled
+            };
+            entries.archive(
+                id,
+                status,
+                "Not sent. Review expired or client stopped waiting.",
+            );
             drop(entries);
             self.notify();
             bail!("request expired or the waiting proxy request was cancelled");
         }
-        let entry = entries.remove(&id).expect("checked entry");
+        let (status, outcome) = match decision {
+            Decision::Approve => (
+                Status::Approved,
+                "Approved once; checking current policy before sending.",
+            ),
+            Decision::Deny => (Status::Denied, "Denied by host. Not sent."),
+        };
+        let sender = entries.archive(id, status, outcome).expect("checked entry");
+        let sent = sender.send(decision).is_ok();
         drop(entries);
         self.notify();
-        entry
-            .sender
-            .send(decision)
-            .map_err(|_| anyhow::anyhow!("waiting proxy request was cancelled"))
+        if !sent {
+            self.observe(
+                id,
+                Status::Cancelled,
+                None,
+                "Client stopped waiting. Not sent.",
+            );
+            bail!("waiting proxy request was cancelled");
+        }
+        Ok(())
     }
     pub fn set_resolved(
         &self,
@@ -303,7 +485,10 @@ impl Queue {
         revision: Uuid,
     ) -> Result<Detail> {
         let mut entries = self.0.entries.lock().expect("review queue");
-        let entry = entries.get_mut(&id).context("request no longer waiting")?;
+        let entry = entries
+            .pending
+            .get_mut(&id)
+            .context("request no longer waiting")?;
         if entry.detail.summary.fingerprint != fingerprint
             || entry.deadline <= tokio::time::Instant::now()
             || entry.sender.is_closed()
@@ -322,21 +507,28 @@ impl Queue {
     }
     pub fn cancel_container(&self, container: &str) {
         let mut entries = self.0.entries.lock().expect("review queue");
-        entries.retain(|_, entry| entry.detail.summary.container != container);
+        let ids: Vec<_> = entries
+            .pending
+            .iter()
+            .filter(|(_, entry)| entry.detail.summary.container == container)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            entries.archive(
+                id,
+                Status::Cancelled,
+                "Container permissions changed. Not sent.",
+            );
+        }
         drop(entries);
         self.notify();
     }
     fn remove(&self, id: Uuid) {
-        if self
-            .0
-            .entries
-            .lock()
-            .expect("review queue")
-            .remove(&id)
-            .is_some()
-        {
-            self.notify();
-        }
+        self.cancel_pending(
+            id,
+            Status::Cancelled,
+            "Waiting request was cancelled. Not sent.",
+        );
     }
 }
 
@@ -351,6 +543,11 @@ impl Ticket {
         tokio::time::timeout_at(self.deadline, &mut self.receiver)
             .await
             .map_err(|_| {
+                self.queue.cancel_pending(
+                    self.id,
+                    Status::Expired,
+                    "No decision within 2 minutes. Not sent.",
+                );
                 anyhow::anyhow!("review expired after 120 seconds; request was not forwarded")
             })?
             .map_err(|_| {
@@ -484,12 +681,22 @@ mod tests {
                 .is_err()
         );
         assert!(queue.detail(id).is_none());
-        let next = detail.clone();
+        assert_eq!(queue.inspect(id).unwrap().summary.status, Status::Approved);
+        assert!(
+            queue.enqueue(detail.clone()).is_err(),
+            "cannot requeue a retained ID"
+        );
+        let mut next = detail.clone();
+        next.summary.id = Uuid::new_v4();
+        let id = next.summary.id;
         let ticket = queue.enqueue(next).unwrap();
         queue
             .decide(id, &detail.summary.fingerprint, Decision::Deny)
             .unwrap();
         assert_eq!(ticket.wait().await.unwrap(), Decision::Deny);
+        assert_eq!(queue.inspect(id).unwrap().summary.status, Status::Denied);
+        queue.observe(id, Status::Sending, None, "late approval");
+        assert_eq!(queue.inspect(id).unwrap().summary.status, Status::Denied);
     }
 
     #[tokio::test]
@@ -504,6 +711,7 @@ mod tests {
         queue.cancel_container("two");
         assert!(other.wait().await.is_err());
         let mut ticket = queue.enqueue(detail("one")).unwrap();
+        let expired_id = ticket.id;
         ticket.deadline = tokio::time::Instant::now();
         assert!(
             ticket
@@ -514,6 +722,10 @@ mod tests {
                 .contains("expired")
         );
         assert!(queue.summaries().is_empty());
+        assert_eq!(
+            queue.inspect(expired_id).unwrap().summary.status,
+            Status::Expired
+        );
         let detail = detail("one");
         let ticket = queue.enqueue(detail.clone()).unwrap();
         queue
@@ -521,6 +733,7 @@ mod tests {
             .entries
             .lock()
             .unwrap()
+            .pending
             .get_mut(&detail.summary.id)
             .unwrap()
             .deadline = tokio::time::Instant::now();
@@ -534,6 +747,35 @@ mod tests {
                 .is_err()
         );
         assert!(ticket.wait().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn recent_history_is_bounded_read_only_and_separate_from_pending_capacity() {
+        let queue = Queue::with_limits(watch::Sender::new(0), 1, 1);
+        let mut ids = Vec::new();
+        for _ in 0..HISTORY_LIMIT + 2 {
+            let entry = detail("guest");
+            ids.push(entry.summary.id);
+            let ticket = queue.enqueue(entry.clone()).unwrap();
+            queue
+                .decide(entry.summary.id, &entry.summary.fingerprint, Decision::Deny)
+                .unwrap();
+            assert_eq!(ticket.wait().await.unwrap(), Decision::Deny);
+        }
+        assert!(queue.inspect(ids[0]).is_none());
+        assert!(queue.inspect(ids[1]).is_none());
+        assert_eq!(queue.recent().len(), HISTORY_LIMIT);
+        let last = queue.inspect(*ids.last().unwrap()).unwrap();
+        assert_eq!(last.body, detail("guest").body);
+        assert!(!last.comment_permission_supported);
+        assert!(last.comment_context.is_none());
+        let json = serde_json::to_string(&queue.view()).unwrap();
+        assert!(!json.contains("guest-secret"));
+        assert!(!json.contains("addComment"), "history SSE carries no body");
+        let ticket = queue.enqueue(detail("new")).unwrap();
+        assert_eq!(queue.view().0.len(), 1);
+        drop(ticket);
+        assert_eq!(queue.recent()[0].status, Status::Cancelled);
     }
 
     #[test]

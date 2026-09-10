@@ -23,6 +23,7 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
   const pending = {id:"request-id",container:"scratch-kali",method:"POST",url:"https://api.github.com/graphql?long="+"x".repeat(180),
     body_bytes:64,fingerprint:"immutable-hash",created_at:"2026-09-09T00:00:00Z",expires_at:"2099-01-01T00:00:00Z",reason:"GraphQL request needs review"};
   state.pending_requests=[pending];
+  state.recent_reviews=[];
   state.comment_permissions=[];
   const detail={...pending,headers:[["content-type","application/json"],["authorization","[redacted]"]],body:'{"query":"<img src=x onerror=window.pwned=true>","variables":{"value":"' + "payload".repeat(200) + '"}}'};
   detail.graphql={status:"parsed",analysis:{version:1,operation_type:"mutation",operation_name:"Comment",operation_count:1,
@@ -56,6 +57,8 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     if (route === "/api/requests/request-id/decision") {
       let body=""; request.on("data",chunk=>body+=chunk); request.on("end",()=>{
         decisions.push({headers:request.headers,body:JSON.parse(body)}); state.pending_requests=[];
+        Object.assign(detail,{status:"response_received",http_status:201,outcome:"Upstream response received.",updated_at:"2099-01-01T00:00:00Z"});
+        state.recent_reviews=[{...pending,status:detail.status,http_status:201,outcome:detail.outcome,updated_at:detail.updated_at}];
         response.writeHead(204); response.end();
       }); return;
     }
@@ -218,7 +221,7 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     assert.equal(permissionActions.length,3);
     for(const width of [1058,480]) {
       await send("Emulation.setDeviceMetricsOverride",{width,height:1000,deviceScaleFactor:1,mobile:false});
-      const layout=await evaluate(`(() => {const body=document.querySelector('#request-review-body'), button=document.querySelector('#request-approve');return {page:document.documentElement.scrollWidth,body:body.clientWidth,scroll:body.scrollWidth,button:button.getBoundingClientRect().right,disabled:button.disabled};})()`);
+      const layout=await evaluate(`(() => {document.querySelector('#request-raw').open=true;const body=document.querySelector('#request-review-body'), button=document.querySelector('#request-approve');return {page:document.documentElement.scrollWidth,body:body.clientWidth,scroll:body.scrollWidth,button:button.getBoundingClientRect().right,disabled:button.disabled};})()`);
       assert.ok(layout.page<=width+1,JSON.stringify(layout)); assert.ok(layout.scroll<=layout.body+1,JSON.stringify(layout)); assert.ok(layout.button<=width,JSON.stringify(layout)); assert.equal(layout.disabled,false);
     }
     await evaluate("window.confirm=()=>true; document.querySelector('#request-approve').click()");
@@ -228,14 +231,27 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     for(let i=0;i<100 && await evaluate("document.querySelector('#inbox-count').textContent !== '0'");i++) await delay(25);
     assert.equal(await evaluate("document.querySelector('#request-approve').disabled"),true);
     assert.equal(await evaluate("document.querySelector('#inbox-count').textContent"),"0");
+    assert.equal(await evaluate("document.querySelector('#request-review-badge').textContent"),"Response received · HTTP 201");
+    assert.equal(await evaluate("document.querySelector('#request-review').hidden"),false);
+    assert.equal(await evaluate("document.querySelector('#request-review-actions').hidden"),true);
+    assert.equal(await evaluate("getComputedStyle(document.querySelector('#request-review-actions')).display"),'none');
+    assert.equal(await evaluate("document.querySelector('#recent-reviews [data-review]').textContent"),"Details");
+    if(process.env.FZ_SCREENSHOT_DIR){const shot=await send('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});fs.writeFileSync(path.join(process.env.FZ_SCREENSHOT_DIR,'review-outcome.png'),Buffer.from(shot.data,'base64'));}
+    await evaluate("document.documentElement.dataset.beforeReload='yes'");
+    await send("Page.reload");
+    for(let i=0;i<100;i++){if(await evaluate("!document.documentElement.dataset.beforeReload && !!document.querySelector('#recent-reviews [data-review]')"))break;await delay(25);}
+    await evaluate("document.querySelector('#recent-reviews [data-review]').click()");
+    for(let i=0;i<100 && !await evaluate("!document.querySelector('#request-review').hidden");i++)await delay(25);
+    assert.equal(await evaluate("document.querySelector('#request-review-badge').textContent"),"Response received · HTTP 201");
+    assert.equal(await evaluate("document.querySelector('#request-approve').disabled"),true);
     // Real browser rendering of mutation cards: both actions remain explicitly
     // approvable, not disabled by the lack of an automatic comment permission.
     for (const [field,action,label,value] of [["createPullRequest","Create pull request","Head branch (source)","fork:"+"feature-".repeat(150)],["submitPullRequestReview","Submit pull request review","Review event","APPROVE"]]) {
       const mutation={...detail,comment_permission_supported:false,resolution_id:null,resolved_target:null,graphql:{status:"parsed",analysis:{...detail.graphql.analysis,
         fields:[{...detail.graphql.analysis.fields[0],field,action,comment_body:null,mutation_inputs:[{label,path:"input.value",value},{label:"Body",path:"input.body",value:"<img src=x onerror=window.pwned=true>"}]}]}}};
       await evaluate(`activeReview=${JSON.stringify(mutation)};renderGraphqlReview(activeReview.graphql);renderCommentPermissionPanel(activeReview);document.querySelector('#request-approve').disabled=false`);
-      assert.match(await evaluate("document.querySelector('#request-graphql-operation').textContent"),/Manual approval required/);
-      assert.match(await evaluate("document.querySelector('#comment-permission-status').textContent"),/allowed with Approve once below/);
+      assert.match(await evaluate("document.querySelector('#request-graphql-operation').textContent"),/MUTATION/);
+      assert.equal(await evaluate("document.querySelector('#comment-permission-panel').hidden"),true);
       assert.equal(await evaluate("document.querySelector('#save-comment-permission').disabled"),true);
       assert.equal(await evaluate("document.querySelector('#request-graphql-fields img')===null"),true);
       assert.equal(await evaluate("!!window.pwned"),false);

@@ -1,5 +1,6 @@
 const $ = (s) => document.querySelector(s);
 let snapshot = { containers: [], requests: [], pending_requests: [] };
+let snapshotRevision = 0;
 let logRows = [], logCursor = null, logPaused = false, logGeneration = 0, logTimer;
 let order = readStoredOrder();
 let mcpConnectData = null, mcpHostInitialized = false, mcpConnectGeneration = 0, mcpGuestSignature = "";
@@ -8,7 +9,7 @@ let reviewingMcp = null;
 let activeMcpOAuth = null;
 let setupInitialized = false, setupGeneration = 0;
 let connectedMcpName = null;
-let activeReview = null, reviewGeneration = 0, pendingSignature = "";
+let activeReview = null, reviewGeneration = 0, pendingSignature = "", decisionInFlight = null;
 let commentPermissionGeneration = 0, commentPermissionSignature = "";
 let notificationTimer = null, newNotificationIds = new Set();
 let notificationsEnabled = readStoredValue("fz-notifications") === "enabled";
@@ -66,7 +67,7 @@ function renderContainers() {
     const actions = pending
       ? `<span class="state killed">awaiting approval</span><button class="approve">Approve</button><button class="approve-pin">Approve + pin IP</button><button class="quiet remove">Deny</button>`
       : `<span class="state ${killed?"killed":"approved"}" title="Network authorization, not agent activity">${containerStatus(c)}</span><button class="stop ${killed?"resume":""}">${killed?"Resume":"Kill"}</button><button class="quiet pin-edit">Pin…</button><button class="quiet remove">Remove</button>`;
-    section.innerHTML = `<div class="container-head"><span class="status-dot" style="background:${killed?"var(--red)":"#999"}" title="${esc(containerStatus(c))}; agent activity is not monitored"></span><div><div class="container-name">${esc(c.name)}</div><div class="meta">${c.request_count} retained requests · ${esc(containerTraffic(c))} · ${pin}</div></div><div class="actions">${actions}</div></div><div class="container-body">${pending?"This container asked to join. Approving permits network requests; it does not mean the agent is running.":"Agent activity is not monitored. Approval does not mean the container is busy or even online."}</div>`;
+    section.innerHTML = `<div class="container-head"><span class="status-dot" style="background:${killed?"var(--red)":"#999"}" title="${esc(containerStatus(c))}; agent activity is not monitored"></span><div><div class="container-name">${esc(c.name)}</div><div class="meta">${c.request_count} retained requests · ${esc(containerTraffic(c))} · ${pin}</div></div><div class="actions">${actions}</div></div>${pending?'<div class="container-body">Join request · approve to grant network access.</div>':""}`;
     section.querySelector(".stop")?.addEventListener("click", () => {$("#container-error").textContent="";return setKilled(c.id, !killed).catch(showContainerError);});
     section.querySelector(".approve")?.addEventListener("click", async () => {
       await changeContainerPolicy(`/api/containers/${encodeURIComponent(c.id)}/approve`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pin_to_last_ip:false})});
@@ -108,10 +109,10 @@ function updateNotificationStatus() {
   const button = $("#enable-notifications");
   button.disabled = !supported;
   button.textContent = notificationsEnabled ? "Disable notifications" : "Enable notifications";
-  $("#notification-status").textContent = !supported ? "Desktop notifications unavailable. Use localhost/HTTPS and a supported desktop browser; Inbox still works."
-    : Notification.permission === "denied" ? "Notifications blocked by browser permission. Change site settings to enable them; Inbox still works."
-    : notificationsEnabled && Notification.permission === "granted" ? "Notifications enabled while this page is open. Clicking a notification opens Inbox, never approves a request."
-    : "Desktop notifications are off. Enable them to be alerted when a guest requests approval.";
+  $("#notification-status").textContent = !supported ? "Notifications unavailable in this browser/context."
+    : Notification.permission === "denied" ? "Notifications blocked in browser site settings."
+    : notificationsEnabled && Notification.permission === "granted" ? "Notifications on while this page is open."
+    : "Notifications off.";
 }
 
 $("#enable-notifications").onclick = async () => {
@@ -152,19 +153,54 @@ function renderPendingRequests() {
   renderCommentPermissions();
   const pending = snapshot.pending_requests || [];
   $("#inbox-count").textContent = pending.length + snapshot.containers.filter(container=>!container.approved).length;
-  const signature = JSON.stringify(pending);
+  const recent = snapshot.recent_reviews || [];
+  $("#pending-count").textContent = pending.length;
+  $("#recent-count").textContent = recent.length;
+  const signature = JSON.stringify([pending, recent]);
   if (signature !== pendingSignature) {
     pendingSignature = signature;
-    $("#pending-requests").innerHTML = pending.map(request=>`<article class="pending-request"><strong>${esc(request.container)}</strong> · ${esc(request.method)} <code>${esc(request.url)}</code><p class="meta">${request.body_bytes} body bytes · expires ${esc(displayTime(request.expires_at))}</p><button type="button" data-review="${esc(request.id)}">Review request</button></article>`).join("") || '<p>No requests waiting for review.</p>';
+    $("#pending-requests").innerHTML = pending.map(reviewRow).join("") || '<p>No pending requests.</p>';
+    $("#recent-reviews").innerHTML = recent.map(reviewRow).join("") || '<p>No recent reviews.</p>';
     document.querySelectorAll("[data-review]").forEach(button=>button.onclick=()=>openRequestReview(button.dataset.review));
   }
-  if (activeReview && !pending.some(request=>request.id===activeReview.id)) {
-    activeReview = null; ++reviewGeneration;
-    $("#request-approve").disabled = true; $("#request-deny").disabled = true;
-    ++commentPermissionGeneration; renderCommentPermissionPanel(null);
-    $("#request-review-status").textContent = "This request is no longer waiting (decided, cancelled or expired). Check the log for its outcome.";
+  if (activeReview) {
+    const current = [...pending, ...recent].find(request=>request.id===activeReview.id);
+    if (current && (current.updated_at || "") >= (activeReview.updated_at || "")) applyReviewOutcome(current);
+    else if (!current) applyReviewOutcome({status:"unavailable", outcome:"Not retained: broker restarted or history limit reached."});
   }
   updateNotificationStatus(); notifyPendingRequests(pending);
+}
+
+const REVIEW_STATUSES = {
+  pending:["Pending","pending"], approved:["Approved","sending"], sending:["Sending","sending"],
+  response_received:["Response received","response"], denied:["Denied","blocked"], expired:["Expired","muted"],
+  graphql_error:["GraphQL error","blocked"],
+  cancelled:["Cancelled","muted"], blocked:["Blocked","blocked"], upstream_error:["Upstream error","blocked"],
+  unknown:["Outcome unknown","blocked"], unavailable:["Not retained","muted"],
+};
+function reviewStatus(request) {
+  const [label, color] = REVIEW_STATUSES[request.status || "pending"] || REVIEW_STATUSES.unavailable;
+  return {label:label + (request.http_status ? ` · HTTP ${request.http_status}` : ""), color:request.http_status>=400?"blocked":color};
+}
+function reviewRow(request) {
+  const status = reviewStatus(request), pending = !request.status || request.status === "pending";
+  return `<article class="pending-request"><div class="request-row-heading"><span class="request-badge ${status.color}">${esc(status.label)}</span><strong>${esc(request.container)}</strong><span class="meta">${pending?`expires ${esc(displayTime(request.expires_at))}`:esc(displayTime(request.updated_at || request.created_at))}</span><button type="button" data-review="${esc(request.id)}">${pending?"Review":"Details"}</button></div><div class="request-destination"><span class="method">${esc(request.method)}</span> <code>${esc(request.url)}</code></div>${request.outcome?`<p class="meta">${esc(request.outcome)}</p>`:""}</article>`;
+}
+function applyReviewOutcome(summary) {
+  if (!activeReview) return;
+  const oldStatus = activeReview.status || "pending";
+  // An older fetch must not reopen a one-shot decision acknowledged locally.
+  if (oldStatus !== "pending" && (summary.status || "pending") === "pending") return;
+  Object.assign(activeReview, summary);
+  const waiting = (activeReview.status || "pending") === "pending";
+  if (oldStatus === "pending" && !waiting) { ++commentPermissionGeneration; renderCommentPermissionPanel(null); }
+  const status = reviewStatus(activeReview);
+  $("#request-review-badge").textContent = status.label;
+  $("#request-review-badge").className = `request-badge ${status.color}`;
+  $("#request-review-outcome").textContent = activeReview.outcome || `Waiting for your decision · expires ${displayTime(activeReview.expires_at)}`;
+  $("#request-review-actions").hidden = !waiting;
+  $("#request-approve").disabled = !waiting || decisionInFlight === activeReview.id;
+  $("#request-deny").disabled = !waiting || decisionInFlight === activeReview.id;
 }
 
 async function openRequestReview(id) {
@@ -175,29 +211,33 @@ async function openRequestReview(id) {
   try {
     const response = await fetch(`/api/requests/${encodeURIComponent(id)}`, {cache:"no-store"});
     if (!response.ok) throw new Error(await response.text());
-    const detail = await response.json();
+    const detail = {...await response.json()};
     if (generation !== reviewGeneration) return;
     activeReview = detail;
-    $("#request-review-title").textContent = `${detail.container}: ${detail.method} ${detail.url}`;
+    // A detail fetch may finish after a newer SSE decision/response update.
+    const current = [...(snapshot.pending_requests || []), ...(snapshot.recent_reviews || [])].find(request=>request.id===id);
+    if (current && (current.updated_at || "") >= (detail.updated_at || "")) Object.assign(detail, current);
+    $("#request-review-title").textContent = `${detail.container} · ${detail.method}`;
+    $("#request-review-url").textContent = detail.url;
     $("#request-review-reason").textContent = detail.reason;
-    $("#request-review-meta").textContent = `Expires ${new Date(detail.expires_at).toLocaleString()} · SHA-256 ${detail.fingerprint}`;
+    $("#request-review-meta").textContent = `${detail.body_bytes} bytes · SHA-256 ${detail.fingerprint}`;
     $("#request-review-headers").textContent = detail.headers.map(([name,value])=>`${name}: ${value}`).join("\n");
     $("#request-review-body").textContent = detail.body || "(empty body)";
     renderGraphqlReview(detail.graphql);
+    $("#request-raw").open = detail.graphql?.status !== "parsed";
     renderCommentPermissionPanel(detail);
     $("#request-review").hidden = false;
-    $("#request-approve").disabled = false; $("#request-deny").disabled = false;
-    $("#request-review-status").textContent = "Review all fields before approving. Approval is for this request only; upstream success is not guaranteed.";
+    applyReviewOutcome(detail);
+    $("#request-review-status").textContent = "";
     $("#request-review").scrollIntoView({behavior:"smooth",block:"start"});
   } catch (error) { if (generation === reviewGeneration) $("#request-review-status").textContent = String(error); }
 }
 
 function renderCommentPermissionPanel(detail) {
-  $("#comment-permission-panel").hidden = !detail?.graphql;
+  $("#comment-permission-panel").hidden = !detail?.comment_permission_supported || (detail.status && detail.status !== "pending");
   $("#resolve-comment-target").disabled = !detail?.comment_permission_supported;
   $("#save-comment-permission").disabled = !detail?.resolution_id || !detail?.resolved_target;
-  $("#comment-permission-status").textContent = detail?.graphql && !detail.comment_permission_supported
-    ? "Saved permissions cover only supported addComment requests. PR creation and review comments/submissions are allowed with Approve once below, not with a saved comment permission. Queries normally flow automatically; a queued query has an unsupported or unclassified request shape." : "";
+  $("#comment-permission-status").textContent = "";
   const resolved = detail?.resolved_target;
   $("#resolved-comment-target").textContent = resolved
     ? `Verified with GitHub credential '${resolved.credential}':\n${resolved.target.kind}: ${resolved.target.repository} #${resolved.target.number}\n${resolved.target.title}\n${resolved.target.url}\nNode ID: ${resolved.target.node_id}\nRepository ID: ${resolved.target.repository_id}` : "";
@@ -213,7 +253,7 @@ $("#resolve-comment-target").onclick = async () => {
     if (!response.ok) throw new Error(await response.text());
     const detail = await response.json();
     if (generation !== commentPermissionGeneration || activeReview?.id !== reviewed.id) return;
-    activeReview = detail; renderCommentPermissionPanel(detail);
+    activeReview = {...detail}; renderCommentPermissionPanel(activeReview);
     $("#comment-permission-status").textContent = "Inspect the repository, number and title above. Resolving has not granted anything.";
   } catch (error) {
     if (generation !== commentPermissionGeneration) return;
@@ -263,7 +303,7 @@ function renderGraphqlReview(graphql) {
     return;
   }
   const analysis = graphql.analysis;
-  $("#request-graphql-operation").textContent = `${analysis.operation_type.toUpperCase()} · ${analysis.operation_name || "(anonymous)"} · ${analysis.operation_count} operation(s) in document. ${analysis.operation_type==="mutation"?"Manual approval required for this queued mutation. ":""}Names and aliases are guest-chosen, not permissions.`;
+  $("#request-graphql-operation").textContent = `${analysis.operation_type.toUpperCase()} · ${analysis.operation_name || "(anonymous)"} · ${analysis.operation_count} operation(s)`;
   $("#request-graphql-warning").textContent = analysis.warnings.join("\n");
   $("#request-graphql-document").textContent = analysis.formatted_document;
   $("#request-graphql-variables").textContent = analysis.supplied_variables;
@@ -271,29 +311,33 @@ function renderGraphqlReview(graphql) {
   $("#request-graphql-fields").innerHTML = analysis.fields.map(field=>{
     const target = field.target;
     const conditions = field.conditions_text || [];
-    const targetText = !target ? "Target not identified for this field. Do not infer a target from unrelated variables or response selections."
+    const targetText = !target ? "No target identified."
       : target.kind === "node_id" ? `Unverified ${target.expected_type} node ID at ${target.input_path}: ${target.id}. This is NOT an issue/PR number; a trusted GitHub lookup is needed.`
       : `Unverified ${target.expected_type}: ${target.owner}/${target.repository} #${target.number} (explicit request arguments, not a verified pin).`;
     const inputs = field.mutation_inputs || [];
-    const inputView = inputs.length ? `<h4>PR / review inputs — approve once only</h4><p>Inspect every input, including additional options. Review events can approve or request changes, not just post text.</p>${inputs.map(input=>`<div class="mutation-input"><strong>${esc(input.label)}</strong> <code>${esc(input.path)}</code><pre>${esc(input.value)}</pre></div>`).join("")}` : "";
-    return `<article class="graphql-field"><strong>${esc(field.action || field.field)}</strong><p>Actual field: <code>${esc(field.field)}</code> · response path: <code>${esc(field.path.join(" → "))}</code>${field.parent===null?" · root operation field":" · nested response selection"}</p><p class="graphql-target">${esc(targetText)}</p>${conditions.length?`<p>Conditions (all branches retained): ${esc(conditions.join("; "))}</p>`:""}${inputView}${field.comment_body!==null && field.comment_body!==undefined?`<h4>Comment text (literal, not Markdown)</h4><pre>${esc(field.comment_body)}</pre>`:""}<details${field.parent===null?" open":""}><summary>Resolved arguments</summary><pre>${esc(field.arguments_text || "(none)")}</pre></details></article>`;
+    const inputView = inputs.length ? `<h4>PR / review inputs — approve once only</h4>${inputs.map(input=>`<div class="mutation-input"><strong>${esc(input.label)}</strong> <code>${esc(input.path)}</code><pre>${esc(input.value)}</pre></div>`).join("")}` : "";
+    return `<article class="graphql-field"><strong>${esc(field.action || field.field)}</strong><p>Actual field: <code>${esc(field.field)}</code> · response path: <code>${esc(field.path.join(" → "))}</code>${field.parent===null?"":" · response selection"}</p><p class="graphql-target">${esc(targetText)}</p>${conditions.length?`<p>Conditions (all branches retained): ${esc(conditions.join("; "))}</p>`:""}${inputView}${field.comment_body!==null && field.comment_body!==undefined?`<h4>Comment text (literal, not Markdown)</h4><pre>${esc(field.comment_body)}</pre>`:""}<details><summary>Resolved arguments</summary><pre>${esc(field.arguments_text || "(none)")}</pre></details></article>`;
   }).join("");
 }
 
 async function decideRequest(decision) {
-  if (!activeReview) return;
+  if (!activeReview || (activeReview.status && activeReview.status !== "pending") || decisionInFlight === activeReview.id) return;
   const reviewed = activeReview;
-  if (decision === "approve" && !confirm("Forward this exact request once? Only approve if the requesting client is still waiting. Retried writes are separate requests and may duplicate an operation.")) return;
+  const generation = reviewGeneration;
+  if (decision === "approve" && !confirm("Send this request once? Don't approve a stale retry of a write.")) return;
+  decisionInFlight = reviewed.id;
   $("#request-approve").disabled = true; $("#request-deny").disabled = true;
   try {
     const response = await fetch(`/api/requests/${encodeURIComponent(reviewed.id)}/decision`, {method:"POST",headers:{"content-type":"application/json","x-friendzone-review":"1"},body:JSON.stringify({fingerprint:reviewed.fingerprint,decision})});
     if (!response.ok) throw new Error(await response.text());
-    activeReview = null; ++reviewGeneration; ++commentPermissionGeneration; renderCommentPermissionPanel(null);
-    $("#request-review-status").textContent = decision === "approve" ? "Approved once. Check the request log for upstream status; do not blindly retry." : "Denied. The request was not forwarded.";
+    if (generation === reviewGeneration && activeReview?.id === reviewed.id) {
+      if ((activeReview.status || "pending") === "pending") applyReviewOutcome({status:decision === "approve"?"approved":"denied", outcome:decision === "approve"?"Approved once; awaiting broker update.":"Denied by host. Not sent."});
+      $("#request-review-status").textContent = "";
+    }
     await refresh();
   } catch (error) {
-    $("#request-review-status").textContent = `Could not confirm the decision: ${error}. Refresh the Inbox/log before retrying.`;
-  }
+    if (generation === reviewGeneration && activeReview?.id === reviewed.id) $("#request-review-status").textContent = `Could not confirm decision: ${error}. Refresh to reconcile.`;
+  } finally { if (decisionInFlight === reviewed.id) decisionInFlight = null; }
 }
 $("#request-approve").onclick = () => decideRequest("approve");
 $("#request-deny").onclick = () => decideRequest("deny");
@@ -324,7 +368,16 @@ function scheduleLog() {
 $("#log-more").onclick = () => { logPaused = true; clearTimeout(logTimer); logTimer = null; loadLog(true); };
 $("#log-live").onclick = () => { logPaused = false; loadLog(); };
 
-async function refresh() { try { const response=await fetch("/api/state"); snapshot=await response.json(); renderContainers(); scheduleLog(); } catch(e) { console.error(e); } }
+async function refresh() {
+  const revision = snapshotRevision;
+  try {
+    const response = await fetch("/api/state", {cache:"no-store"});
+    if (response.ok === false) throw new Error(await response.text());
+    const next = await response.json();
+    if (revision !== snapshotRevision) return; // A newer SSE/fetch snapshot already won.
+    ++snapshotRevision; snapshot = next; renderContainers(); scheduleLog();
+  } catch(e) { console.error(e); }
+}
 
 const PROVIDER_PRESETS = {
   anthropic: {
@@ -866,6 +919,6 @@ $("#refresh").onclick=refresh; ["#search","#container-filter","#verdict-filter"]
 // the gap before the stream opens.
 refresh();
 const events = new EventSource("/api/events");
-events.onmessage = (e) => { snapshot = JSON.parse(e.data); renderContainers(); scheduleLog(); };
+events.onmessage = (e) => { ++snapshotRevision; snapshot = JSON.parse(e.data); renderContainers(); scheduleLog(); };
 events.onerror = () => setTimeout(refresh, 3000); // bridge reconnect gaps
 selectView(readStoredValue("fz-active-view"));

@@ -164,10 +164,26 @@ The queue is memory-only: 32 requests globally, 8 per guest, 64 KiB per body,
 decision deadline. Compressed, binary, multipart/form and git push payloads
 remain blocked because this UI cannot faithfully review them. Kill,
 removal, approval/pin changes, expiry, or cancellation of the waiting HTTP
-handler discard the pending request; restart never replays it. A permission
+handler end the pending request; restart never replays it. A permission
 change after the final admission check cannot undo already-admitted work.
 No general approve-for-session/always rules or MCP write approval are added here.
 Other origins remain logged and unpoliced.
+
+**Outcomes in Inbox:** Pending contains only requests needing a decision.
+Recent retains the last 100 reviewed requests and their redacted details for
+this broker session, separate from the busy traffic log. Open details stay
+visible after approval/denial and update live: Approved, Sending, Response
+received (with HTTP status), Denied, Expired, Cancelled, Blocked, or Upstream
+error. A response is not a claim of application success (GraphQL can report
+errors with HTTP 200). Reviewed GraphQL JSON responses up to 64 KiB are
+observed as they stream to the guest; a nonempty `errors` array produces a
+GraphQL error badge without copying upstream payloads into history. Larger,
+encoded or unparseable responses remain HTTP-only outcomes. If the handler
+ends after admission without a response,
+the outcome is Unknown, not a promise that retrying is safe. Recent is
+read-only: no replay, reapproval or new permissions from old requests. Reload
+preserves this server-side history; broker restart clears it. Bodies remain
+host-only and are never included in SSE or desktop notifications.
 
 **Retry caution:** clients may time out before 120 seconds, and the HTTP
 stack may not immediately cancel its handler on a disconnect. Deny a stale

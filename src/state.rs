@@ -62,6 +62,7 @@ pub struct StateView {
     pub containers: Vec<ContainerView>,
     pub requests: Vec<RequestEvent>,
     pub pending_requests: Vec<crate::review::Summary>,
+    pub recent_reviews: Vec<crate::review::Summary>,
     pub comment_permissions: Vec<CommentPermissionView>,
 }
 
@@ -385,6 +386,8 @@ impl AppState {
     }
 
     pub fn mark_blocked(&self, id: Uuid, status: u16, detail: String) {
+        self.reviews
+            .observe(id, crate::review::Status::Blocked, None, &detail);
         let mut state = self.data.write().expect("state lock poisoned");
         if let Some(event) = state.requests.iter_mut().rev().find(|e| e.id == id) {
             event.verdict = Verdict::Blocked;
@@ -398,13 +401,22 @@ impl AppState {
     /// Admission is the consistency boundary: policy changes before this
     /// check cancel the review. Already-admitted upstream work is not undone.
     pub fn admit_review(&self, id: Uuid, container: &str, peer: IpAddr, epoch: Uuid) -> bool {
-        self.admit_request(
+        let admitted = self.admit_request(
             id,
             container,
             peer,
             epoch,
             "approved once by host; forwarding original request",
-        )
+        );
+        if admitted {
+            self.reviews.observe(
+                id,
+                crate::review::Status::Sending,
+                None,
+                "Approved once. Waiting for upstream response.",
+            );
+        }
+        admitted
     }
 
     pub fn admit_graphql_read(&self, id: Uuid, container: &str, peer: IpAddr, epoch: Uuid) -> bool {
@@ -800,6 +812,7 @@ impl AppState {
                 .cmp(&a.last_activity)
                 .then_with(|| a.id.cmp(&b.id))
         });
+        let (pending_requests, recent_reviews) = self.reviews.view();
         StateView {
             containers,
             comment_permissions: state
@@ -815,7 +828,8 @@ impl AppState {
                     })
                 })
                 .collect(),
-            pending_requests: self.reviews.summaries(),
+            pending_requests,
+            recent_reviews,
             requests: state.requests.iter().rev().take(200).cloned().collect(),
         }
     }

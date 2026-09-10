@@ -19,6 +19,7 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
     select() { this.selected = true; },
     scrollIntoView() { this.scrolled = true; },
     append(child) { this.child=child; },
+    content: {cloneNode(){return {}; }},
   }]));
   const calls = [];
   const timers = [];
@@ -160,11 +161,11 @@ test("PR and review inputs are readable, escaped and explicitly manually approva
     const opening=f.run('openRequestReview("request-id")');
     f.calls.at(-1).resolve({ok:true,json:async()=>({...pendingRequest,graphql:{status:"parsed",analysis},comment_permission_supported:false})});await opening;
     const element=id=>f.sandbox.document.querySelector(id);
-    assert.match(element("#request-graphql-operation").textContent,/Manual approval required/);
+    assert.equal(element("#request-review-badge").textContent,"Pending");
     const markup=element("#request-graphql-fields").innerHTML;
     assert.ok(markup.includes(example.action)); assert.ok(markup.includes(example.highlight));
     assert.match(markup,/approve once only/);assert.doesNotMatch(markup,/<img|<script/);
-    assert.match(element("#comment-permission-status").textContent,/allowed with Approve once below/);
+    assert.equal(element("#comment-permission-panel").hidden,true);
     assert.equal(element("#request-approve").disabled,false);
     assert.equal(element("#save-comment-permission").disabled,true);
     const decision=f.run('decideRequest("approve")');const call=f.calls.at(-1);
@@ -196,6 +197,70 @@ test("review renders guest payload literally and only submits the loaded fingerp
 });
 
 const verifiedTarget={node_id:"canonical",repository_id:"repo-id",repository:"cline/cline",kind:"Issue",number:482,title:"<img src=x> A real issue",url:"https://github.com/cline/cline/issues/482"};
+test("review outcomes stay visible, survive reopening and never enable resolved actions", async () => {
+  const f=fixture(), element=id=>f.sandbox.document.querySelector("#"+id);
+  f.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)}]`);
+  const opening=f.run('openRequestReview("request-id")');
+  f.calls.at(-1).resolve({ok:true,json:async()=>pendingRequest}); await opening;
+  for (const [status,code,label] of [["approved",null,"Approved"],["sending",null,"Sending"],["response_received",201,"Response received · HTTP 201"],["graphql_error",200,"GraphQL error · HTTP 200"],["denied",null,"Denied"],["expired",null,"Expired"],["cancelled",null,"Cancelled"],["blocked",null,"Blocked"],["upstream_error",502,"Upstream error · HTTP 502"],["unknown",null,"Outcome unknown"]]) {
+    const summary={...pendingRequest,status,http_status:code,outcome:"Exact outcome <script>",updated_at:"2099-01-01T00:00:00Z"};
+    f.run(`snapshot.pending_requests=[];snapshot.recent_reviews=[${JSON.stringify(summary)}];renderPendingRequests()`);
+    assert.equal(element("request-review-badge").textContent,label);
+    assert.equal(element("request-review-outcome").textContent,summary.outcome);
+    assert.equal(element("request-review-outcome").innerHTML,"");
+    assert.equal(element("request-review-body").textContent,pendingRequest.body);
+    assert.equal(element("request-review").hidden,false);
+    assert.equal(element("request-review-actions").hidden,true);
+    assert.equal(element("inbox-count").textContent,0);
+    assert.equal(element("recent-count").textContent,1);
+    assert.match(element("recent-reviews").innerHTML,/Exact outcome &lt;script&gt;/);
+    const calls=f.calls.length; await f.run('decideRequest("approve")'); assert.equal(f.calls.length,calls);
+  }
+  const reopening=f.run('openRequestReview("request-id")');
+  f.calls.at(-1).resolve({ok:true,json:async()=>({...pendingRequest,status:"denied",outcome:"Not sent.",updated_at:"2099-02-01T00:00:00Z"})});await reopening;
+  assert.equal(element("request-review-badge").textContent,"Denied");
+  assert.equal(element("request-approve").disabled,true);
+  f.run('snapshot.pending_requests=[];snapshot.recent_reviews=[];renderPendingRequests()');
+  assert.equal(element("request-review-badge").textContent,"Not retained");
+  assert.doesNotMatch(element("request-review-outcome").textContent,/Check the log/);
+});
+
+test("newer SSE outcome wins over slow detail and decision responses", async () => {
+  const f=fixture(), element=id=>f.sandbox.document.querySelector("#"+id);
+  const original={...pendingRequest,status:"pending",updated_at:"2099-01-01T00:00:00Z"};
+  const resolved={...original,status:"response_received",updated_at:"2099-01-01T00:00:01Z",http_status:201,outcome:"Response received."};
+  const opening=f.run('openRequestReview("request-id")');
+  f.run(`snapshot.recent_reviews=[${JSON.stringify(resolved)}];renderPendingRequests()`);
+  f.calls.at(-1).resolve({ok:true,json:async()=>original});await opening;
+  assert.equal(element("request-review-badge").textContent,"Response received · HTTP 201");
+  f.run(`activeReview=${JSON.stringify(original)};snapshot.pending_requests=[${JSON.stringify(original)}];snapshot.recent_reviews=[]`);
+  const decision=f.run('decideRequest("approve")'), call=f.calls.at(-1);
+  const count=f.calls.length;await f.run('decideRequest("approve")');assert.equal(f.calls.length,count,"double click submits once");
+  f.run(`snapshot.pending_requests=[];snapshot.recent_reviews=[${JSON.stringify(resolved)}];renderPendingRequests()`);
+  call.resolve({ok:true});await new Promise(setImmediate);
+  assert.equal(element("request-review-badge").textContent,"Response received · HTTP 201");
+  f.calls.at(-1).resolve({json:async()=>({containers:[],requests:[],pending_requests:[],recent_reviews:[resolved]})});await decision;
+  assert.equal(element("request-review-badge").textContent,"Response received · HTTP 201");
+  assert.equal(element("request-review-actions").hidden,true);
+});
+
+test("retained outcomes do not send notifications or increase pending count", () => {
+  const f=fixture({notificationPermission:"granted",storage:new Map([["fz-notifications","enabled"]])});
+  f.run(`snapshot.recent_reviews=[${JSON.stringify({...pendingRequest,status:"denied"})}];renderPendingRequests();renderPendingRequests()`);
+  assert.equal(f.notifications.length,0);assert.equal(f.timers.length,0);
+  assert.equal(f.sandbox.document.querySelector("#inbox-count").textContent,0);
+});
+
+test("slow state fetch cannot replace newer SSE outcomes with pending requests", async () => {
+  const f=fixture();
+  const refreshing=f.run('refresh()'), call=f.calls.at(-1);
+  const resolved={...pendingRequest,status:"denied",outcome:"Denied. Not sent."};
+  f.run(`events.onmessage({data:JSON.stringify({containers:[],requests:[],pending_requests:[],recent_reviews:[${JSON.stringify(resolved)}]})})`);
+  call.resolve({ok:true,json:async()=>({containers:[],requests:[],pending_requests:[pendingRequest],recent_reviews:[]})});await refreshing;
+  assert.equal(f.sandbox.document.querySelector("#pending-count").textContent,0);
+  assert.match(f.sandbox.document.querySelector("#recent-reviews").innerHTML,/Denied/);
+});
+
 test("resolve then grant requires confirmation, binds the displayed resolution, and never approves the pending write", async () => {
   const f=fixture(), element=id=>f.sandbox.document.querySelector("#"+id);
   f.run(`activeReview=${JSON.stringify({...pendingRequest,comment_permission_supported:true})}; renderCommentPermissionPanel(activeReview)`);
@@ -270,7 +335,7 @@ test("unsupported, insecure, denied notifications and disappeared requests leave
     f.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)}]; renderPendingRequests()`);
     assert.equal(f.notifications.length,0); assert.equal(f.permissionRequests,0);
     assert.ok(f.sandbox.document.querySelector("#notification-status").textContent);
-    assert.match(f.sandbox.document.querySelector("#pending-requests").innerHTML,/Review request/);
+    assert.match(f.sandbox.document.querySelector("#pending-requests").innerHTML,/>Review</);
   }
   const f=fixture({notificationPermission:"granted",storage:new Map([["fz-notifications","enabled"]])});
   f.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)}]; renderPendingRequests(); snapshot.pending_requests=[]; renderPendingRequests()`);

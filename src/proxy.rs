@@ -19,10 +19,93 @@ struct ReviewLogGuard {
 impl Drop for ReviewLogGuard {
     fn drop(&mut self) {
         if !self.finished {
+            self.state.reviews.observe(
+                self.event,
+                crate::review::Status::Cancelled,
+                None,
+                "Review cancelled before forwarding. Not sent.",
+            );
             self.state.mark_blocked(
                 self.event,
                 403,
                 "review cancelled; waiting proxy handler ended without forwarding".into(),
+            );
+        }
+    }
+}
+
+/// Last handler owner disappearing without a response is not evidence that a
+/// remote write failed. Preserve that uncertainty rather than imply safe retry.
+struct ResponseWatch {
+    state: AppState,
+    id: uuid::Uuid,
+}
+impl Drop for ResponseWatch {
+    fn drop(&mut self) {
+        self.state.reviews.observe(self.id, crate::review::Status::Unknown, None, "Proxy request ended without a response. The operation may have executed; check upstream before retrying.");
+    }
+}
+
+/// Observe a bounded JSON copy without delaying, truncating or rewriting the
+/// response stream. Large/invalid bodies remain HTTP-only outcomes.
+struct ReviewResponseBody {
+    inner: Body,
+    state: AppState,
+    id: uuid::Uuid,
+    bytes: Option<Vec<u8>>,
+    ended: bool,
+}
+impl hudsucker::hyper::body::Body for ReviewResponseBody {
+    type Data = hudsucker::hyper::body::Bytes;
+    type Error = hudsucker::Error;
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hudsucker::hyper::body::Frame<Self::Data>, Self::Error>>>
+    {
+        use std::task::Poll;
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        match &result {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref()
+                    && let Some(bytes) = &mut this.bytes
+                {
+                    if bytes.len() + data.len() <= crate::review::MAX_BODY {
+                        bytes.extend_from_slice(data);
+                    } else {
+                        this.bytes = None;
+                    }
+                }
+            }
+            Poll::Ready(None) => {
+                this.ended = true;
+                if let Some(bytes) = &this.bytes
+                    && let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes)
+                    && json
+                        .get("errors")
+                        .and_then(|errors| errors.as_array())
+                        .is_some_and(|errors| !errors.is_empty())
+                {
+                    this.state.reviews.response_detail(this.id, crate::review::Status::GraphqlError, "GitHub returned GraphQL errors; the operation may have partially executed. Check upstream before retrying.");
+                }
+            }
+            Poll::Ready(Some(Err(_))) => {
+                this.ended = true;
+                this.state.reviews.response_detail(this.id, crate::review::Status::Unknown, "HTTP headers received, but reading the response failed. Check upstream before retrying.");
+            }
+            Poll::Pending => {}
+        }
+        result
+    }
+}
+impl Drop for ReviewResponseBody {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.state.reviews.response_detail(
+                self.id,
+                crate::review::Status::Unknown,
+                "HTTP response was not fully observed. Check upstream before retrying.",
             );
         }
     }
@@ -45,6 +128,7 @@ pub struct EventHandler {
     /// Listener policy is fixed at broker startup; the bootstrap exception
     /// and actual listener use the same configured port, including in clones.
     bootstrap_port: u16,
+    response_watch: Option<std::sync::Arc<ResponseWatch>>,
 }
 
 impl EventHandler {
@@ -61,6 +145,7 @@ impl EventHandler {
             tunnel_identity: None,
             management_port,
             bootstrap_port,
+            response_watch: None,
         }
     }
 
@@ -79,6 +164,7 @@ impl EventHandler {
         mut req: Request<Body>,
     ) -> RequestOrResponse {
         self.pending = None;
+        self.response_watch = None;
         let Some(container) = self.container(&req) else {
             // Git/libcurl's anyauth mode waits for this challenge before
             // sending the username from its proxy URL. 403 cannot do that.
@@ -170,7 +256,13 @@ impl EventHandler {
         } else {
             if needs_review {
                 match self.await_review(&container, peer.ip(), req, id).await {
-                    Ok(reviewed) => req = reviewed,
+                    Ok(reviewed) => {
+                        req = reviewed;
+                        self.response_watch = Some(std::sync::Arc::new(ResponseWatch {
+                            state: self.state.clone(),
+                            id,
+                        }));
+                    }
                     Err(reason) => {
                         self.pending = None;
                         self.state.mark_blocked(id, 403, reason.clone());
@@ -430,6 +522,7 @@ impl HttpHandler for EventHandler {
         error: hudsucker::hyper_util::client::legacy::Error,
     ) -> Response<Body> {
         if let Some((id, _)) = self.pending.take() {
+            self.state.reviews.observe(id, crate::review::Status::UpstreamError, Some(502), "Upstream connection failed. Delivery is uncertain; check upstream before retrying.");
             self.state.annotate(
                 id,
                 Some(502),
@@ -449,6 +542,8 @@ impl HttpHandler for EventHandler {
             return res;
         };
         let status = res.status().as_u16();
+        self.state.reviews.observe(id, crate::review::Status::ResponseReceived, Some(status),
+            if status >= 400 { "Upstream returned an HTTP error." } else { "Upstream response received. HTTP status alone does not confirm the operation succeeded." });
         // Only inspect bodies for escrow-pinned hosts (our known
         // providers), and only JSON: streaming stays untouched.
         let is_known_host = self
@@ -461,6 +556,26 @@ impl HttpHandler for EventHandler {
             .get(hudsucker::hyper::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|ct| ct.starts_with("application/json"));
+        let reviewed_graphql =
+            host.eq_ignore_ascii_case("api.github.com") && self.state.reviews.tracks_response(id);
+        if reviewed_graphql && is_json {
+            use http_body_util::BodyExt;
+            self.state.annotate(id, Some(status), None);
+            let (parts, body) = res.into_parts();
+            return Response::from_parts(
+                parts,
+                Body::from(
+                    ReviewResponseBody {
+                        inner: body,
+                        state: self.state.clone(),
+                        id,
+                        bytes: Some(Vec::new()),
+                        ended: false,
+                    }
+                    .boxed(),
+                ),
+            );
+        }
         if !(is_known_host && is_json) {
             self.state.annotate(id, Some(status), None);
             return res;
@@ -469,13 +584,13 @@ impl HttpHandler for EventHandler {
         match http_body_util::BodyExt::collect(body).await {
             Ok(collected) => {
                 let bytes = collected.to_bytes();
-                let detail = serde_json::from_slice::<serde_json::Value>(&bytes)
-                    .ok()
-                    .and_then(|json| inference_detail(&json));
+                let parsed = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+                let detail = parsed.as_ref().and_then(inference_detail);
                 self.state.annotate(id, Some(status), detail);
                 Response::from_parts(parts, Body::from(bytes.to_vec()))
             }
             Err(_) => {
+                self.state.reviews.response_detail(id, crate::review::Status::Unknown, "HTTP headers received, but reading the response failed. Check upstream before retrying.");
                 self.state.annotate(id, Some(status), None);
                 Response::from_parts(parts, Body::empty())
             }
@@ -516,6 +631,90 @@ pub fn basic_username(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn response_observation_is_bounded_keeps_bytes_and_reports_uncertainty() {
+        use crate::review::{Decision, Detail, Status};
+        use http_body_util::BodyExt;
+        let state = AppState::default();
+        let queued = || {
+            let req = request("POST", "https://api.github.com/graphql", Some("guest"));
+            let detail = Detail::from_request("guest", &req, b"").unwrap();
+            let id = detail.summary.id;
+            let ticket = state.reviews.enqueue(detail.clone()).unwrap();
+            state
+                .reviews
+                .decide(id, &detail.summary.fingerprint, Decision::Approve)
+                .unwrap();
+            (id, ticket)
+        };
+        let (unknown, ticket) = queued();
+        assert_eq!(ticket.wait().await.unwrap(), Decision::Approve);
+        state
+            .reviews
+            .observe(unknown, Status::Sending, None, "sending");
+        drop(ResponseWatch {
+            state: state.clone(),
+            id: unknown,
+        });
+        assert_eq!(
+            state.reviews.inspect(unknown).unwrap().summary.status,
+            Status::Unknown
+        );
+        for payload in [
+            br#"{"errors":[{"message":"private"}]}"#.to_vec(),
+            vec![b'x'; crate::review::MAX_BODY + 1],
+            br#"{"data":{"ok":true}}"#.to_vec(),
+        ] {
+            let (id, ticket) = queued();
+            assert_eq!(ticket.wait().await.unwrap(), Decision::Approve);
+            state.reviews.observe(
+                id,
+                Status::ResponseReceived,
+                Some(200),
+                "HTTP response received",
+            );
+            let body = ReviewResponseBody {
+                inner: Body::from(payload.clone()),
+                state: state.clone(),
+                id,
+                bytes: Some(Vec::new()),
+                ended: false,
+            };
+            assert_eq!(
+                body.collect().await.unwrap().to_bytes().as_ref(),
+                payload.as_slice()
+            );
+            let summary = state.reviews.inspect(id).unwrap().summary;
+            assert_eq!(
+                summary.status,
+                if payload.starts_with(b"{\"errors\"") {
+                    Status::GraphqlError
+                } else {
+                    Status::ResponseReceived
+                }
+            );
+            assert!(!summary.outcome.unwrap().contains("private"));
+        }
+        let (id, ticket) = queued();
+        ticket.wait().await.unwrap();
+        state.reviews.observe(
+            id,
+            Status::ResponseReceived,
+            Some(201),
+            "HTTP response received",
+        );
+        drop(ReviewResponseBody {
+            inner: Body::from("incomplete"),
+            state: state.clone(),
+            id,
+            bytes: Some(Vec::new()),
+            ended: false,
+        });
+        let summary = state.reviews.inspect(id).unwrap().summary;
+        assert_eq!(summary.status, Status::Unknown);
+        assert_eq!(summary.http_status, Some(201));
+    }
 
     #[tokio::test]
     async fn graphql_reads_keep_identity_kill_pin_escrow_and_buffered_policy_gates() {
@@ -689,6 +888,10 @@ mod tests {
                     .is_err()
             );
             assert!(matches!(state.view().requests[0].verdict, Verdict::Blocked));
+            assert_eq!(
+                state.reviews.inspect(summary.id).unwrap().summary.status,
+                crate::review::Status::Cancelled
+            );
         }
         // Approval racing with a later kill cannot slip through a resume.
         state.set_pinned_ip("guest", None).unwrap();

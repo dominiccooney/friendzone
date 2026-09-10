@@ -966,9 +966,13 @@ async fn review_request(
         )
             .into_response();
     }
-    match state.app.reviews.detail(id) {
+    match state.app.reviews.inspect(id) {
         Some(detail) => ([(header::CACHE_CONTROL, "no-store")], Json(detail)).into_response(),
-        None => (StatusCode::NOT_FOUND, "request is no longer waiting").into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            "Request not retained (broker restarted or history limit reached).",
+        )
+            .into_response(),
     }
 }
 
@@ -1444,10 +1448,12 @@ mod tests {
                         async move {
                             assert_eq!(headers["authorization"], "Bearer host-secret");
                             assert!(!headers.contains_key("proxy-authorization"));
+                            let graphql_error = body.contains("OutcomeGraphqlError");
+                            let http_error = body.contains("OutcomeHttpError");
                             observed.lock().unwrap().push(body);
                             (
-                                StatusCode::OK,
-                                Json(serde_json::json!({"data":{"ok":true}})),
+                                if http_error { StatusCode::FORBIDDEN } else { StatusCode::OK },
+                                Json(if graphql_error { serde_json::json!({"data":null,"errors":[{"message":"sensitive fixture error"}]}) } else { serde_json::json!({"data":{"ok":true}}) }),
                             )
                         }
                     },
@@ -1474,6 +1480,12 @@ mod tests {
         let connector = tower::service_fn(move |uri: hudsucker::hyper::Uri| {
             Box::pin(async move {
                 assert_eq!(uri.host(), Some("api.github.com"));
+                if uri.port_u16() == Some(444) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "fixture connection refused",
+                    ));
+                }
                 tokio::net::TcpStream::connect(upstream_addr)
                     .await
                     .map(hudsucker::hyper_util::rt::TokioIo::new)
@@ -1568,6 +1580,9 @@ mod tests {
             (crate::github::ENDPOINT.into(),serde_json::json!({"query":mixed,"operationName":"Write"}).to_string(),Some("Create pull request".into())),
             (crate::github::ENDPOINT.into(),serde_json::json!({"query":mixed}).to_string(),None),
             (format!("{}?operationName=Write",crate::github::ENDPOINT),serde_json::json!({"query":mixed,"operationName":"Read"}).to_string(),None),
+            (crate::github::ENDPOINT.into(),serde_json::json!({"query":"mutation OutcomeGraphqlError { createPullRequest(input:{repositoryId:\"id\",baseRefName:\"main\",headRefName:\"feature\",title:\"text\"}){clientMutationId} }"}).to_string(),None),
+            (crate::github::ENDPOINT.into(),serde_json::json!({"query":"mutation OutcomeHttpError { createPullRequest(input:{repositoryId:\"id\",baseRefName:\"main\",headRefName:\"feature\",title:\"text\"}){clientMutationId} }"}).to_string(),None),
+            ("https://api.github.com:444/graphql".into(),serde_json::json!({"query":"mutation OutcomeConnectionError { createPullRequest(input:{repositoryId:\"id\",baseRefName:\"main\",headRefName:\"feature\",title:\"text\"}){clientMutationId} }"}).to_string(),None),
         ]);
         for (url, body, action) in mutations {
             for decision in ["deny", "approve"] {
@@ -1619,17 +1634,70 @@ mod tests {
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::NO_CONTENT);
                 let response = pending.await.unwrap();
+                let connection_error = url.contains(":444/");
+                let expected_http = if connection_error {
+                    StatusCode::BAD_GATEWAY
+                } else if body.contains("OutcomeHttpError") {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::OK
+                };
                 if decision == "approve" {
-                    assert_eq!(response.status(), StatusCode::OK);
-                    assert_eq!(received.lock().unwrap().last(), Some(&body));
+                    assert_eq!(response.status(), expected_http);
+                    if !connection_error {
+                        assert_eq!(received.lock().unwrap().last(), Some(&body));
+                    }
                 } else {
                     assert_eq!(response.status(), StatusCode::FORBIDDEN);
                 }
+                let response_body = response.text().await.unwrap();
+                if decision == "approve" && body.contains("OutcomeGraphqlError") {
+                    assert!(
+                        response_body.contains("sensitive fixture error"),
+                        "client still receives original response"
+                    );
+                }
                 assert_eq!(
                     received.lock().unwrap().len(),
-                    before + 1 + usize::from(decision == "approve")
+                    before + 1 + usize::from(decision == "approve" && !connection_error)
                 );
                 assert!(state.reviews.summaries().is_empty());
+                let outcome: serde_json::Value = host
+                    .get(&endpoint)
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    outcome["status"],
+                    if decision == "deny" {
+                        "denied"
+                    } else if connection_error {
+                        "upstream_error"
+                    } else if body.contains("OutcomeGraphqlError") {
+                        "graphql_error"
+                    } else {
+                        "response_received"
+                    }
+                );
+                assert_eq!(outcome["body"], body);
+                if decision == "approve" {
+                    assert_eq!(outcome["http_status"], expected_http.as_u16());
+                }
+                assert!(outcome["outcome"].as_str().is_some());
+                assert!(!outcome.to_string().contains("host-secret"));
+                assert!(
+                    !outcome.to_string().contains("sensitive fixture error"),
+                    "upstream error payload is not copied into review history"
+                );
+                assert!(
+                    state.reviews.detail(summary.id).is_none(),
+                    "retained detail cannot authorize a grant"
+                );
                 assert_eq!(host.post(format!("{endpoint}/decision")).header("x-friendzone-review","1").json(&serde_json::json!({"fingerprint":summary.fingerprint,"decision":"approve"})).send().await.unwrap().status(),StatusCode::CONFLICT);
             }
         }
