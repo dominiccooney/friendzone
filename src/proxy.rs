@@ -273,6 +273,15 @@ impl EventHandler {
             .map_err(|e| error(e.to_string()))?;
         // Keep the review ID searchable/correlatable with its single audit row.
         detail.summary.id = event;
+        if detail.graphql_read {
+            if !self.state.admit_graphql_read(event, container, peer, epoch) {
+                return Err(error(
+                    "container policy changed while reading the GraphQL body".into(),
+                ));
+            }
+            guard.finished = true;
+            return Ok(req); // Existing escrow substitution/response logging still run.
+        }
         if let Some(credential) = crate::github::comment_credential(&self.settings, &req)
             && let Some(crate::graphql::Review::Parsed { analysis }) = &detail.graphql
             && let Some(plan) = &analysis.comment
@@ -452,6 +461,112 @@ pub fn basic_username(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn graphql_reads_keep_identity_kill_pin_escrow_and_buffered_policy_gates() {
+        let dir = std::env::temp_dir().join(format!("fz-read-gates-{}", uuid::Uuid::new_v4()));
+        let state = AppState::default();
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        let peer: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let query = r#"{"query":"query { viewer { login } }"}"#;
+        let read = |user: Option<&str>| {
+            let mut req = request("POST", crate::github::ENDPOINT, user);
+            req.headers_mut()
+                .insert("content-type", "application/json".parse().unwrap());
+            *req.body_mut() = Body::from(query);
+            req
+        };
+        let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081);
+        assert_eq!(
+            status(handler.handle_from_peer(peer, read(None)).await),
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        );
+        assert_eq!(
+            status(handler.handle_from_peer(peer, read(Some("guest"))).await),
+            StatusCode::FORBIDDEN
+        );
+        state.approve_container("guest", true).unwrap();
+        assert!(matches!(
+            handler.handle_from_peer(peer, read(Some("guest"))).await,
+            RequestOrResponse::Request(_)
+        ));
+        assert_eq!(
+            status(
+                handler
+                    .handle_from_peer("127.0.0.2:12345".parse().unwrap(), read(Some("guest")))
+                    .await
+            ),
+            StatusCode::FORBIDDEN
+        );
+        state.set_killed("guest".into(), true).unwrap();
+        assert_eq!(
+            status(handler.handle_from_peer(peer, read(Some("guest"))).await),
+            StatusCode::FORBIDDEN
+        );
+        state.set_killed("guest".into(), false).unwrap();
+        settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "github".into(),
+                hosts: vec!["api.github.com".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fake".into(),
+                real_env: None,
+                guest_env: None,
+            })
+            .unwrap();
+        let mut no_secret = read(Some("guest"));
+        no_secret
+            .headers_mut()
+            .insert("authorization", "Bearer fake".parse().unwrap());
+        assert_eq!(
+            status(handler.handle_from_peer(peer, no_secret).await),
+            StatusCode::FORBIDDEN
+        );
+        settings.set_secret("github", "secret").unwrap();
+        let mut with_secret = read(Some("guest"));
+        with_secret
+            .headers_mut()
+            .insert("authorization", "Bearer fake".parse().unwrap());
+        let RequestOrResponse::Request(forwarded) =
+            handler.handle_from_peer(peer, with_secret).await
+        else {
+            panic!("approved read")
+        };
+        assert_eq!(forwarded.headers()["authorization"], "Bearer secret");
+        assert!(!forwarded.headers().contains_key(PROXY_AUTHORIZATION));
+        assert!(state.reviews.summaries().is_empty());
+        for action in ["kill", "pin", "remove"] {
+            state.add_container("guest").unwrap();
+            state.set_killed("guest".into(), false).unwrap();
+            state.set_pinned_ip("guest", None).unwrap();
+            let changed = state.clone();
+            let mut req = read(Some("guest"));
+            *req.body_mut() = Body::from_stream(futures_util::stream::once(async move {
+                match action {
+                    "kill" => {
+                        changed.set_killed("guest".into(), true).unwrap();
+                        changed.set_killed("guest".into(), false).unwrap();
+                    }
+                    "pin" => changed
+                        .set_pinned_ip("guest", Some("127.0.0.2".parse().unwrap()))
+                        .unwrap(),
+                    _ => {
+                        changed.remove_container("guest").unwrap();
+                        changed.add_container("guest").unwrap();
+                    }
+                }
+                Ok::<_, std::io::Error>(query)
+            }));
+            assert_eq!(
+                status(handler.handle_from_peer(peer, req).await),
+                StatusCode::FORBIDDEN,
+                "{action} during buffering"
+            );
+            assert!(state.reviews.summaries().is_empty());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     async fn wait_for_review(state: &AppState) -> crate::review::Summary {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {

@@ -44,6 +44,9 @@ pub struct Detail {
     /// Broker-parsed view of the same body, not an alternate authorization or
     /// request representation. Kept out of SSE and notifications with bodies.
     pub graphql: Option<crate::graphql::Review>,
+    /// Classified by the same parse used for the view, before display limits.
+    #[serde(skip)]
+    pub graphql_read: bool,
     pub comment_permission_supported: bool,
     pub resolved_target: Option<crate::github::Resolved>,
     pub resolution_id: Option<Uuid>,
@@ -134,15 +137,18 @@ impl Detail {
             .host()
             .is_some_and(|host| host.eq_ignore_ascii_case("api.github.com"))
             && request.uri().path() == "/graphql";
+        let mut graphql_read = false;
         let graphql = is_graphql.then(|| {
             if request.uri().query().is_some() {
                 crate::graphql::Review::Unavailable { message: "URL query parameters may change GraphQL operation selection; structured review is unavailable. Inspect the complete URL and raw body.".into() }
             } else {
-                crate::graphql::review(body, request.headers().get("content-type").and_then(|v|v.to_str().ok()).unwrap_or(""))
+                let (read_only, view) = crate::graphql::inspect(body, request.headers().get("content-type").and_then(|v|v.to_str().ok()).unwrap_or(""));
+                graphql_read = read_only && crate::github::read_transport(request);
+                view
             }
         });
         let reason = if is_graphql {
-            "GitHub GraphQL: this request did not qualify for automatic comment permission. Review it once, or resolve an eligible comment target and explicitly save a permission for future requests."
+            "GitHub GraphQL: supported queries flow automatically. This request requires review (mutation, subscription, or unclassified/unsupported query transport). PR creation and review comments are permitted with Approve once; inspect all inputs before approving."
         } else {
             "GitHub operation requires one-shot approval. Review the full destination and payload; this does not grant future requests."
         };
@@ -161,6 +167,7 @@ impl Detail {
             headers,
             body: body.into(),
             graphql,
+            graphql_read,
             comment_permission_supported: false,
             resolved_target: None,
             resolution_id: None,

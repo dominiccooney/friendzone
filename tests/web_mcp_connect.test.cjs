@@ -148,6 +148,30 @@ test("repository issue/PR targets preserve repository context rather than extrac
   assert.match(f.sandbox.document.querySelector("#request-graphql-operation").textContent,/QUERY.*anonymous/);
 });
 
+test("PR and review inputs are readable, escaped and explicitly manually approvable", async () => {
+  const fixtures=JSON.parse(fs.readFileSync(path.join(__dirname,"fixtures/github_mutations.json"),"utf8"));
+  for (const example of fixtures.filter(item=>item.body.variables?.input)) {
+    const f=fixture();
+    const input=example.body.variables.input;
+    const analysis={...parsedGraphql.analysis,fields:[{...parsedGraphql.analysis.fields[0],field:example.field,action:example.action,comment_body:null,
+      target:{kind:"node_id",input_path:example.target_path,id:"opaque-id",expected_type:example.target_type},
+      mutation_inputs:Object.entries(input).map(([key,value])=>({path:`input.${key}`,label:key==="event"?"Review event (APPROVE / REQUEST_CHANGES / COMMENT)":key==="baseRefName"?"Base branch (destination)":key==="headRefName"?"Head branch (source)":key,value:JSON.stringify(value)}))}]};
+    const opening=f.run('openRequestReview("request-id")');
+    f.calls.at(-1).resolve({ok:true,json:async()=>({...pendingRequest,graphql:{status:"parsed",analysis},comment_permission_supported:false})});await opening;
+    const element=id=>f.sandbox.document.querySelector(id);
+    assert.match(element("#request-graphql-operation").textContent,/Manual approval required/);
+    const markup=element("#request-graphql-fields").innerHTML;
+    assert.ok(markup.includes(example.action)); assert.ok(markup.includes(example.highlight));
+    assert.match(markup,/approve once only/);assert.doesNotMatch(markup,/<img|<script/);
+    assert.match(element("#comment-permission-status").textContent,/allowed with Approve once below/);
+    assert.equal(element("#request-approve").disabled,false);
+    assert.equal(element("#save-comment-permission").disabled,true);
+    const decision=f.run('decideRequest("approve")');const call=f.calls.at(-1);
+    assert.equal(call.url,"/api/requests/request-id/decision");assert.deepEqual(JSON.parse(call.options.body),{fingerprint:"exact-hash",decision:"approve"});
+    call.resolve({ok:false,text:async()=>"expired"});await decision;
+  }
+});
+
 test("review renders guest payload literally and only submits the loaded fingerprint", async () => {
   const f=fixture();
   f.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)}]; renderPendingRequests()`);

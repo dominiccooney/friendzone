@@ -1,9 +1,9 @@
 //! Request classification: reads flow, potential writes require review.
 //!
 //! Read vs write is semantic, not the HTTP method: git-upload-pack and
-//! GraphQL queries are reads despite being POSTs. The review parser is
-//! advisory: GraphQL POSTs enter the review path, where only an explicitly
-//! saved, verified comment permission can admit a reconstructed command.
+//! GraphQL POSTs enter the bounded body-inspection path. The selected query
+//! operation flows automatically; mutations queue for one-shot review unless
+//! an explicitly saved comment permission admits a reconstructed addComment.
 //! Unknown origins remain unpoliced while policy grows.
 
 use hudsucker::{Body, hyper::Request};

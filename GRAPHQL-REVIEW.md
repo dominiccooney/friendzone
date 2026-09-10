@@ -13,8 +13,9 @@ The browser renders the broker's structured snapshot; it does not parse
 GraphQL independently. Approval still fingerprints and forwards the
 **original method, URL, headers and body**, through the existing
 authorization/escrow path. Formatting does not change what executes.
-Queries and general mutations still require one-shot review. The explicit
-comment permission below is the only automatic exception. Parse failures
+GitHub queries on the supported transport now flow automatically; general
+mutations still require one-shot review. The explicit comment permission
+below remains the only automatic write exception. Parse failures
 remain reviewable as raw text under the existing manual policy; they must
 never qualify for a future automatic grant.
 
@@ -42,10 +43,12 @@ envelopes, URL query parameters, other media types, type-system definitions
 and unsupported language extensions fall back to a visible raw-review
 diagnostic. Unknown JSON envelope fields are not silently discarded.
 
-Work limits: 64 KiB request body, 8,192 lexical tokens, 32 nesting levels,
-256 expanded fields, 1,024 selection visits and a 256 KiB expansion budget.
-Over-limit documents yield no partial analysis. Formatting normalizes
-whitespace/string escapes and omits comments; the raw body is retained.
+Parser limits: 64 KiB request body, 8,192 lexical tokens and 32 nesting
+levels. Display limits: 256 expanded fields, 1,024 selection visits and a
+256 KiB expansion budget. Over-limit displays yield no partial analysis,
+but a successfully classified query still flows when only display expansion
+fails. Formatting normalizes whitespace/string escapes and omits comments;
+the raw body is retained for queued requests.
 
 **This is not schema validation.** The broker does not know all GitHub
 types, validate field merges, coerce custom inputs or evaluate directives.
@@ -56,8 +59,66 @@ not implicitly coerced; omitted values are not conflated with null.
 **Isolation limitation:** the parser receives only body text/content type
 and performs no network, settings or credential access, but currently runs
 in the broker process. The separate secret-free parser process described
-as a design goal in `DECISIONS.md` is not implemented. Do not treat this
-advisory parser as the security boundary for automatic authorization.
+as a design goal in `DECISIONS.md` is not implemented. Query admission uses
+the bounded executable grammar and GitHub's Query-root contract; target/action
+display hints are not the security boundary for automatic write authorization.
+
+## Read-only GraphQL queries
+
+The same envelope parser and AST operation selection feed read admission and
+the UI. The operation type must be `query` (including the shorthand `{ ... }`),
+not `mutation` or `subscription`. Names/aliases and words in comments or
+strings cannot change that type. For multiple operations, the request must
+select an existing, unique query with `operationName`; an unselected mutation
+does not run. No field or argument allowlist is applied to queries, so
+repository reads, search, fragments, variables and introspection all work.
+This relies on [GitHub's read/query contract](https://docs.github.com/en/graphql/guides/forming-calls-with-graphql),
+not an assertion that every arbitrary GraphQL service honors read semantics.
+GitHub still validates schema/variables and may return errors for invalid
+fields or missing values; those errors do not turn a query into a mutation.
+
+Automatic read transport is POST to HTTPS `api.github.com`, port 443 (implicit
+or explicit), path `/graphql`, with no URL query parameters or conflicting
+Host header. JSON and raw GraphQL content types are supported, with optional
+UTF-8 charset. Duplicate headers, encoding/upgrade/method-override semantics,
+unknown headers and unknown directive extensions do not auto-pass. Allowed
+headers are Authorization, Content-Type, Content-Length, Transfer-Encoding,
+Host, User-Agent, Accept, Accept-Encoding, Connection (`close`/`keep-alive`),
+X-GitHub-Next-Global-ID, X-GitHub-Api-Version, Time-Zone and Cache-Control.
+Standard `@skip`/`@include` on selections are supported; their Boolean/variable
+conditions cannot convert a query into a mutation. Other directives stay
+manual until supported. Batches, duplicate JSON keys, persisted queries,
+ambiguous selection, malformed syntax and invalid fragment graphs never
+qualify as reads. Existing size/encoding limits may reject rather than queue.
+
+Read requests still pass identity/approval/IP/kill/management-port and escrow
+checks. The final epoch/IP/kill check is shared with manual approvals and
+occurs after body buffering; prior revocation cannot slip through as a read.
+The original query bytes are forwarded, with normal escrow substitution.
+No target lookup, saved grant, pending item or browser notification is created.
+Log rows identify `read-only GitHub GraphQL query; automatically allowed`.
+
+## PR creation and review operations: manual approval
+
+`createPullRequest`, `addPullRequestReview`, `addPullRequestReviewThread`,
+`addPullRequestReviewThreadReply`, `submitPullRequestReview`, and the legacy
+`addPullRequestReviewComment` are manually approvable through the ordinary
+Inbox. This does not require a saved comment permission. The original
+request waits for **Approve once** / **Deny** and is forwarded unchanged on
+approval. No blanket PR/review grant is created. Legacy operations may be
+rejected by GitHub if no longer supported; Friendzone does not rewrite them.
+REST JSON PR creation and review-comment writes use the same one-shot gate.
+
+Cards show an action label and `mutation_inputs` (path/label/value) for every
+supplied input: repository IDs, head/base branches, title/body, draft and
+maintainer options, commit, file/line/side, threads/comments and review event.
+Unknown inputs remain explicitly visible. `APPROVE` and `REQUEST_CHANGES`
+are consequential review submissions, not merely comment text. Target hints
+identify opaque Repository/PR/Review/Thread IDs, not verified PR numbers;
+when both PR and review/reply IDs are supplied no single target is guessed.
+General PR/review target lookup is not added to the narrow comment resolver.
+Binary git push remains blocked; PR creation requires the head branch to
+already exist on GitHub. Token scopes must permit the approved operation.
 
 ## Structured model (version 1)
 
@@ -77,6 +138,8 @@ Each field contains:
   `conditions_text` provides the corresponding display strings.
 - `action`, `target`: optional broker-recognized action and primary target hint.
 - `comment_body`: literal `addComment.input.body`, separate from its target.
+- `mutation_inputs`: labeled exact resolved inputs for PR creation/review
+  operations; extra fields remain visible and do not imply a broader grant.
 
 Value tags preserve strings, enums, integer/float literals, lists, objects,
 null, booleans and missing variables. Field order and duplicate occurrences
@@ -93,6 +156,9 @@ These are explicit schema paths, not a recursive search for a field named
 | Root mutation `updateIssue` | `input.id`: opaque Issue node ID |
 | Root mutation `closeIssue`, `reopenIssue` | `input.issueId`: opaque Issue node ID |
 | Root mutation `addPullRequestReview`, `updatePullRequest` | `input.pullRequestId`: opaque PullRequest node ID |
+| Root mutation `createPullRequest` | `input.repositoryId`: opaque Repository node ID |
+| Root mutation `addPullRequestReviewThread`, legacy `addPullRequestReviewComment`, `submitPullRequestReview` | sole provided PR/review/reply ID; ambiguous combinations have no primary hint |
+| Root mutation `addPullRequestReviewThreadReply` | `input.pullRequestReviewThreadId`: opaque thread node ID |
 | Root query `node` | `id`: opaque node ID, type unknown |
 | Root query `repository(owner, name)` → `issue(number)` | owner + repository + issue number |
 | Same → `pullRequest(number)` | owner + repository + PR number |
@@ -170,8 +236,8 @@ command. Later revocation/rotation cannot undo admitted upstream work.
 GitHub state can change between the read and mutation; the mutation uses
 the verified canonical node ID, not a possibly reused issue number.
 
-No user-configurable lookup URL/query, guest-grant API, general query
-auto-allowing, REST comment pinning, MCP write policy, separate parser
+No user-configurable lookup URL/query, guest-grant API, REST comment pinning,
+automatic PR/review mutation grants, MCP write policy, separate parser
 process, or full schema validator is added. All preexisting network
 containment limitations still apply. A comment permission permits arbitrary
 comment content (including links/mentions); it is not content moderation or

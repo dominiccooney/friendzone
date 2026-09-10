@@ -195,7 +195,7 @@ function renderCommentPermissionPanel(detail) {
   $("#resolve-comment-target").disabled = !detail?.comment_permission_supported;
   $("#save-comment-permission").disabled = !detail?.resolution_id || !detail?.resolved_target;
   $("#comment-permission-status").textContent = detail?.graphql && !detail.comment_permission_supported
-    ? "This request cannot use a saved comment permission: it needs one supported addComment mutation, an exact Friendzone fake GitHub Bearer credential, and no extra semantic headers. Queries, fragments/directives, extra mutations/inputs or unsupported response fields still need manual review." : "";
+    ? "Saved permissions cover only supported addComment requests. PR creation and review comments/submissions are allowed with Approve once below, not with a saved comment permission. Queries normally flow automatically; a queued query has an unsupported or unclassified request shape." : "";
   const resolved = detail?.resolved_target;
   $("#resolved-comment-target").textContent = resolved
     ? `Verified with GitHub credential '${resolved.credential}':\n${resolved.target.kind}: ${resolved.target.repository} #${resolved.target.number}\n${resolved.target.title}\n${resolved.target.url}\nNode ID: ${resolved.target.node_id}\nRepository ID: ${resolved.target.repository_id}` : "";
@@ -261,7 +261,7 @@ function renderGraphqlReview(graphql) {
     return;
   }
   const analysis = graphql.analysis;
-  $("#request-graphql-operation").textContent = `${analysis.operation_type.toUpperCase()} · ${analysis.operation_name || "(anonymous)"} · ${analysis.operation_count} operation(s) in document. Names and aliases are guest-chosen, not permissions.`;
+  $("#request-graphql-operation").textContent = `${analysis.operation_type.toUpperCase()} · ${analysis.operation_name || "(anonymous)"} · ${analysis.operation_count} operation(s) in document. ${analysis.operation_type==="mutation"?"Manual approval required for this queued mutation. ":""}Names and aliases are guest-chosen, not permissions.`;
   $("#request-graphql-warning").textContent = analysis.warnings.join("\n");
   $("#request-graphql-document").textContent = analysis.formatted_document;
   $("#request-graphql-variables").textContent = analysis.supplied_variables;
@@ -272,7 +272,9 @@ function renderGraphqlReview(graphql) {
     const targetText = !target ? "Target not identified for this field. Do not infer a target from unrelated variables or response selections."
       : target.kind === "node_id" ? `Unverified ${target.expected_type} node ID at ${target.input_path}: ${target.id}. This is NOT an issue/PR number; a trusted GitHub lookup is needed.`
       : `Unverified ${target.expected_type}: ${target.owner}/${target.repository} #${target.number} (explicit request arguments, not a verified pin).`;
-    return `<article class="graphql-field"><strong>${esc(field.action || field.field)}</strong><p>Actual field: <code>${esc(field.field)}</code> · response path: <code>${esc(field.path.join(" → "))}</code>${field.parent===null?" · root operation field":" · nested response selection"}</p><p class="graphql-target">${esc(targetText)}</p>${conditions.length?`<p>Conditions (all branches retained): ${esc(conditions.join("; "))}</p>`:""}${field.comment_body!==null && field.comment_body!==undefined?`<h4>Comment text (literal, not Markdown)</h4><pre>${esc(field.comment_body)}</pre>`:""}<details${field.parent===null?" open":""}><summary>Resolved arguments</summary><pre>${esc(field.arguments_text || "(none)")}</pre></details></article>`;
+    const inputs = field.mutation_inputs || [];
+    const inputView = inputs.length ? `<h4>PR / review inputs — approve once only</h4><p>Inspect every input, including additional options. Review events can approve or request changes, not just post text.</p>${inputs.map(input=>`<div class="mutation-input"><strong>${esc(input.label)}</strong> <code>${esc(input.path)}</code><pre>${esc(input.value)}</pre></div>`).join("")}` : "";
+    return `<article class="graphql-field"><strong>${esc(field.action || field.field)}</strong><p>Actual field: <code>${esc(field.field)}</code> · response path: <code>${esc(field.path.join(" → "))}</code>${field.parent===null?" · root operation field":" · nested response selection"}</p><p class="graphql-target">${esc(targetText)}</p>${conditions.length?`<p>Conditions (all branches retained): ${esc(conditions.join("; "))}</p>`:""}${inputView}${field.comment_body!==null && field.comment_body!==undefined?`<h4>Comment text (literal, not Markdown)</h4><pre>${esc(field.comment_body)}</pre>`:""}<details${field.parent===null?" open":""}><summary>Resolved arguments</summary><pre>${esc(field.arguments_text || "(none)")}</pre></details></article>`;
   }).join("");
 }
 
@@ -333,7 +335,7 @@ const PROVIDER_PRESETS = {
   },
   github: {
     name: "github", hosts: "api.github.com,github.com,codeload.github.com", header: "authorization", prefix: "Bearer ", guest: "GITHUB_TOKEN",
-    hint: "Use a fine-grained PAT from github.com → Settings → Developer settings → Personal access tokens (narrow scopes recommended), or reuse the gh CLI's token: run `gh auth token`. Agents and gh read it from GITHUB_TOKEN. GitHub JSON/text writes and GraphQL POSTs require one-shot Inbox review; approval cannot grant scopes your token lacks. Binary git pushes remain blocked.",
+    hint: "Use a fine-grained PAT from github.com → Settings → Developer settings → Personal access tokens (narrow scopes recommended), or reuse the gh CLI's token: run `gh auth token`. Agents and gh read it from GITHUB_TOKEN. GitHub GraphQL queries flow automatically. PR creation and review comments/submissions require Approve once in Inbox; saved ordinary-comment permissions do not cover them. Approval cannot grant scopes your token lacks. Binary git pushes remain blocked.",
   },
   custom: { name: "", hosts: "", header: "", prefix: "", guest: "", hint: "Fill the advanced fields: pinned hosts, credential header, optional 'Bearer ' prefix, and the env var the agent expects." },
 };

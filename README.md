@@ -145,7 +145,7 @@ resumed.
 
 ## GitHub policy
 
-GitHub reads (GET/HEAD/OPTIONS and `git-upload-pack`) flow through the
+GitHub reads (GET/HEAD/OPTIONS, `git-upload-pack`, and parsed GraphQL queries) flow through the
 proxy. Potential writes wait in **Inbox → Requests awaiting review**.
 Open **Review request**, inspect the complete URL, headers and literal
 payload, then **Approve once** or **Deny**. Approval releases only that
@@ -157,9 +157,22 @@ selected query/mutation/subscription, actual fields behind aliases, expanded
 fragments, resolved arguments, variable defaults, formatted document and
 supplied variables. Comment text is shown literally, separately from its
 target. The exact original body remains visible and is forwarded unchanged.
-**Queries and general mutations still require review**; parsing is not a grant
-or full GitHub schema validation. Malformed, ambiguous or unsupported input
+**GitHub GraphQL queries now flow automatically**, including aliases,
+fragments, variables and introspection. Classification uses the selected
+AST operation, not a name or the occurrence of `mutation` in strings.
+In a multi-operation document, `operationName` must unambiguously select
+the query. This relies on GitHub's read-only Query root; it is not a promise
+about arbitrary GraphQL servers, nor full GitHub schema validation.
+Malformed, ambiguous or unsupported input
 shows a diagnostic and raw body instead of a partial structured summary.
+
+**PR creation and review comments/threads/submission are allowed with manual
+approval.** Open the pending request, inspect all inputs, then **Approve once**
+or **Deny**. Review cards label branches, repository IDs, title/body, commit,
+file/line and review event (`COMMENT`, `APPROVE`, `REQUEST_CHANGES`). These
+mutations never inherit ordinary saved comment permissions. JSON REST PR
+creation/review-comment requests use the same one-shot gate. GitHub token
+permissions still apply, and creating a PR does not unblock binary git pushes.
 See [GRAPHQL-REVIEW.md](GRAPHQL-REVIEW.md) for supported syntax and the
 operation/target model and the supported issue/PR-scoped comment permission.
 
@@ -203,6 +216,8 @@ bursts and remember recently notified IDs across reloads; clicking one
 focuses Inbox, never approves a request. Their text contains no payload or
 URL. Browser/OS notification settings can suppress them; the Inbox works
 without permission. No push service or closed-browser delivery is included.
+Automatically allowed queries create no pending item or notification; their
+log rows say `read-only GitHub GraphQL query; automatically allowed`.
 
 ## MCP forwarding (read tools)
 

@@ -1327,6 +1327,236 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
+    async fn github_queries_flow_and_pr_review_mutations_wait_for_host_decisions_over_real_tls() {
+        use hudsucker::{Proxy, certificate_authority::RcgenAuthority, rustls::crypto::aws_lc_rs};
+        let dir = std::env::temp_dir().join(format!("fz-query-review-{}", uuid::Uuid::new_v4()));
+        let files = crate::ca::AuthorityFiles::load_or_create(&dir).unwrap();
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "github".into(),
+                hosts: vec!["api.github.com".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fake-github".into(),
+                real_env: None,
+                guest_env: None,
+            })
+            .unwrap();
+        settings.set_secret("github", "host-secret").unwrap();
+        let state = AppState::default();
+        state.add_container("guest").unwrap();
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let received = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let observed = received.clone();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(
+                upstream,
+                Router::new().fallback(post(
+                    move |headers: axum::http::HeaderMap, body: String| {
+                        let observed = observed.clone();
+                        async move {
+                            assert_eq!(headers["authorization"], "Bearer host-secret");
+                            assert!(!headers.contains_key("proxy-authorization"));
+                            observed.lock().unwrap().push(body);
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({"data":{"ok":true}})),
+                            )
+                        }
+                    },
+                )),
+            )
+            .await
+            .unwrap()
+        });
+        let ui_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ui_addr = ui_listener.local_addr().unwrap();
+        let registry = crate::mcp::ForwardRegistry::load(&dir, settings.clone()).unwrap();
+        let ui = ui_router(UiState {
+            app: state.clone(),
+            settings: settings.clone(),
+            registry,
+            oauth: Default::default(),
+            cline: Default::default(),
+            ui_addr,
+            bootstrap_addr: "127.0.0.1:8082".parse().unwrap(),
+        });
+        let ui_task = tokio::spawn(async move { axum::serve(ui_listener, ui).await.unwrap() });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let connector = tower::service_fn(move |uri: hudsucker::hyper::Uri| {
+            Box::pin(async move {
+                assert_eq!(uri.host(), Some("api.github.com"));
+                tokio::net::TcpStream::connect(upstream_addr)
+                    .await
+                    .map(hudsucker::hyper_util::rt::TokioIo::new)
+            })
+        });
+        let proxy = Proxy::builder()
+            .with_listener(listener)
+            .with_ca(RcgenAuthority::new(
+                files.issuer().unwrap(),
+                10,
+                aws_lc_rs::default_provider(),
+            ))
+            .with_http_connector(connector)
+            .with_http_handler(crate::proxy::EventHandler::new(
+                state.clone(),
+                settings.clone(),
+                ui_addr.port(),
+            ))
+            .build()
+            .unwrap();
+        let proxy_task = tokio::spawn(proxy.start());
+        let guest = reqwest::Client::builder()
+            .use_rustls_tls()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(files.cert_pem.as_bytes()).unwrap(),
+            )
+            .proxy(
+                reqwest::Proxy::all(format!("http://{proxy_addr}"))
+                    .unwrap()
+                    .basic_auth("guest", "x"),
+            )
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let host = reqwest::Client::builder().no_proxy().build().unwrap();
+        let send = |url: &str, body: String| {
+            let req = guest
+                .post(url)
+                .header("authorization", "Bearer fake-github")
+                .header("content-type", "application/json")
+                .body(body);
+            tokio::spawn(async move { req.send().await.unwrap() })
+        };
+        let mixed = "query Read { viewer { id } } mutation Write { createPullRequest(input:{repositoryId:\"repo\",headRefName:\"feature\",baseRefName:\"main\",title:\"new\"}){clientMutationId}}";
+        let queries=vec![
+            serde_json::json!({"query":"{ viewer { login } }"}).to_string(),
+            serde_json::json!({"query":"query MutationInName($q:String!){search(query:$q,type:ISSUE){issueCount}}","variables":{"q":"mutation { addComment }"}}).to_string(),
+            serde_json::json!({"query":"query($show:Boolean=true){...F} fragment F on Query { __schema @include(if:$show){queryType{name}} }"}).to_string(),
+            serde_json::json!({"query":mixed,"operationName":"Read"}).to_string(),
+            serde_json::json!({"query":format!("query Big {{ {} }}","viewer { id } ".repeat(300))}).to_string(),
+        ];
+        for query in &queries {
+            let response = send(crate::github::ENDPOINT, query.clone()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.json::<serde_json::Value>().await.unwrap()["data"]["ok"],
+                true
+            );
+            assert_eq!(received.lock().unwrap().last(), Some(query));
+            assert!(
+                state.reviews.summaries().is_empty(),
+                "read creates no inbox item"
+            );
+            let row = &state.view().requests[0];
+            assert!(matches!(row.verdict, crate::state::Verdict::Allowed));
+            assert!(
+                row.detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("read-only GitHub GraphQL")
+            );
+        }
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/github_mutations.json")).unwrap();
+        let mut mutations: Vec<_> = fixtures
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|fixture| {
+                (
+                    crate::github::ENDPOINT.to_owned(),
+                    fixture["body"].to_string(),
+                    fixture["action"].as_str().map(str::to_owned),
+                )
+            })
+            .collect();
+        // REST workflows use the same one-shot gate, without special grants.
+        mutations.extend([
+            ("https://api.github.com/repos/owner/repo/pulls".into(),r#"{"title":"new PR","head":"feature","base":"main"}"#.into(),None),
+            ("https://api.github.com/repos/owner/repo/pulls/12/comments".into(),r#"{"body":"review comment","path":"file.rs","line":4,"side":"RIGHT","commit_id":"abc"}"#.into(),None),
+            (crate::github::ENDPOINT.into(),serde_json::json!({"query":mixed,"operationName":"Write"}).to_string(),Some("Create pull request".into())),
+            (crate::github::ENDPOINT.into(),serde_json::json!({"query":mixed}).to_string(),None),
+            (format!("{}?operationName=Write",crate::github::ENDPOINT),serde_json::json!({"query":mixed,"operationName":"Read"}).to_string(),None),
+        ]);
+        for (url, body, action) in mutations {
+            for decision in ["deny", "approve"] {
+                let before = received.lock().unwrap().len();
+                let pending = send(&url, body.clone());
+                let summary = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    loop {
+                        if let Some(s) = state.reviews.summaries().into_iter().next() {
+                            break s;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(!pending.is_finished());
+                assert_eq!(received.lock().unwrap().len(), before);
+                let endpoint = format!("http://{ui_addr}/api/requests/{}", summary.id);
+                let detail: serde_json::Value = host
+                    .get(&endpoint)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(detail["body"], body);
+                assert_eq!(detail["comment_permission_supported"], false);
+                if let Some(action) = &action {
+                    assert_eq!(
+                        detail["graphql"]["analysis"]["fields"][0]["action"],
+                        *action
+                    );
+                }
+                // A read still flows while a mutation is awaiting a decision.
+                let read = send(crate::github::ENDPOINT, queries[0].clone())
+                    .await
+                    .unwrap();
+                assert_eq!(read.status(), StatusCode::OK);
+                assert_eq!(state.reviews.summaries().len(), 1);
+                let response = host
+                    .post(format!("{endpoint}/decision"))
+                    .header("x-friendzone-review", "1")
+                    .json(
+                        &serde_json::json!({"fingerprint":summary.fingerprint,"decision":decision}),
+                    )
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                let response = pending.await.unwrap();
+                if decision == "approve" {
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(received.lock().unwrap().last(), Some(&body));
+                } else {
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                }
+                assert_eq!(
+                    received.lock().unwrap().len(),
+                    before + 1 + usize::from(decision == "approve")
+                );
+                assert!(state.reviews.summaries().is_empty());
+                assert_eq!(host.post(format!("{endpoint}/decision")).header("x-friendzone-review","1").json(&serde_json::json!({"fingerprint":summary.fingerprint,"decision":"approve"})).send().await.unwrap().status(),StatusCode::CONFLICT);
+            }
+        }
+        ui_task.abort();
+        proxy_task.abort();
+        upstream_task.abort();
+        let _ = ui_task.await;
+        let _ = proxy_task.await;
+        let _ = upstream_task.await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn verified_comment_permission_flows_through_host_api_and_real_mitm_proxy() {
         use hudsucker::{Proxy, certificate_authority::RcgenAuthority, rustls::crypto::aws_lc_rs};
         use std::sync::atomic::{AtomicUsize, Ordering};

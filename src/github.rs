@@ -5,6 +5,75 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const ENDPOINT: &str = "https://api.github.com/graphql";
+
+/// Query admission relies on GitHub's Query root contract, not on arbitrary
+/// GraphQL services. Do not let URL/Host/header overrides change that meaning.
+pub fn read_transport(request: &hudsucker::hyper::Request<hudsucker::Body>) -> bool {
+    let uri = request.uri();
+    if request.method() != hudsucker::hyper::Method::POST
+        || uri.scheme_str() != Some("https")
+        || !uri
+            .host()
+            .is_some_and(|host| host.eq_ignore_ascii_case("api.github.com"))
+        || uri.port_u16().is_some_and(|port| port != 443)
+        || uri.path() != "/graphql"
+        || uri.query().is_some()
+    {
+        return false;
+    }
+    let mut names = std::collections::HashSet::new();
+    for (name, _) in request.headers() {
+        if !names.insert(name.as_str())
+            || !matches!(
+                name.as_str(),
+                "authorization"
+                    | "content-type"
+                    | "content-length"
+                    | "transfer-encoding"
+                    | "host"
+                    | "user-agent"
+                    | "accept"
+                    | "accept-encoding"
+                    | "connection"
+                    | "x-github-next-global-id"
+                    | "x-github-api-version"
+                    | "time-zone"
+                    | "cache-control"
+            )
+        {
+            return false;
+        }
+    }
+    if request.headers().get("host").is_some_and(|value| {
+        !value.to_str().is_ok_and(|host| {
+            host.eq_ignore_ascii_case("api.github.com")
+                || host.eq_ignore_ascii_case("api.github.com:443")
+        })
+    }) {
+        return false;
+    }
+    if request.headers().get("connection").is_some_and(|value| {
+        !value
+            .to_str()
+            .is_ok_and(|s| s.eq_ignore_ascii_case("keep-alive") || s.eq_ignore_ascii_case("close"))
+    }) {
+        return false;
+    }
+    request
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| {
+            let mut parts = value.split(';').map(str::trim);
+            let media = parts.next().unwrap_or("");
+            (media.eq_ignore_ascii_case("application/json")
+                || media.eq_ignore_ascii_case("application/graphql"))
+                && parts.all(|parameter| {
+                    parameter.eq_ignore_ascii_case("charset=utf-8")
+                        || parameter.eq_ignore_ascii_case("charset=\"utf-8\"")
+                })
+        })
+}
 const LOOKUP: &str = "query FriendzoneTarget($id: ID!) { node(id: $id) { __typename ... on Issue { id number title url repository { id nameWithOwner } } ... on PullRequest { id number title url repository { id nameWithOwner } } } }";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -312,6 +381,58 @@ pub fn comment_credential(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn query_transport_keeps_github_authority_and_envelope_unambiguous() {
+        let request = |url: &str| {
+            hudsucker::hyper::Request::builder()
+                .method("POST")
+                .uri(url)
+                .header("content-type", "application/json; charset=\"utf-8\"")
+                .body(hudsucker::Body::empty())
+                .unwrap()
+        };
+        for url in [
+            ENDPOINT,
+            "https://api.github.com:443/graphql",
+            "https://API.GITHUB.COM/graphql",
+        ] {
+            assert!(read_transport(&request(url)));
+        }
+        for url in [
+            "http://api.github.com/graphql",
+            "https://api.github.com:8443/graphql",
+            "https://example.com/graphql",
+            "https://api.github.com/graphql?operationName=Write",
+            "https://api.github.com/graphql?",
+            "https://api.github.com/other",
+        ] {
+            assert!(!read_transport(&request(url)), "{url}");
+        }
+        for (name, value) in [
+            ("host", "evil.test"),
+            ("x-http-method-override", "DELETE"),
+            ("x-operation-name", "Write"),
+            ("cookie", "auth=x"),
+            ("content-type", "application/json; charset=utf-16"),
+            ("connection", "content-type"),
+            ("upgrade", "websocket"),
+        ] {
+            let mut req = request(ENDPOINT);
+            req.headers_mut().insert(
+                hudsucker::hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+            assert!(!read_transport(&req), "{name}");
+        }
+        let mut req = request(ENDPOINT);
+        req.headers_mut()
+            .insert("x-github-next-global-id", "1".parse().unwrap());
+        assert!(read_transport(&req));
+        req.headers_mut()
+            .append("content-type", "application/graphql".parse().unwrap());
+        assert!(!read_transport(&req));
+    }
 
     #[test]
     fn automatic_transport_requires_one_exact_escrow_binding_and_rejects_semantic_headers() {

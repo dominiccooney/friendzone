@@ -1,0 +1,65 @@
+[
+  {
+    "action": "Create pull request",
+    "field": "createPullRequest",
+    "target_type": "Repository",
+    "target_path": "input.repositoryId",
+    "highlight": "input.baseRefName",
+    "body": {
+      "query": "mutation ReadOnlyLookingName($input: CreatePullRequestInput!) { result: createPullRequest(input: $input) { pullRequest { id number url } } }",
+      "variables": {"input": {"repositoryId": "repo-node", "headRepositoryId": "fork-node", "headRefName": "contributor:feature", "baseRefName": "main", "title": "<img src=x onerror=alert(1)> New PR", "body": "## Description\nLiteral content", "draft": true, "maintainerCanModify": false}}
+    }
+  },
+  {
+    "action": "Add pull request review",
+    "field": "addPullRequestReview",
+    "target_type": "PullRequest",
+    "target_path": "input.pullRequestId",
+    "highlight": "input.event",
+    "body": {
+      "query": "mutation($input: AddPullRequestReviewInput!) { addPullRequestReview(input: $input) { pullRequestReview { id } } }",
+      "variables": {"input": {"pullRequestId": "pr-node", "body": "Please fix this", "event": "REQUEST_CHANGES", "commitOID": "0123456789012345678901234567890123456789", "threads": [{"path": "src/main.rs", "line": 24, "side": "RIGHT", "body": "<script>not executable</script>"}]}}
+    }
+  },
+  {
+    "action": "Post review thread",
+    "field": "addPullRequestReviewThread",
+    "target_type": "PullRequestReview",
+    "target_path": "input.pullRequestReviewId",
+    "highlight": "input.line",
+    "body": {
+      "query": "mutation($review: ID!, $text: String!) { harmless: addPullRequestReviewThread(input: {pullRequestReviewId: $review, body: $text, path: \"src/main.rs\", startLine: 8, line: 12, startSide: RIGHT, side: RIGHT, subjectType: LINE}) { thread { id } } }",
+      "variables": {"review": "review-node", "text": "A multiline review comment"}
+    }
+  },
+  {
+    "action": "Reply to review thread",
+    "field": "addPullRequestReviewThreadReply",
+    "target_type": "PullRequestReviewThread",
+    "target_path": "input.pullRequestReviewThreadId",
+    "highlight": "input.body",
+    "body": {
+      "query": "mutation { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: \"thread-node\", body: \"A reply\"}) { comment { id } } }"
+    }
+  },
+  {
+    "action": "Submit pull request review",
+    "field": "submitPullRequestReview",
+    "target_type": "PullRequestReview",
+    "target_path": "input.pullRequestReviewId",
+    "highlight": "input.event",
+    "body": {
+      "query": "mutation { submitPullRequestReview(input: {pullRequestReviewId: \"review-node\", event: APPROVE, body: \"Ready to merge\"}) { pullRequestReview { id state } } }"
+    }
+  },
+  {
+    "action": "Post review comment (legacy API)",
+    "field": "addPullRequestReviewComment",
+    "target_type": "PullRequest",
+    "target_path": "input.pullRequestId",
+    "highlight": "input.position",
+    "body": {
+      "query": "mutation { addPullRequestReviewComment(input: {pullRequestId: \"pr-node\", path: \"file.rs\", position: 4, body: \"Legacy inline comment\"}) { comment { id } } }"
+    }
+  }
+]

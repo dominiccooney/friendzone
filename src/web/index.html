@@ -21,6 +21,7 @@
       <section class="request-inbox" aria-labelledby="request-inbox-title">
         <div class="page-heading"><div><h2 id="request-inbox-title">Requests awaiting review</h2><p>Approve once releases the exact waiting request. Nothing is replayed after a restart.</p></div><button id="enable-notifications" type="button">Enable notifications</button></div>
         <p id="notification-status" class="meta" role="status"></p>
+        <p class="meta">GitHub GraphQL queries flow automatically. PR creation, review comments/threads and review submissions wait here for Approve once / Deny; they are not covered by saved comment permissions.</p>
         <p class="meta">Keep this UI open for desktop notifications. Requests expire after 2 minutes; a client's own timeout may be shorter. Deny old requests before retrying a timed-out write.</p>
         <div id="pending-requests"></div>
         <section id="request-review" hidden>

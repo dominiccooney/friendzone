@@ -398,6 +398,35 @@ impl AppState {
     /// Admission is the consistency boundary: policy changes before this
     /// check cancel the review. Already-admitted upstream work is not undone.
     pub fn admit_review(&self, id: Uuid, container: &str, peer: IpAddr, epoch: Uuid) -> bool {
+        self.admit_request(
+            id,
+            container,
+            peer,
+            epoch,
+            "approved once by host; forwarding original request",
+        )
+    }
+
+    pub fn admit_graphql_read(&self, id: Uuid, container: &str, peer: IpAddr, epoch: Uuid) -> bool {
+        self.admit_request(
+            id,
+            container,
+            peer,
+            epoch,
+            "read-only GitHub GraphQL query; automatically allowed",
+        )
+    }
+
+    /// Reads and manual approvals share the final epoch/IP/kill check; neither
+    /// can bypass a policy change that happened while its body was buffered.
+    fn admit_request(
+        &self,
+        id: Uuid,
+        container: &str,
+        peer: IpAddr,
+        epoch: Uuid,
+        reason: &str,
+    ) -> bool {
         let mut state = self.data.write().expect("state lock poisoned");
         if state.killed.contains(container)
             || state.containers.get(container).is_none_or(|record| {
@@ -410,7 +439,7 @@ impl AppState {
         }
         if let Some(event) = state.requests.iter_mut().rev().find(|event| event.id == id) {
             event.verdict = Verdict::Allowed;
-            event.detail = Some("approved once by host; forwarding original request".into());
+            event.detail = Some(reason.into());
         }
         drop(state);
         self.notify();

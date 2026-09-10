@@ -131,7 +131,8 @@ do not substitute the guest MCP endpoint for an OAuth redirect URI.
 
 ### Reviewing a GitHub request
 
-If a guest submits a GitHub write (including any GraphQL POST), keep the
+GitHub GraphQL queries flow without approval. If a guest submits a GitHub
+write (a GraphQL mutation or REST write), keep the
 host UI open and go to **Inbox → Requests awaiting review → Review request**.
 Inspect the full URL, headers and body, then **Approve once** or **Deny**.
 The original HTTP call waits up to two minutes; nothing is replayed on
@@ -143,7 +144,18 @@ desktop alerts. Click an alert to focus Inbox. This works with the UI open
 in a background tab on localhost, not after closing the browser. Denied or
 unsupported notification permission does not prevent manual review.
 
-GraphQL queries and general mutations require manual review. For an eligible
+PR creation, inline review comments/threads, replies and review submissions
+are allowed with **Approve once**, not automatically. Inspect the displayed
+head/base branches, body, file/line and review event—`APPROVE` and
+`REQUEST_CHANGES` are more than comment text. The host's token needs the
+appropriate GitHub write scopes. Binary git pushes are still blocked.
+
+Queries use the actual parsed `query` operation, including fragments and
+introspection. Ambiguous operation selection, unsupported directives/headers,
+URL query parameters and malformed requests still require review or fail
+closed. No query-body/field allowlist is needed on the supported transport.
+
+For an eligible
 single `addComment` using Friendzone's fake GitHub Bearer token:
 
 1. Open the request and click **Resolve GitHub target**.

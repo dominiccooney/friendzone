@@ -188,6 +188,22 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     for(let i=0;i<100 && await evaluate("document.querySelector('#inbox-count').textContent !== '0'");i++) await delay(25);
     assert.equal(await evaluate("document.querySelector('#request-approve').disabled"),true);
     assert.equal(await evaluate("document.querySelector('#inbox-count').textContent"),"0");
+    // Real browser rendering of mutation cards: both actions remain explicitly
+    // approvable, not disabled by the lack of an automatic comment permission.
+    for (const [field,action,label,value] of [["createPullRequest","Create pull request","Head branch (source)","fork:"+"feature-".repeat(150)],["submitPullRequestReview","Submit pull request review","Review event","APPROVE"]]) {
+      const mutation={...detail,comment_permission_supported:false,resolution_id:null,resolved_target:null,graphql:{status:"parsed",analysis:{...detail.graphql.analysis,
+        fields:[{...detail.graphql.analysis.fields[0],field,action,comment_body:null,mutation_inputs:[{label,path:"input.value",value},{label:"Body",path:"input.body",value:"<img src=x onerror=window.pwned=true>"}]}]}}};
+      await evaluate(`activeReview=${JSON.stringify(mutation)};renderGraphqlReview(activeReview.graphql);renderCommentPermissionPanel(activeReview);document.querySelector('#request-approve').disabled=false`);
+      assert.match(await evaluate("document.querySelector('#request-graphql-operation').textContent"),/Manual approval required/);
+      assert.match(await evaluate("document.querySelector('#comment-permission-status').textContent"),/allowed with Approve once below/);
+      assert.equal(await evaluate("document.querySelector('#save-comment-permission').disabled"),true);
+      assert.equal(await evaluate("document.querySelector('#request-graphql-fields img')===null"),true);
+      assert.equal(await evaluate("!!window.pwned"),false);
+      for(const width of [1058,480]) {
+        await send("Emulation.setDeviceMetricsOverride",{width,height:1000,deviceScaleFactor:1,mobile:false});
+        assert.ok(await evaluate(`document.documentElement.scrollWidth <= ${width+1}`));
+      }
+    }
     assert.deepEqual(errors, []);
   } finally {
     socket?.close(); browser.kill();

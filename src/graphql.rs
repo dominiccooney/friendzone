@@ -902,6 +902,16 @@ pub struct FieldView {
     /// Payload is intentionally separate from the action/target tuple.
     /// Not rendered as Markdown; comment text is arbitrary guest input.
     pub comment_body: Option<String>,
+    /// Labeled, resolved inputs for manual PR/review operations. Never used as
+    /// an authorization rule: all other/unknown arguments remain visible too.
+    pub mutation_inputs: Vec<MutationInput>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MutationInput {
+    pub path: String,
+    pub label: &'static str,
+    pub value: String,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Analysis {
@@ -1174,16 +1184,36 @@ impl<'de> Deserialize<'de> for UniqueJson {
     }
 }
 
+#[cfg(test)]
 pub fn review(body: &str, content_type: &str) -> Review {
-    match analyze(body, content_type) {
+    inspect(body, content_type).1
+}
+
+/// One parse/operation-selection authority for policy and the review view.
+/// Display expansion limits must not turn a large read into an approval prompt.
+pub fn inspect(body: &str, content_type: &str) -> (bool, Review) {
+    let parsed = match parse_request(body, content_type) {
+        Ok(parsed) => parsed,
+        Err(message) => return (false, Review::Unavailable { message }),
+    };
+    let read_only = parsed.document.operations[parsed.selected].kind == "query"
+        && query_directives_supported(&parsed);
+    let review = match analyze_parsed(&parsed) {
         Ok(analysis) => Review::Parsed {
             analysis: Box::new(analysis),
         },
         Err(message) => Review::Unavailable { message },
-    }
+    };
+    (read_only, review)
 }
 
-fn analyze(body: &str, content_type: &str) -> Result<Analysis> {
+struct ParsedRequest {
+    document: Document,
+    selected: usize,
+    supplied: serde_json::Map<String, Json>,
+}
+
+fn parse_request(body: &str, content_type: &str) -> Result<ParsedRequest> {
     if body.len() > crate::review::MAX_BODY {
         return Err("GraphQL body exceeds the 64 KiB review limit".into());
     }
@@ -1238,14 +1268,86 @@ fn analyze(body: &str, content_type: &str) -> Result<Analysis> {
         document
             .operations
             .iter()
-            .find(|op| op.name.as_deref() == Some(name.as_str()))
+            .position(|op| op.name.as_deref() == Some(name.as_str()))
             .ok_or("operationName does not select an operation")?
     } else if document.operations.len() == 1 {
-        &document.operations[0]
+        0
     } else {
         return Err("multiple operations require operationName; no operation was guessed".into());
     };
-    let mut warnings=vec!["Parsed syntax, not full GitHub schema validation or an authorization grant. Only an explicitly saved narrow comment permission can bypass one-shot review.".into(),
+    Ok(ParsedRequest {
+        document,
+        selected,
+        supplied,
+    })
+}
+
+/// GitHub query fields (including introspection) are reads. Unknown directive
+/// extensions are not assumed safe. Walk each fragment once, never expand a DAG
+/// for admission; @skip/@include cannot change the operation's root type.
+fn query_directives_supported(parsed: &ParsedRequest) -> bool {
+    fn supported(directives: &[Directive]) -> bool {
+        directives.iter().all(|directive| {
+            matches!(directive.name.as_str(), "skip" | "include")
+                && directive.arguments.len() == 1
+                && matches!(
+                    directive.arguments.get("if"),
+                    Some(Value::Boolean(_) | Value::Variable(_))
+                )
+        })
+    }
+    let operation = &parsed.document.operations[parsed.selected];
+    if !operation.directives.is_empty()
+        || operation.variables.iter().any(|v| !v.directives.is_empty())
+    {
+        return false;
+    }
+    let mut visited = HashSet::new();
+    let mut pending: Vec<_> = operation.selections.iter().collect();
+    while let Some(selection) = pending.pop() {
+        match selection {
+            Selection::Field {
+                directives,
+                selections,
+                ..
+            }
+            | Selection::Inline {
+                directives,
+                selections,
+                ..
+            } => {
+                if !supported(directives) {
+                    return false;
+                }
+                pending.extend(selections);
+            }
+            Selection::Spread { name, directives } => {
+                if !supported(directives) {
+                    return false;
+                }
+                if visited.insert(name) {
+                    let fragment = &parsed.document.fragments[name];
+                    if !fragment.directives.is_empty() {
+                        return false;
+                    }
+                    pending.extend(&fragment.selections);
+                }
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+fn analyze(body: &str, content_type: &str) -> Result<Analysis> {
+    analyze_parsed(&parse_request(body, content_type)?)
+}
+
+fn analyze_parsed(parsed: &ParsedRequest) -> Result<Analysis> {
+    let document = &parsed.document;
+    let selected = &document.operations[parsed.selected];
+    let supplied = &parsed.supplied;
+    let mut warnings=vec!["GitHub queries flow automatically on supported transports. Mutations require one-shot approval unless covered by an explicitly saved narrow comment permission. Parsing is not full GitHub schema validation.".into(),
         "Targets come from request arguments and are unverified. Opaque node IDs are not issue/PR numbers; no GitHub lookup has run.".into(),
         "The target hint identifies a primary subject only. Other arguments may change permissions, reference other objects, or perform additional effects; a future rule must constrain the entire operation.".into(),
         "Formatting removes comments and normalizes whitespace/string escapes. The exact original body below remains the approval identity.".into()];
@@ -1288,7 +1390,7 @@ fn analyze(body: &str, content_type: &str) -> Result<Analysis> {
         warnings.push("Supplied variables include names not declared by the selected operation. They are not used to infer targets.".into());
     }
     let mut expander = Expander {
-        document: &document,
+        document,
         variables: &variables,
         operation_type: &selected.kind,
         fields: Vec::new(),
@@ -1307,7 +1409,7 @@ fn analyze(body: &str, content_type: &str) -> Result<Analysis> {
         effective_variables,
         fields: expander.fields,
         warnings,
-        comment: comment_plan(&document, selected, &variables, &supplied),
+        comment: comment_plan(document, selected, &variables, supplied),
     })
 }
 
@@ -1481,7 +1583,17 @@ impl Expander<'_> {
                         &arguments,
                         parent.map(|index| &self.fields[index]),
                     );
-                    let comment_body = if action == Some("Post comment") {
+                    let comment_body = if action == Some("Post comment")
+                        || (parent.is_none()
+                            && self.operation_type == "mutation"
+                            && matches!(
+                                name.as_str(),
+                                "addPullRequestReview"
+                                    | "addPullRequestReviewComment"
+                                    | "addPullRequestReviewThread"
+                                    | "addPullRequestReviewThreadReply"
+                                    | "submitPullRequestReview"
+                            )) {
                         arguments
                             .get("input")
                             .and_then(|v| v.member("body"))
@@ -1496,6 +1608,11 @@ impl Expander<'_> {
                         path: field_path.clone(),
                         parent,
                         arguments_text: format_args(&arguments),
+                        mutation_inputs: if parent.is_none() && self.operation_type == "mutation" {
+                            mutation_inputs(name, &arguments)
+                        } else {
+                            vec![]
+                        },
                         arguments,
                         conditions: conditions.clone(),
                         conditions_text: conditions.iter().map(Condition::text).collect(),
@@ -1559,6 +1676,42 @@ fn target_for(
                 Some(("Add pull request review", "pullRequestId", "PullRequest"))
             }
             "updatePullRequest" => Some(("Update pull request", "pullRequestId", "PullRequest")),
+            "createPullRequest" => Some(("Create pull request", "repositoryId", "Repository")),
+            "addPullRequestReviewComment"
+            | "addPullRequestReviewThread"
+            | "submitPullRequestReview" => {
+                let input = args.get("input");
+                let candidates = [
+                    ("pullRequestId", "PullRequest"),
+                    ("pullRequestReviewId", "PullRequestReview"),
+                    ("inReplyTo", "PullRequestReviewComment"),
+                ];
+                let provided: Vec<_> = candidates
+                    .into_iter()
+                    .filter(|(key, _)| {
+                        input
+                            .and_then(|input| input.member(key))
+                            .is_some_and(|v| !matches!(v, Value::Null))
+                    })
+                    .collect();
+                let action = match field {
+                    "submitPullRequestReview" => "Submit pull request review",
+                    "addPullRequestReviewThread" => "Post review thread",
+                    _ => "Post review comment (legacy API)",
+                };
+                // A request may provide both PR and review/reply IDs. Do not
+                // guess which is authoritative; show all exact inputs below.
+                if provided.len() == 1 {
+                    Some((action, provided[0].0, provided[0].1))
+                } else {
+                    return (Some(action), None);
+                }
+            }
+            "addPullRequestReviewThreadReply" => Some((
+                "Reply to review thread",
+                "pullRequestReviewThreadId",
+                "PullRequestReviewThread",
+            )),
             _ => None,
         }
     } else {
@@ -1623,10 +1776,159 @@ fn target_for(
     (None, None)
 }
 
+fn mutation_inputs(field: &str, args: &BTreeMap<String, Value>) -> Vec<MutationInput> {
+    if !matches!(
+        field,
+        "createPullRequest"
+            | "addPullRequestReview"
+            | "addPullRequestReviewComment"
+            | "addPullRequestReviewThread"
+            | "addPullRequestReviewThreadReply"
+            | "submitPullRequestReview"
+    ) {
+        return vec![];
+    }
+    let Some(Value::Object(input)) = args.get("input") else {
+        return vec![];
+    };
+    input
+        .iter()
+        .map(|(key, value)| MutationInput {
+            path: format!("input.{key}"),
+            label: match key.as_str() {
+                "repositoryId" => "Destination repository node ID",
+                "headRepositoryId" => "Source repository node ID",
+                "headRefName" => "Head branch (source)",
+                "baseRefName" => "Base branch (destination)",
+                "title" => "PR title",
+                "body" => "Body text (literal, not Markdown)",
+                "draft" => "Draft PR",
+                "maintainerCanModify" => "Allow maintainer modifications",
+                "event" => "Review event (APPROVE / REQUEST_CHANGES / COMMENT)",
+                "pullRequestId" => "Pull request node ID",
+                "pullRequestReviewId" => "Review node ID",
+                "pullRequestReviewThreadId" => "Review thread node ID",
+                "inReplyTo" => "Reply-to comment node ID",
+                "commitOID" => "Commit SHA",
+                "path" => "File path",
+                "line" => "Line / end line",
+                "startLine" => "Start line",
+                "side" => "Diff side / end side",
+                "startSide" => "Start diff side",
+                "subjectType" => "Line or file target",
+                "position" => "Legacy diff position",
+                "threads" => "Review threads",
+                "comments" => "Legacy review comments",
+                "clientMutationId" => "Client mutation ID",
+                _ => "Additional input (inspect before approving)",
+            },
+            value: value.format(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn read_classification_uses_selected_operation_not_names_strings_or_display_limits() {
+        let classify = |query: &str, operation: Option<&str>| {
+            inspect(
+                &json!({"query":query,"operationName":operation}).to_string(),
+                "application/json",
+            )
+            .0
+        };
+        for query in [
+            "{ viewer { login } }",
+            "query mutation { createPullRequest: viewer { login } }",
+            "# mutation { evil }\nquery Q { search(query: \"mutation { addComment }\", type: ISSUE) { issueCount } }",
+            "query($skip:Boolean=false){...F} fragment F on Query { viewer @skip(if:$skip) { ... on User { login @include(if:true) } } }",
+            "query IntrospectionQuery { __schema { queryType { name } types { kind name fields { name } } } }",
+        ] {
+            assert!(classify(query, None), "{query}");
+        }
+        let mixed = "query Read { viewer { id } } mutation Write { createPullRequest(input:{}) { clientMutationId } }";
+        assert!(classify(mixed, Some("Read")));
+        assert!(!classify(mixed, Some("Write")));
+        assert!(!classify(mixed, None));
+        assert!(!classify(mixed, Some("missing")));
+        for query in [
+            "mutation Read { viewer { id } }",
+            "subscription Read { viewer { id } }",
+            "query Read { viewer { id } } mutation Read { a }",
+            "{ ...Missing }",
+            "{ ...F } fragment F on Query { ...F }",
+            "query @custom { a }",
+            "{ a @custom }",
+            "{...F} fragment F on Query @custom { a }",
+            "query($v:String @custom){a}",
+        ] {
+            assert!(!classify(query, None), "{query}");
+        }
+        let huge = format!("query Big {{ {} }}", "viewer { id } ".repeat(300));
+        let (read, view) = inspect(&json!({"query":huge}).to_string(), "application/json");
+        assert!(read);
+        assert!(
+            matches!(view, Review::Unavailable { .. }),
+            "display budget does not decide operation kind"
+        );
+        for body in [
+            r#"[{"query":"{a}"}]"#,
+            r#"{"query":"{a}","query":"mutation{b}"}"#,
+            r#"{"query":"{a}","extensions":{}}"#,
+            r#"{"query":"{a}","operationName":true}"#,
+            r#"{"query":"{a}","variables":[]}"#,
+            r#"{"query":"{a}","variables":{"x":1,"x":2}}"#,
+        ] {
+            assert!(!inspect(body, "application/json").0, "{body}");
+        }
+        assert!(inspect("query { viewer { login } }", "application/graphql").0);
+        assert!(!inspect("query { viewer { login } }", "text/plain").0);
+    }
+
+    #[test]
+    fn pr_creation_and_review_fixture_inputs_are_manual_only_with_clear_labels() {
+        let fixtures: Json =
+            serde_json::from_str(include_str!("../tests/fixtures/github_mutations.json")).unwrap();
+        for fixture in fixtures.as_array().unwrap() {
+            let (read, view) = inspect(&fixture["body"].to_string(), "application/json");
+            assert!(!read);
+            let Review::Parsed { analysis } = view else {
+                panic!("fixture must parse: {fixture}")
+            };
+            assert!(
+                analysis.comment.is_none(),
+                "comment grants never cover PR/review mutations"
+            );
+            let root = &analysis.fields[0];
+            assert_eq!(root.action, fixture["action"].as_str());
+            assert_eq!(root.field, fixture["field"].as_str().unwrap());
+            let Some(Target::NodeId {
+                input_path,
+                expected_type,
+                ..
+            }) = &root.target
+            else {
+                panic!("fixture target")
+            };
+            assert_eq!(input_path, fixture["target_path"].as_str().unwrap());
+            assert_eq!(*expected_type, fixture["target_type"].as_str().unwrap());
+            assert!(
+                root.mutation_inputs
+                    .iter()
+                    .any(|input| input.path == fixture["highlight"].as_str().unwrap())
+            );
+        }
+        let analysis=parse("mutation{addPullRequestReviewThread(input:{pullRequestId:\"pr\",pullRequestReviewId:\"review\",body:\"text\"}){thread{id}}}",Json::Null,None).unwrap();
+        assert!(
+            analysis.fields[0].target.is_none(),
+            "do not hide ambiguous target inputs"
+        );
+        assert_eq!(analysis.fields[0].mutation_inputs.len(), 3);
+    }
 
     #[test]
     fn comment_command_is_reconstructed_from_a_closed_shape_not_arbitrary_graphql() {
