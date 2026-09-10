@@ -287,7 +287,7 @@ mod tests {
     async fn management_port_is_denied_before_http_forwarding_or_connect() {
         let dir = std::env::temp_dir().join(format!("fz-ui-gate-{}", uuid::Uuid::new_v4()));
         let state = AppState::default();
-        state.add_container("guest");
+        state.add_container("guest").unwrap();
         let settings = crate::settings::Settings::load(&dir).unwrap();
         let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081);
         let peer = "10.0.0.2:12345".parse().unwrap();
@@ -359,7 +359,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fz-ui-isolation-{}", uuid::Uuid::new_v4()));
         let files = crate::ca::AuthorityFiles::load_or_create(&dir).unwrap();
         let state = AppState::default();
-        state.add_container("guest");
+        state.add_container("guest").unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
         let observed = hits.clone();
         let ui_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -487,7 +487,7 @@ mod tests {
                 .unwrap()
                 .contains("awaiting approval")
         );
-        state.approve_container("guest", true);
+        state.approve_container("guest", true).unwrap();
         let connect = handler
             .handle_from_peer(peer, request("CONNECT", "github.com:443", Some("guest")))
             .await;
@@ -520,7 +520,7 @@ mod tests {
             ),
             StatusCode::FORBIDDEN
         );
-        state.set_killed("guest".into(), true);
+        state.set_killed("guest".into(), true).unwrap();
         assert_eq!(
             status(
                 intercepted
@@ -529,7 +529,7 @@ mod tests {
             ),
             StatusCode::FORBIDDEN
         );
-        state.set_killed("guest".into(), false);
+        state.set_killed("guest".into(), false).unwrap();
         let mut fresh = EventHandler::new(state.clone(), handler.settings.clone(), 8081);
         assert_eq!(
             status(
@@ -560,7 +560,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fz-mitm-{}", uuid::Uuid::new_v4()));
         let files = crate::ca::AuthorityFiles::load_or_create(&dir).unwrap();
         let state = AppState::default();
-        state.add_container("guest");
+        state.add_container("guest").unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let proxy = Proxy::builder()

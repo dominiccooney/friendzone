@@ -39,6 +39,15 @@ Open <http://127.0.0.1:8081>.
   Inbox as "awaiting approval"; click **Approve + pin IP** to admit it
   and lock the name to its address. Unknown containers are denied until
   approved.
+- **Overview and restarts:** "Approved" means permitted to use the network,
+  not "working" or "online". The last traffic timestamp is separate and is
+  reset on broker restart. Inbox/Log/Settings selection survives browser
+  reloads. Host approval/pin/kill/remove actions are saved in `containers.json`
+  under the broker data directory; reuse that directory when restarting.
+  Old in-memory approvals require one new approval after upgrading. Pending
+  unreviewed joins are not saved and reappear when the guest reconnects.
+  A save error leaves the previous policy in effect and appears in the Inbox;
+  do not assume a failed Kill succeeded. Invalid saved policy stops startup.
 - **Settings → Escrowed credentials** — pick a provider preset
   (Anthropic, Cline, GitHub, or Custom…), paste the real key in the one
   masked field, click Add. Hosts/header/env-var are prefilled by the

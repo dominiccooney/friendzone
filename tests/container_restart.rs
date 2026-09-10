@@ -1,0 +1,283 @@
+//! Exercise durable approvals through the binary and real management/proxy
+//! listeners. Uses isolated ports and data, never the running user's broker.
+use std::{path::PathBuf, process::Stdio, time::Duration};
+
+use serde_json::{Value, json};
+
+struct TempDir(PathBuf);
+impl TempDir {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("fz-restart-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct Broker {
+    child: tokio::process::Child,
+    ui: String,
+    bootstrap: String,
+    proxy: String,
+    client: reqwest::Client,
+}
+impl Broker {
+    async fn start(dir: &TempDir) -> Self {
+        let mut listeners = Vec::new();
+        for _ in 0..3 {
+            listeners.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+        }
+        let addresses: Vec<_> = listeners
+            .iter()
+            .map(|l| l.local_addr().unwrap().to_string())
+            .collect();
+        drop(listeners);
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_fz"));
+        command
+            .args([
+                "broker",
+                "--proxy-addr",
+                &addresses[0],
+                "--ui-addr",
+                &addresses[1],
+                "--bootstrap-addr",
+                &addresses[2],
+                "--data-dir",
+            ])
+            .arg(&dir.0)
+            .kill_on_drop(true)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for name in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            command.env_remove(name);
+        }
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let mut broker = Self {
+            child: command.spawn().unwrap(),
+            client,
+            proxy: format!("http://{}", addresses[0]),
+            ui: format!("http://{}", addresses[1]),
+            bootstrap: format!("http://{}", addresses[2]),
+        };
+        for _ in 0..100 {
+            assert!(
+                broker.child.try_wait().unwrap().is_none(),
+                "temporary broker exited during startup"
+            );
+            if broker
+                .client
+                .get(format!("{}/health", broker.ui))
+                .send()
+                .await
+                .is_ok()
+                && broker
+                    .client
+                    .get(format!("{}/health", broker.bootstrap))
+                    .send()
+                    .await
+                    .is_ok()
+            {
+                return broker;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("temporary broker did not become ready");
+    }
+    async fn stop(mut self) {
+        self.child.kill().await.unwrap();
+        self.child.wait().await.unwrap();
+    }
+    async fn post(&self, path: &str, body: Value) -> reqwest::Response {
+        self.client
+            .post(format!("{}{path}", self.ui))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    }
+    async fn snapshot(&self) -> Value {
+        self.client
+            .get(format!("{}/api/state", self.ui))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+    async fn announce(&self, name: &str) {
+        self.client
+            .get(format!("{}/bootstrap/hello", self.bootstrap))
+            .query(&[("container", name)])
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+    async fn proxy_request(&self, name: &str) -> reqwest::Response {
+        let client = reqwest::Client::builder()
+            .proxy(
+                reqwest::Proxy::all(&self.proxy)
+                    .unwrap()
+                    .basic_auth(name, "x"),
+            )
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        // Allowed request reaches only this fixture's bootstrap health endpoint.
+        client
+            .get(format!("{}/health", self.bootstrap))
+            .send()
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn approvals_pins_kills_removals_and_http_save_errors_survive_restart() {
+    let dir = TempDir::new();
+    let broker = Broker::start(&dir).await;
+    broker.announce("pinned").await;
+    assert!(
+        broker
+            .post(
+                "/api/containers/pinned/approve",
+                json!({"pin_to_last_ip":true})
+            )
+            .await
+            .status()
+            .is_success()
+    );
+    assert!(
+        broker
+            .post("/api/containers", json!({"name":"killed"}))
+            .await
+            .status()
+            .is_success()
+    );
+    assert!(
+        broker
+            .post("/api/containers/killed/kill", json!({"killed":true}))
+            .await
+            .status()
+            .is_success()
+    );
+    broker.announce("wrong-ip").await;
+    assert!(
+        broker
+            .post(
+                "/api/containers/wrong-ip/approve",
+                json!({"pin_to_last_ip":true})
+            )
+            .await
+            .status()
+            .is_success()
+    );
+    assert!(
+        broker
+            .post("/api/containers/wrong-ip/pin", json!({"ip":"192.0.2.123"}))
+            .await
+            .status()
+            .is_success()
+    );
+    broker.announce("pending").await;
+    assert!(broker.proxy_request("pinned").await.status().is_success());
+    broker.stop().await; // kill rather than graceful shutdown: each mutation must already be durable
+
+    let broker = Broker::start(&dir).await;
+    let view = broker.snapshot().await;
+    let containers = view["containers"].as_array().unwrap();
+    assert_eq!(containers.len(), 3);
+    assert!(containers.iter().all(|c| c["last_activity"].is_null()));
+    let pinned = containers.iter().find(|c| c["id"] == "pinned").unwrap();
+    assert_eq!(pinned["state"], "approved");
+    assert_eq!(pinned["pinned_ip"], "127.0.0.1");
+    assert!(broker.proxy_request("pinned").await.status().is_success());
+    let denied = broker.proxy_request("wrong-ip").await;
+    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+    assert!(denied.text().await.unwrap().contains("different address"));
+    assert_eq!(
+        broker.proxy_request("killed").await.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        broker.proxy_request("pending").await.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+
+    // Make persistence fail. API must return failure and not resume/approve.
+    let policy_path = dir.0.join("containers.json");
+    let policy = std::fs::read(&policy_path).unwrap();
+    std::fs::remove_file(&policy_path).unwrap();
+    std::fs::create_dir(&policy_path).unwrap();
+    let failed = broker
+        .post("/api/containers/killed/kill", json!({"killed":false}))
+        .await;
+    assert_eq!(failed.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(failed.text().await.unwrap().contains("not applied"));
+    assert_eq!(
+        broker
+            .post(
+                "/api/containers/pending/approve",
+                json!({"pin_to_last_ip":false})
+            )
+            .await
+            .status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        broker.proxy_request("killed").await.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        broker.proxy_request("pending").await.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    std::fs::remove_dir(&policy_path).unwrap();
+    std::fs::write(&policy_path, policy).unwrap();
+
+    assert!(
+        broker
+            .post("/api/containers/killed/kill", json!({"killed":false}))
+            .await
+            .status()
+            .is_success()
+    );
+    assert!(
+        broker
+            .client
+            .delete(format!("{}/api/containers/pinned", broker.ui))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    broker.stop().await;
+    let broker = Broker::start(&dir).await;
+    assert!(broker.proxy_request("killed").await.status().is_success());
+    assert_eq!(
+        broker.proxy_request("pinned").await.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "removed approval must not return after restart"
+    );
+    broker.stop().await;
+}

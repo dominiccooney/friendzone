@@ -19,7 +19,7 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
   const forward = { name, url: "https://mcp.linear.app/mcp", tools: ["list_issues"],
     guests: ["scratch-kali"], auth: "oauth", guest_endpoint: endpoint };
   const state = { containers: [{ id: "scratch-kali", name: "scratch-kali", approved: true,
-    state: "working", request_count: 0, last_activity: new Date().toISOString(), pinned_ip: null }], requests: [] };
+    state: "approved", request_count: 0, last_activity: null, pinned_ip: null }], requests: [] };
   const server = http.createServer((request, response) => {
     const route = request.url.split("?")[0];
     if (route === "/api/events") {
@@ -105,6 +105,22 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     }
     await evaluate("Object.defineProperty(navigator, 'clipboard', {value:{writeText:async text=>{window.copiedEndpoint=text}}, configurable:true}); document.querySelector('[data-mcp-copy-url]').click()");
     assert.equal(await evaluate("window.copiedEndpoint"), endpoint);
+    for (const tab of ["log", "inbox", "settings"]) {
+      await evaluate(`document.querySelector('[data-view=${tab}]').click()`);
+      assert.equal(await evaluate("localStorage.getItem('fz-active-view')"), tab);
+      await evaluate("document.documentElement.dataset.beforeReload='yes'");
+      await send("Page.reload");
+      for (let i=0;i<100;i++) {
+        if (await evaluate(`!document.documentElement.dataset.beforeReload && document.querySelector('.view.active')?.id === '${tab}-view' && !!document.querySelector('[data-view=${tab}]')?.onclick`)) break;
+        await delay(25);
+      }
+      assert.equal(await evaluate("document.querySelector('.view.active').id"), `${tab}-view`);
+      if (tab === "inbox") {
+        for (let i=0;i<100 && !await evaluate("!!document.querySelector('.container')");i++) await delay(25);
+        assert.equal(await evaluate("document.querySelector('.container .state').textContent"), "Approved");
+        assert.match(await evaluate("document.querySelector('.container .meta').textContent"), /No guest traffic observed/);
+      }
+    }
     assert.deepEqual(errors, []);
   } finally {
     socket?.close(); browser.kill();

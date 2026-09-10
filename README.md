@@ -45,6 +45,29 @@ pre-approves a name (wildcard address) before its VM boots. Kill/Resume
 stops traffic reversibly; Remove forgets the container (its log rows
 remain for audit).
 
+The overview reports **Approved**, **Awaiting approval**, or **Killed**.
+These describe network authorization, not whether an agent is working, idle,
+or online. Last observed guest traffic is shown separately; administrative
+actions do not count as traffic. The selected Inbox/Log/Settings tab is
+remembered in this browser for the same UI origin.
+
+Approvals, IP pins, and kill state are saved atomically in `containers.json`
+in the broker data directory and restored on startup. Removal is persisted
+too. Failed writes return an error and leave the previous policy in effect;
+if Kill cannot be saved, stop the guest externally rather than assuming it
+was killed. A malformed/unsupported policy file stops startup instead of
+silently resetting permissions. Run only one broker per data directory and
+keep that directory inaccessible to guests.
+
+Unreviewed join requests, logs, request counts, and traffic timestamps are
+not persisted. After restart, an approved guest may correctly show **No guest
+traffic observed this broker session** until it contacts the broker. Restored
+IP pins are never automatically changed to match a new address.
+
+**First upgrade:** previous builds held approvals only in memory. They need
+to be approved once in this version before later restarts can restore them;
+changing the data directory also starts a separate policy store.
+
 ## Set up a guest
 
 The broker exposes its own binary at `http://HOST_IP:8082/bootstrap/fz`

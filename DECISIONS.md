@@ -200,6 +200,13 @@ line. The header is the dashboard: live/killed, doctor state, ruleset,
 agent dots, working/waiting/idle, kill switch. At inbox zero the surface
 is just headers.
 
+Current implementation has no trustworthy agent busy/idle signal: it shows
+authorization state (Approved / Awaiting approval / Killed) and last observed
+guest traffic instead. Approval is not evidence of work. Browser tab choice
+persists locally; host policy (approval, IP pin, kill state, removal) persists
+atomically in the broker data directory, separately from session-local logs
+and activity. A failed policy save does not publish a change.
+
 **Cards.** One line: agent dot, verb + object ("Post comment"), target
 ("cline/cline #1234"), age, flag glyph (scan hit, taint, or floor rule).
 Container omitted — the section says that. Subjects scan; bodies read.

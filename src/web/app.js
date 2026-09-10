@@ -1,7 +1,7 @@
 const $ = (s) => document.querySelector(s);
 let snapshot = { containers: [], requests: [] };
 let logRows = [], logCursor = null, logPaused = false, logGeneration = 0, logTimer;
-let order = JSON.parse(localStorage.getItem("fz-order") || "[]");
+let order = readStoredOrder();
 let mcpConnectData = null, mcpHostInitialized = false, mcpConnectGeneration = 0, mcpGuestSignature = "";
 const mcpOAuthPolls = new Map();
 let reviewingMcp = null;
@@ -9,12 +9,39 @@ let activeMcpOAuth = null;
 
 function esc(value) { return String(value).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;"); }
 function displayTime(value) { return new Date(value).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"}); }
+function readStoredValue(key) { try { return localStorage.getItem(key); } catch { return null; } }
+function storeValue(key, value) { try { localStorage.setItem(key, value); } catch { /* Private/restricted browsers still work without persistence. */ } }
+function readStoredOrder() {
+  try { const value = JSON.parse(readStoredValue("fz-order") || "[]"); return Array.isArray(value) ? value.filter(v=>typeof v==="string") : []; } catch { return []; }
+}
+function containerStatus(container) {
+  return container.state === "killed" ? "Killed" : container.approved ? "Approved" : "Awaiting approval";
+}
+function containerTraffic(container) {
+  return container.last_activity ? `Last guest traffic: ${new Date(container.last_activity).toLocaleString()}` : "No guest traffic observed this broker session";
+}
 function ordered(containers) { return [...containers].sort((a,b) => { const ai=order.indexOf(a.id),bi=order.indexOf(b.id); if(ai<0&&bi<0)return 0;if(ai<0)return 1;if(bi<0)return-1;return ai-bi; }); }
 
 async function setKilled(id, killed) {
   const response = await fetch(`/api/containers/${encodeURIComponent(id)}/kill`, {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({killed})});
-  if (!response.ok) throw new Error(`Kill request failed: ${response.status}`);
+  if (!response.ok) throw rejectedContainerChange(await response.text());
   await refresh();
+}
+
+function rejectedContainerChange(message) { const error = new Error(message); error.policyUnchanged = true; return error; }
+function showContainerError(error) {
+  $("#container-error").textContent = error.policyUnchanged
+    ? `Change not applied: ${error.message}. Existing policy remains in effect.`
+    : `Could not confirm the change: ${error.message || error}. Refresh to check the actual policy; do not assume Kill or approval succeeded.`;
+}
+async function changeContainerPolicy(url, options) {
+  $("#container-error").textContent = "";
+  try {
+    const response = await fetch(url, options);
+    if (!response.ok) throw rejectedContainerChange(await response.text());
+    await refresh();
+    return true;
+  } catch (error) { showContainerError(error); return false; }
 }
 
 function renderContainers() {
@@ -23,38 +50,33 @@ function renderContainers() {
   if (!snapshot.containers.length) { root.append($("#empty-template").content.cloneNode(true)); return; }
   for (const c of ordered(snapshot.containers)) {
     const killed = c.state === "killed";
-    const pending = c.state === "pending";
+    const pending = !killed && !c.approved;
     const section = document.createElement("section");
     section.className = "container"; section.draggable = true; section.dataset.id = c.id;
     const pin = c.pinned_ip ? (c.pinned_ip.startsWith("~") ? `last seen ${esc(c.pinned_ip.slice(1))}, not pinned` : `pinned to ${esc(c.pinned_ip)}`) : "any address";
     const actions = pending
       ? `<span class="state killed">awaiting approval</span><button class="approve">Approve</button><button class="approve-pin">Approve + pin IP</button><button class="quiet remove">Deny</button>`
-      : `<span class="state ${killed?"killed":"working"}">${killed?"killed":"working"}</span><button class="stop ${killed?"resume":""}">${killed?"Resume":"Kill"}</button><button class="quiet pin-edit">Pin…</button><button class="quiet remove">Remove</button>`;
-    section.innerHTML = `<div class="container-head"><span class="status-dot ${killed||pending?"":"live"}" style="${killed||pending?"background:#999":""}"></span><div><div class="container-name">${esc(c.name)}</div><div class="meta">${c.request_count} requests · last traffic ${displayTime(c.last_activity)} · ${pin}</div></div><div class="actions">${actions}</div></div><div class="container-body">${pending?"This container asked to join (first traffic or fz setup). Approving lets its requests through.":"No decisions waiting"}</div>`;
-    section.querySelector(".stop")?.addEventListener("click", () => setKilled(c.id, !killed).catch(console.error));
+      : `<span class="state ${killed?"killed":"approved"}" title="Network authorization, not agent activity">${containerStatus(c)}</span><button class="stop ${killed?"resume":""}">${killed?"Resume":"Kill"}</button><button class="quiet pin-edit">Pin…</button><button class="quiet remove">Remove</button>`;
+    section.innerHTML = `<div class="container-head"><span class="status-dot" style="background:${killed?"var(--red)":"#999"}" title="${esc(containerStatus(c))}; agent activity is not monitored"></span><div><div class="container-name">${esc(c.name)}</div><div class="meta">${c.request_count} retained requests · ${esc(containerTraffic(c))} · ${pin}</div></div><div class="actions">${actions}</div></div><div class="container-body">${pending?"This container asked to join. Approving permits network requests; it does not mean the agent is running.":"Agent activity is not monitored. Approval does not mean the container is busy or even online."}</div>`;
+    section.querySelector(".stop")?.addEventListener("click", () => {$("#container-error").textContent="";return setKilled(c.id, !killed).catch(showContainerError);});
     section.querySelector(".approve")?.addEventListener("click", async () => {
-      await fetch(`/api/containers/${encodeURIComponent(c.id)}/approve`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pin_to_last_ip:false})});
-      refresh();
+      await changeContainerPolicy(`/api/containers/${encodeURIComponent(c.id)}/approve`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pin_to_last_ip:false})});
     });
     section.querySelector(".approve-pin")?.addEventListener("click", async () => {
-      await fetch(`/api/containers/${encodeURIComponent(c.id)}/approve`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pin_to_last_ip:true})});
-      refresh();
+      await changeContainerPolicy(`/api/containers/${encodeURIComponent(c.id)}/approve`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pin_to_last_ip:true})});
     });
     section.querySelector(".pin-edit")?.addEventListener("click", async () => {
       const current = c.pinned_ip && !c.pinned_ip.startsWith("~") ? c.pinned_ip : "";
       const ip = prompt(`Pin '${c.name}' to an IP (empty = any address):`, current);
       if (ip === null) return;
-      const r = await fetch(`/api/containers/${encodeURIComponent(c.id)}/pin`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({ip:ip||null})});
-      if (!r.ok) alert(await r.text());
-      refresh();
+      await changeContainerPolicy(`/api/containers/${encodeURIComponent(c.id)}/pin`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({ip:ip||null})});
     });
     section.querySelector(".remove").onclick = async () => {
       if (!confirm(`Remove container '${c.name}'? Kill it first if it is still running.`)) return;
-      await fetch(`/api/containers/${encodeURIComponent(c.id)}`, {method:"DELETE"});
-      refresh();
+      await changeContainerPolicy(`/api/containers/${encodeURIComponent(c.id)}`, {method:"DELETE"});
     };
     section.addEventListener("dragstart", () => section.classList.add("dragging"));
-    section.addEventListener("dragend", () => { section.classList.remove("dragging"); order=[...root.querySelectorAll(".container")].map(n=>n.dataset.id);localStorage.setItem("fz-order",JSON.stringify(order)); });
+    section.addEventListener("dragend", () => { section.classList.remove("dragging"); order=[...root.querySelectorAll(".container")].map(n=>n.dataset.id);storeValue("fz-order",JSON.stringify(order)); });
     root.append(section);
   }
   root.ondragover = e => { e.preventDefault(); const active=root.querySelector(".dragging");if(!active)return;const next=[...root.querySelectorAll(".container:not(.dragging)")].find(n=>e.clientY<n.getBoundingClientRect().top+n.offsetHeight/2);root.insertBefore(active,next||null); };
@@ -515,9 +537,7 @@ $("#mcp-add").onclick = async () => {
 
 $("#add-container").onsubmit = async (e) => {
   e.preventDefault();
-  const r = await fetch("/api/containers",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name:$("#new-container-name").value})});
-  if (!r.ok) { alert(await r.text()); return; }
-  e.target.reset(); refresh();
+  if (await changeContainerPolicy("/api/containers",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name:$("#new-container-name").value})})) e.target.reset();
 };
 
 let editingEntry = null;
@@ -545,7 +565,19 @@ $("#escrow-form").onsubmit = async (e) => {
   e.target.reset(); $("#e-hint").textContent = ""; renderSettings();
 };
 
-document.querySelectorAll(".nav").forEach(button=>button.onclick=()=>{document.querySelectorAll(".nav,.view").forEach(n=>n.classList.remove("active"));button.classList.add("active");$(`#${button.dataset.view}-view`).classList.add("active");if(button.dataset.view==="settings")renderSettings().catch(console.error);});
+function selectView(view) {
+  const selected = ["inbox", "log", "settings"].includes(view) ? view : "inbox";
+  document.querySelectorAll(".nav").forEach(button=>{
+    const active = button.dataset.view === selected;
+    button.classList.toggle("active", active);
+    if (active) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
+  });
+  document.querySelectorAll(".view").forEach(section=>section.classList.toggle("active", section.id === `${selected}-view`));
+  storeValue("fz-active-view", selected);
+  if (selected === "settings") renderSettings().catch(console.error);
+  if (selected === "log") loadLog();
+}
+document.querySelectorAll(".nav").forEach(button=>button.onclick=()=>selectView(button.dataset.view));
 $("#refresh").onclick=refresh; ["#search","#container-filter","#verdict-filter"].forEach(s=>$(s).addEventListener("input",()=>{logPaused=false;loadLog();}));
 
 // Live updates over SSE: the broker pushes a full snapshot on every
@@ -555,3 +587,4 @@ refresh();
 const events = new EventSource("/api/events");
 events.onmessage = (e) => { snapshot = JSON.parse(e.data); renderContainers(); scheduleLog(); };
 events.onerror = () => setTimeout(refresh, 3000); // bridge reconnect gaps
+selectView(readStoredValue("fz-active-view"));

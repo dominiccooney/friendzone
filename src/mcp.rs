@@ -619,7 +619,7 @@ mod tests {
         let app = AppState::default();
         let ip = "127.0.0.1".parse().unwrap();
         app.authorize("guest", ip);
-        app.approve_container("guest", true);
+        app.approve_container("guest", true).unwrap();
         let state = McpState::new(app, registry.clone());
         let init = json!({"jsonrpc":"2.0", "id":1, "method":"initialize"});
         assert!(
@@ -717,7 +717,7 @@ mod tests {
             }])
             .unwrap();
         let app = AppState::default();
-        app.add_container("guest");
+        app.add_container("guest").unwrap();
         let state = McpState::new(app, registry);
         let list = json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"});
         let response = handle_message(

@@ -297,6 +297,14 @@ shared broker just to test this without scheduling the interruption.
 - Keep an offline clean snapshot and host-side backup. Roll back **while the
   VM is shut down or its NIC is disconnected**, never by auto-opening egress
   on a timer while an agent may be running.
+- Include the broker's `containers.json` in the host policy backup. Approval,
+  explicit IP pins, kill state and removals survive restart; observed traffic
+  and pending unreviewed joins do not. Restore/repair malformed policy while
+  the broker is stopped rather than deleting it and guessing the previous
+  restrictions. Never copy this writable policy into a guest. A restart does
+  not repin a moved guest or resume a killed guest. If a policy write fails,
+  the API reports failure and the old policy remains; use host VM controls to
+  stop the guest if Kill cannot be saved.
 - A temporary unrestricted build/update session belongs in a fresh trusted
   clone, without real keys or hostile workloads. Seal and re-test that image
   before using it as an agent guest.

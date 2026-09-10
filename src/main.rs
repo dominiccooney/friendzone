@@ -111,7 +111,7 @@ async fn run_broker(
     validate_listeners(proxy_addr, ui_addr, bootstrap_addr)?;
     let files = AuthorityFiles::load_or_create(&data_dir)?;
     let issuer = files.issuer()?;
-    let state = AppState::default();
+    let state = AppState::load(&data_dir)?;
     let settings = settings::Settings::load(&data_dir)?;
     let registry = mcp::ForwardRegistry::load(&data_dir, settings.clone())?;
     let forwards = registry.configs();

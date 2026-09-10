@@ -884,15 +884,16 @@ async fn add_container(
         )
             .into_response();
     }
-    state.app.add_container(&name);
-    StatusCode::CREATED.into_response()
+    container_policy_response(state.app.add_container(&name), StatusCode::CREATED)
 }
 
 /// Unregisters a container. Log rows remain for audit; a reconnecting
 /// guest re-appears as a new container.
-async fn remove_container(State(state): State<UiState>, Path(id): Path<String>) -> StatusCode {
-    state.app.remove_container(&id);
-    StatusCode::NO_CONTENT
+async fn remove_container(
+    State(state): State<UiState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    container_policy_response(state.app.remove_container(&id), StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
@@ -907,9 +908,11 @@ async fn approve_container(
     State(state): State<UiState>,
     Path(id): Path<String>,
     Json(request): Json<ApproveRequest>,
-) -> StatusCode {
-    state.app.approve_container(&id, request.pin_to_last_ip);
-    StatusCode::NO_CONTENT
+) -> impl IntoResponse {
+    container_policy_response(
+        state.app.approve_container(&id, request.pin_to_last_ip),
+        StatusCode::NO_CONTENT,
+    )
 }
 
 #[derive(Deserialize)]
@@ -925,14 +928,13 @@ async fn set_container_pin(
 ) -> impl IntoResponse {
     match request.ip.filter(|ip| !ip.trim().is_empty()) {
         None => {
-            state.app.set_pinned_ip(&id, None);
-            StatusCode::NO_CONTENT.into_response()
+            container_policy_response(state.app.set_pinned_ip(&id, None), StatusCode::NO_CONTENT)
         }
         Some(text) => match text.trim().parse() {
-            Ok(ip) => {
-                state.app.set_pinned_ip(&id, Some(ip));
-                StatusCode::NO_CONTENT.into_response()
-            }
+            Ok(ip) => container_policy_response(
+                state.app.set_pinned_ip(&id, Some(ip)),
+                StatusCode::NO_CONTENT,
+            ),
             Err(_) => (StatusCode::UNPROCESSABLE_ENTITY, "not an IP address").into_response(),
         },
     }
@@ -947,9 +949,18 @@ async fn set_killed(
     State(state): State<UiState>,
     Path(id): Path<String>,
     Json(request): Json<KillRequest>,
-) -> StatusCode {
-    state.app.set_killed(id, request.killed);
-    StatusCode::NO_CONTENT
+) -> impl IntoResponse {
+    container_policy_response(
+        state.app.set_killed(id, request.killed),
+        StatusCode::NO_CONTENT,
+    )
+}
+
+fn container_policy_response(result: Result<()>, success: StatusCode) -> axum::response::Response {
+    match result {
+        Ok(()) => success.into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")).into_response(),
+    }
 }
 
 /// What this broker can bootstrap: the host binary's platform plus any
@@ -1120,7 +1131,7 @@ mod tests {
             )
             .unwrap();
         let app = AppState::default();
-        app.add_container("scratch-kali");
+        app.add_container("scratch-kali").unwrap();
         let oauth = crate::mcp_oauth::OauthFlows::default();
         let forward = registry.get("Linear").unwrap();
         let url = oauth
@@ -1318,7 +1329,7 @@ mod tests {
         let app = AppState::default();
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         app.authorize("guest", peer.ip());
-        app.approve_container("guest", true);
+        app.approve_container("guest", true).unwrap();
         let ui = ui_router(UiState {
             app: app.clone(),
             settings: settings.clone(),
@@ -1497,9 +1508,9 @@ mod tests {
             crate::mcp::ForwardRegistry::load(settings.data_dir(), settings.clone()).unwrap();
         let app = AppState::default();
         app.authorize("scratch-kali", "10.0.0.2".parse().unwrap());
-        app.set_killed("scratch-kali".into(), true);
-        app.add_container("guest-ü");
-        app.add_container("bad:name");
+        app.set_killed("scratch-kali".into(), true).unwrap();
+        app.add_container("guest-ü").unwrap();
+        app.add_container("bad:name").unwrap();
         let config: Vec<crate::mcp::ForwardConfig> = serde_json::from_value(serde_json::json!([
             {"name":"linear", "url":"https://upstream.invalid/mcp", "tools":["read"], "guests":[]},
             {"name":"github", "url":"https://other.invalid/mcp", "tools":[], "guests":null}

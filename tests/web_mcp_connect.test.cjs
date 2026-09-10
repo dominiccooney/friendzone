@@ -9,7 +9,7 @@ const web = path.join(__dirname, "../src/web");
 const html = fs.readFileSync(path.join(web, "index.html"), "utf8");
 const script = fs.readFileSync(path.join(web, "app.js"), "utf8");
 
-function fixture() {
+function fixture({storage = new Map(), storageUnavailable = false} = {}) {
   // Only model the DOM APIs used by the connection panel. IDs come from
   // the shipped HTML so missing/mismatched element wiring fails the test.
   const elements = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map(([, id]) => ["#" + id, {
@@ -21,6 +21,15 @@ function fixture() {
   }]));
   const calls = [];
   const timers = [];
+  const classList = () => {
+    const classes = new Set();
+    return {toggle(name, enabled){if(enabled)classes.add(name);else classes.delete(name);}, contains(name){return classes.has(name);}};
+  };
+  const nav = ["inbox", "log", "settings"].map(view => ({
+    dataset:{view}, classList:classList(), attributes:{},
+    setAttribute(name,value){this.attributes[name]=value;}, removeAttribute(name){delete this.attributes[name];},
+  }));
+  const views = ["inbox", "log", "settings"].map(view => ({id:`${view}-view`, classList:classList()}));
   let copyButtons = [];
   const sandbox = {
     document: {
@@ -29,6 +38,8 @@ function fixture() {
         return elements.get(selector);
       },
       querySelectorAll(selector) {
+        if (selector === ".nav") return nav;
+        if (selector === ".view") return views;
         if (selector !== "[data-mcp-copy-url]") return [];
         // Model row-level controls from the real rendered markup so tests
         // exercise both button wiring and choosing the guest (not upstream) URL.
@@ -42,7 +53,10 @@ function fixture() {
         return copyButtons;
       },
     },
-    localStorage: { getItem() { return null; } },
+    localStorage: {
+      getItem(key) { if(storageUnavailable)throw new Error("storage blocked");return storage.get(key) ?? null; },
+      setItem(key,value) { if(storageUnavailable)throw new Error("storage blocked");storage.set(key,value); },
+    },
     EventSource: class {},
     window: {addEventListener(){}}, navigator: {}, URL, URLSearchParams, console,
     setTimeout(callback) { const timer = {callback, cancelled:false}; timers.push(timer); return timer; },
@@ -73,8 +87,62 @@ function fixture() {
       }}}},
     }),
   });
-  return {run, element, sandbox, calls, seed, reply, timers, copyButtons:()=>copyButtons};
+  return {run, element, sandbox, calls, seed, reply, timers, nav, views, storage, copyButtons:()=>copyButtons};
 }
+
+test("selected inbox/log/settings tab survives reload and loads its view", () => {
+  for (const selected of ["inbox", "log", "settings"]) {
+    const storage = new Map();
+    const original = fixture({storage});
+    original.nav.find(n=>n.dataset.view===selected).onclick();
+    assert.equal(storage.get("fz-active-view"), selected);
+    const reloaded = fixture({storage});
+    assert.equal(reloaded.nav.find(n=>n.classList.contains("active")).dataset.view, selected);
+    assert.equal(reloaded.views.find(n=>n.classList.contains("active")).id, `${selected}-view`);
+    assert.equal(reloaded.nav.find(n=>n.dataset.view===selected).attributes["aria-current"], "page");
+    if(selected==="settings") assert.ok(reloaded.calls.some(c=>c.url==="/api/mcp"));
+    if(selected==="log") assert.ok(reloaded.calls.some(c=>c.url.startsWith("/api/log?")));
+  }
+});
+
+test("invalid or unavailable browser storage cannot break navigation", () => {
+  const invalid = fixture({storage:new Map([["fz-active-view", "not-a-tab"],["fz-order", "{"]])});
+  assert.equal(invalid.nav.find(n=>n.classList.contains("active")).dataset.view, "inbox");
+  assert.equal(invalid.run("order.length"), 0);
+  const blocked = fixture({storageUnavailable:true});
+  assert.equal(blocked.nav.find(n=>n.classList.contains("active")).dataset.view, "inbox");
+  blocked.nav.find(n=>n.dataset.view==="settings").onclick();
+  assert.equal(blocked.views.find(n=>n.classList.contains("active")).id, "settings-view");
+});
+
+test("container status reports permission, never guesses working or idle", () => {
+  const f=fixture();
+  assert.equal(f.run('containerStatus({approved:true,state:"approved"})'), "Approved");
+  assert.equal(f.run('containerStatus({approved:true,state:"working"})'), "Approved", "old broker's state must not restore misleading wording");
+  assert.equal(f.run('containerStatus({approved:false,state:"pending"})'), "Awaiting approval");
+  assert.equal(f.run('containerStatus({approved:true,state:"killed"})'), "Killed");
+  assert.match(f.run('containerTraffic({last_activity:null})'), /No guest traffic observed/);
+  assert.match(f.run('containerTraffic({last_activity:"2026-09-09T01:00:00Z"})'), /Last guest traffic:/);
+});
+
+test("failed policy API change is visible and not reported as saved", async () => {
+  const f=fixture();
+  const change=f.run('changeContainerPolicy("/api/containers/guest/approve", {method:"POST"})');
+  f.calls.at(-1).resolve({ok:false,text:async()=>"container policy change was not applied: disk full"});
+  await change;
+  assert.match(f.sandbox.document.querySelector("#container-error").textContent,/Change not applied:.*disk full/);
+  assert.match(f.sandbox.document.querySelector("#container-error").textContent,/Existing policy remains in effect/);
+});
+
+test("a lost policy response is reported as unconfirmed rather than unchanged", async () => {
+  const f=fixture();
+  f.sandbox.fetch=async()=>{throw new Error("network disconnected");};
+  await f.run('changeContainerPolicy("/api/containers/guest/kill", {method:"POST"})');
+  const text=f.sandbox.document.querySelector("#container-error").textContent;
+  assert.match(text,/Could not confirm.*network disconnected/);
+  assert.match(text,/Refresh to check the actual policy/);
+  assert.doesNotMatch(text,/Existing policy remains/);
+});
 
 async function resolveSettings(f, forwards = []) {
   await new Promise(setImmediate);
@@ -219,7 +287,7 @@ test("selection defaults, empty state, and guest refresh preserve user choices",
   assert.equal(f.element("connect-forward").value, "linear");
   f.element("connect-host").value = "my-broker.local";
   f.element("connect-guest").value = "scratch-kali";
-  f.run('snapshot.containers = [{id:"scratch-kali",name:"scratch-kali",approved:true,state:"working"}]; updateMcpConnectionGuests()');
+  f.run('snapshot.containers = [{id:"scratch-kali",name:"scratch-kali",approved:true,state:"approved"}]; updateMcpConnectionGuests()');
   assert.equal(f.element("connect-guest").value, "scratch-kali");
   assert.equal(f.element("connect-host").value, "my-broker.local");
   f.run('fillMcpConnectSelect("#mcp-connect-forward", [], "Select"); loadMcpConnection()');
