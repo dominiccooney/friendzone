@@ -9,6 +9,7 @@ mod oauth;
 mod policy;
 mod proxy;
 mod proxy_server;
+mod review;
 mod settings;
 mod setup;
 mod state;

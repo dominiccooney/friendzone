@@ -9,7 +9,7 @@ const web = path.join(__dirname, "../src/web");
 const html = fs.readFileSync(path.join(web, "index.html"), "utf8");
 const script = fs.readFileSync(path.join(web, "app.js"), "utf8");
 
-function fixture({storage = new Map(), storageUnavailable = false} = {}) {
+function fixture({storage = new Map(), storageUnavailable = false, notificationPermission = null, secureContext = true} = {}) {
   // Only model the DOM APIs used by the connection panel. IDs come from
   // the shipped HTML so missing/mismatched element wiring fails the test.
   const elements = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map(([, id]) => ["#" + id, {
@@ -21,6 +21,14 @@ function fixture({storage = new Map(), storageUnavailable = false} = {}) {
   }]));
   const calls = [];
   const timers = [];
+  const notifications = [];
+  let permissionRequests = 0;
+  class Notification {
+    static permission = notificationPermission;
+    static async requestPermission() { permissionRequests++; return this.permission = "granted"; }
+    constructor(title, options) { this.title=title;this.options=options;notifications.push(this); }
+    close() { this.closed=true; }
+  }
   const classList = () => {
     const classes = new Set();
     return {toggle(name, enabled){if(enabled)classes.add(name);else classes.delete(name);}, contains(name){return classes.has(name);}};
@@ -58,13 +66,15 @@ function fixture({storage = new Map(), storageUnavailable = false} = {}) {
       setItem(key,value) { if(storageUnavailable)throw new Error("storage blocked");storage.set(key,value); },
     },
     EventSource: class {},
-    window: {addEventListener(){}}, navigator: {}, URL, URLSearchParams, console,
+    window: {addEventListener(){}, isSecureContext:secureContext, focus(){this.focused=true;}}, navigator: {}, URL, URLSearchParams, console,
+    confirm:()=>true,
     setTimeout(callback) { const timer = {callback, cancelled:false}; timers.push(timer); return timer; },
     clearTimeout(timer) { if (timer) timer.cancelled = true; },
     fetch(url, options) {
       return new Promise(resolve => calls.push({url, options, resolve}));
     },
   };
+  if (notificationPermission !== null) sandbox.Notification = Notification;
   const context = vm.createContext(sandbox);
   vm.runInContext(script, context);
   const run = source => vm.runInContext(source, context);
@@ -87,8 +97,77 @@ function fixture({storage = new Map(), storageUnavailable = false} = {}) {
       }}}},
     }),
   });
-  return {run, element, sandbox, calls, seed, reply, timers, nav, views, storage, copyButtons:()=>copyButtons};
+  return {run, element, sandbox, calls, seed, reply, timers, nav, views, storage, notifications, get permissionRequests(){return permissionRequests;}, copyButtons:()=>copyButtons};
 }
+
+const pendingRequest = {id:"request-id",container:"guest<script>",method:"POST",url:"https://api.github.com/graphql?x=<script>",body_bytes:42,expires_at:"2099-01-01T00:00:00Z",fingerprint:"exact-hash",reason:"Review complete GraphQL payload",headers:[["authorization","[redacted]"]],body:'{"query":"<script>alert(1)</script>","variables":{"id":42}}'};
+
+test("review renders guest payload literally and only submits the loaded fingerprint", async () => {
+  const f=fixture();
+  f.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)}]; renderPendingRequests()`);
+  const markup=f.sandbox.document.querySelector("#pending-requests").innerHTML;
+  assert.ok(markup.includes("guest&lt;script&gt;")); assert.ok(!markup.includes("<script>"));
+  assert.equal(f.sandbox.document.querySelector("#inbox-count").textContent,1);
+  const opening=f.run('openRequestReview("request-id")');
+  f.calls.at(-1).resolve({ok:true,json:async()=>pendingRequest}); await opening;
+  assert.equal(f.sandbox.document.querySelector("#request-review-body").textContent,pendingRequest.body);
+  assert.equal(f.sandbox.document.querySelector("#request-review-body").innerHTML,"");
+  const decision=f.run('decideRequest("approve")');
+  const call=f.calls.at(-1);
+  assert.equal(call.url,"/api/requests/request-id/decision");
+  assert.equal(call.options.headers["x-friendzone-review"],"1");
+  assert.deepEqual(JSON.parse(call.options.body),{fingerprint:"exact-hash",decision:"approve"});
+  call.resolve({ok:false,text:async()=>"already expired"}); await decision;
+  assert.match(f.sandbox.document.querySelector("#request-review-status").textContent,/Could not confirm.*expired/);
+  f.run('snapshot.pending_requests=[]; renderPendingRequests()');
+  assert.equal(f.sandbox.document.querySelector("#request-approve").disabled,true);
+  const count=f.calls.length; await f.run('decideRequest("approve")'); assert.equal(f.calls.length,count);
+});
+
+test("stale asynchronous detail response cannot change the request being reviewed", async () => {
+  const f=fixture();
+  const first=f.run('openRequestReview("old")'); const firstCall=f.calls.at(-1);
+  const second=f.run('openRequestReview("new")'); const secondCall=f.calls.at(-1);
+  secondCall.resolve({ok:true,json:async()=>({...pendingRequest,id:"new",body:"new payload"})}); await second;
+  firstCall.resolve({ok:true,json:async()=>({...pendingRequest,id:"old",body:"old payload"})}); await first;
+  assert.equal(f.run("activeReview.id"),"new");
+  assert.equal(f.sandbox.document.querySelector("#request-review-body").textContent,"new payload");
+});
+
+test("notification permission requires a click; bursts, SSE repeats and reloads are deduplicated", async () => {
+  const storage=new Map(); const f=fixture({storage,notificationPermission:"default"});
+  f.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)}]; renderPendingRequests()`);
+  assert.equal(f.permissionRequests,0); assert.equal(f.notifications.length,0);
+  await f.sandbox.document.querySelector("#enable-notifications").onclick();
+  assert.equal(f.permissionRequests,1);
+  f.run('snapshot.pending_requests.push({...snapshot.pending_requests[0],id:"second"}); renderPendingRequests(); renderPendingRequests()');
+  assert.equal(f.timers.length,1); f.timers[0].callback();
+  assert.equal(f.notifications.length,1); assert.match(f.notifications[0].options.body,/2 new requests/);
+  assert.ok(!JSON.stringify(f.notifications).includes("script"));
+  f.run('renderPendingRequests()'); assert.equal(f.timers.length,1);
+  f.notifications[0].onclick(); assert.equal(f.sandbox.window.focused,true);
+  assert.equal(f.nav.find(n=>n.classList.contains("active")).dataset.view,"inbox");
+  assert.equal(f.notifications[0].closed,true);
+  assert.ok(!f.calls.some(call=>call.url.includes("/decision")));
+  const reload=fixture({storage,notificationPermission:"granted"});
+  reload.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)},{...${JSON.stringify(pendingRequest)},id:"second"}]; renderPendingRequests()`);
+  assert.equal(reload.notifications.length,0); assert.equal(reload.timers.length,0);
+  await reload.sandbox.document.querySelector("#enable-notifications").onclick();
+  assert.equal(storage.get("fz-notifications"),"disabled");
+});
+
+test("unsupported, insecure, denied notifications and disappeared requests leave Inbox usable", () => {
+  for (const options of [{},{notificationPermission:"granted",secureContext:false},{notificationPermission:"denied"}]) {
+    const f=fixture({...options,storage:new Map([["fz-notifications","enabled"]])});
+    f.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)}]; renderPendingRequests()`);
+    assert.equal(f.notifications.length,0); assert.equal(f.permissionRequests,0);
+    assert.ok(f.sandbox.document.querySelector("#notification-status").textContent);
+    assert.match(f.sandbox.document.querySelector("#pending-requests").innerHTML,/Review request/);
+  }
+  const f=fixture({notificationPermission:"granted",storage:new Map([["fz-notifications","enabled"]])});
+  f.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)}]; renderPendingRequests(); snapshot.pending_requests=[]; renderPendingRequests()`);
+  f.timers[0].callback(); assert.equal(f.notifications.length,0);
+});
 
 test("selected inbox/log/settings tab survives reload and loads its view", () => {
   for (const selected of ["inbox", "log", "settings"]) {

@@ -129,6 +129,8 @@ fn ui_router(state: UiState) -> Router {
         .route("/api/state", get(api_state))
         .route("/api/log", get(api_log))
         .route("/api/events", get(state_events))
+        .route("/api/requests/{id}", get(review_request))
+        .route("/api/requests/{id}/decision", post(decide_request))
         .route("/api/containers", post(add_container))
         .route(
             "/api/containers/{id}",
@@ -166,6 +168,24 @@ fn ui_router(state: UiState) -> Router {
             get(cline_oauth_status),
         )
         .route("/health", get(|| async { "ok" }))
+        .layer(axum::middleware::from_fn(
+            |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                let mut response = next.run(request).await;
+                // Host decisions must not be clickjacked inside another site's
+                // frame. No-store also avoids serving a stale review UI on upgrade.
+                response
+                    .headers_mut()
+                    .insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
+                response.headers_mut().insert(
+                    header::CONTENT_SECURITY_POLICY,
+                    "frame-ancestors 'none'".parse().unwrap(),
+                );
+                response
+                    .headers_mut()
+                    .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+                response
+            },
+        ))
         .with_state(state)
 }
 
@@ -818,6 +838,86 @@ async fn api_state(State(state): State<UiState>) -> Json<StateView> {
     Json(state.app.view())
 }
 
+fn local_review_request(state: &UiState, headers: &axum::http::HeaderMap) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(&format!("http://{host}")) else {
+        return false;
+    };
+    let hostname = url
+        .host_str()
+        .unwrap_or("")
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    (hostname.eq_ignore_ascii_case("localhost")
+        || hostname
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()))
+        && url.port_or_known_default() == Some(state.ui_addr.port())
+        && headers
+            .get(header::ORIGIN)
+            .is_none_or(|origin| origin.to_str().ok() == Some(format!("http://{host}").as_str()))
+        && headers
+            .get("sec-fetch-site")
+            .is_none_or(|site| site != "cross-site")
+}
+
+async fn review_request(
+    State(state): State<UiState>,
+    Path(id): Path<uuid::Uuid>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if !local_review_request(&state, &headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            "review is only available from the host-local UI origin",
+        )
+            .into_response();
+    }
+    match state.app.reviews.detail(id) {
+        Some(detail) => ([(header::CACHE_CONTROL, "no-store")], Json(detail)).into_response(),
+        None => (StatusCode::NOT_FOUND, "request is no longer waiting").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewDecision {
+    fingerprint: String,
+    decision: crate::review::Decision,
+}
+
+async fn decide_request(
+    State(state): State<UiState>,
+    Path(id): Path<uuid::Uuid>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<ReviewDecision>,
+) -> impl IntoResponse {
+    // Custom header + no CORS blocks cross-origin form/fetch approvals.
+    // This remains a privileged host-local API, not remote user auth.
+    if !local_review_request(&state, &headers)
+        || headers
+            .get("x-friendzone-review")
+            .and_then(|h| h.to_str().ok())
+            != Some("1")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "review decisions must come from the host UI",
+        )
+            .into_response();
+    }
+    match state
+        .app
+        .reviews
+        .decide(id, &request.fingerprint, request.decision)
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
+}
+
 async fn api_log(
     State(state): State<UiState>,
     axum::extract::Query(query): axum::extract::Query<crate::state::LogQuery>,
@@ -1114,6 +1214,231 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn real_mitm_graphql_review_api_releases_exact_request_once_to_local_upstream() {
+        use hudsucker::{Proxy, certificate_authority::RcgenAuthority, rustls::crypto::aws_lc_rs};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir =
+            std::env::temp_dir().join(format!("fz-review-integration-{}", uuid::Uuid::new_v4()));
+        let files = crate::ca::AuthorityFiles::load_or_create(&dir).unwrap();
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "github".into(),
+                hosts: vec!["api.github.com".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fake-github".into(),
+                guest_env: None,
+                real_env: None,
+            })
+            .unwrap();
+        settings.set_secret("github", "host-secret").unwrap();
+        let registry = crate::mcp::ForwardRegistry::load(&dir, settings.clone()).unwrap();
+        let state = AppState::default();
+        state.add_container("guest").unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = hits.clone();
+        let payload = r#"{"query":"mutation Add { addComment(input: {body: \"<script>not HTML</script>\"}) { clientMutationId } }","variables":{"subjectId":"exact"}}"#;
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(
+                upstream,
+                Router::new().route(
+                    "/graphql",
+                    post(move |headers: axum::http::HeaderMap, body: String| {
+                        let observed = observed.clone();
+                        async move {
+                            assert_eq!(body, payload);
+                            assert_eq!(headers["authorization"], "Bearer host-secret");
+                            assert_eq!(headers["x-review-test"], "unchanged");
+                            assert!(!headers.contains_key("proxy-authorization"));
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            (
+                                StatusCode::CREATED,
+                                Json(serde_json::json!({"data":{"ok":true}})),
+                            )
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let ui_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ui_addr = ui_listener.local_addr().unwrap();
+        let ui = ui_router(UiState {
+            app: state.clone(),
+            settings: settings.clone(),
+            registry,
+            oauth: Default::default(),
+            cline: Default::default(),
+            ui_addr,
+            bootstrap_addr: "127.0.0.1:8082".parse().unwrap(),
+        });
+        let ui_task = tokio::spawn(async move {
+            axum::serve(ui_listener, ui).await.unwrap();
+        });
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        // Only the test connector substitutes networking: the production
+        // handler sees the true GitHub HTTPS URL and TLS interception path.
+        // No DNS/network access to GitHub can occur in this test.
+        let connector = tower::service_fn(move |uri: hudsucker::hyper::Uri| {
+            Box::pin(async move {
+                assert_eq!(uri.host(), Some("api.github.com"));
+                tokio::net::TcpStream::connect(upstream_addr)
+                    .await
+                    .map(hudsucker::hyper_util::rt::TokioIo::new)
+            })
+        });
+        let proxy = Proxy::builder()
+            .with_listener(proxy_listener)
+            .with_ca(RcgenAuthority::new(
+                files.issuer().unwrap(),
+                10,
+                aws_lc_rs::default_provider(),
+            ))
+            .with_http_connector(connector)
+            .with_http_handler(crate::proxy::EventHandler::new(
+                state.clone(),
+                settings,
+                ui_addr.port(),
+            ))
+            .build()
+            .unwrap();
+        let proxy_task = tokio::spawn(proxy.start());
+        let guest = reqwest::Client::builder()
+            .use_rustls_tls()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(files.cert_pem.as_bytes()).unwrap(),
+            )
+            .proxy(
+                reqwest::Proxy::all(format!("http://{proxy_addr}"))
+                    .unwrap()
+                    .basic_auth("guest", "x"),
+            )
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let host = reqwest::Client::builder().no_proxy().build().unwrap();
+        for decision in ["approve", "deny"] {
+            let guest = guest.clone();
+            let pending = tokio::spawn(async move {
+                guest
+                    .post("https://api.github.com/graphql")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer fake-github")
+                    .header("x-review-test", "unchanged")
+                    .body(payload)
+                    .send()
+                    .await
+                    .unwrap()
+            });
+            let summary = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if let Some(summary) = state.reviews.summaries().into_iter().next() {
+                        break summary;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!pending.is_finished());
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                if decision == "approve" { 0 } else { 1 }
+            );
+            let url = format!("http://{ui_addr}/api/requests/{}", summary.id);
+            let snapshot = host
+                .get(format!("http://{ui_addr}/api/state"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(!snapshot.contains(payload));
+            assert!(!snapshot.contains("host-secret"));
+            let response = host.get(&url).send().await.unwrap();
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let detail: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(detail["body"], payload);
+            assert!(!detail.to_string().contains("fake-github"));
+            assert!(!detail.to_string().contains("host-secret"));
+            let body = serde_json::json!({"fingerprint":summary.fingerprint,"decision":decision});
+            assert_eq!(
+                host.post(format!("{url}/decision"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                host.post(format!("{url}/decision"))
+                    .header("x-friendzone-review", "1")
+                    .header("origin", "https://evil.test")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                host.get(&url)
+                    .header("host", format!("evil.test:{}", ui_addr.port()))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+            let response = host
+                .post(format!("{url}/decision"))
+                .header("x-friendzone-review", "1")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert_eq!(
+                host.post(format!("{url}/decision"))
+                    .header("x-friendzone-review", "1")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::CONFLICT
+            );
+            let response = pending.await.unwrap();
+            if decision == "approve" {
+                assert_eq!(response.status(), StatusCode::CREATED);
+                assert_eq!(
+                    response.json::<serde_json::Value>().await.unwrap()["data"]["ok"],
+                    true
+                );
+            } else {
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                assert!(response.text().await.unwrap().contains("denied by host"));
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            assert!(state.reviews.summaries().is_empty());
+        }
+        ui_task.abort();
+        proxy_task.abort();
+        upstream_task.abort();
+        let _ = ui_task.await;
+        let _ = proxy_task.await;
+        let _ = upstream_task.await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn host_oauth_callback_enables_guest_forward_without_exposing_tokens() {
@@ -1728,10 +2053,24 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_does_not_expose_management_api() {
-        let response = bootstrap_app()
-            .oneshot(Request::get("/api/state").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        for uri in [
+            "/api/state",
+            "/api/requests/00000000-0000-0000-0000-000000000001",
+            "/api/requests/00000000-0000-0000-0000-000000000001/decision",
+        ] {
+            for method in ["GET", "POST"] {
+                let response = bootstrap_app()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            }
+        }
     }
 }

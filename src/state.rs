@@ -16,6 +16,7 @@ use uuid::Uuid;
 pub enum Verdict {
     Allowed,
     Blocked,
+    Pending,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -60,6 +61,7 @@ pub enum Authorization {
 pub struct StateView {
     pub containers: Vec<ContainerView>,
     pub requests: Vec<RequestEvent>,
+    pub pending_requests: Vec<crate::review::Summary>,
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +75,9 @@ struct ContainerRecord {
     last_ip: Option<IpAddr>,
     /// Explicit host policy is durable; unreviewed join requests are not.
     managed: bool,
+    /// Changes to authorization invalidate one-shot reviews, even if a kill
+    /// is subsequently resumed or a removed guest is re-added under its name.
+    policy_epoch: Uuid,
 }
 
 impl Default for ContainerRecord {
@@ -83,6 +88,7 @@ impl Default for ContainerRecord {
             pinned_ip: None,
             last_ip: None,
             managed: false,
+            policy_epoch: Uuid::new_v4(),
         }
     }
 }
@@ -165,14 +171,17 @@ pub struct AppState {
     /// Bumped on every mutation; SSE subscribers wake on change and
     /// fetch a fresh view. watch coalesces bursts automatically.
     changes: tokio::sync::watch::Sender<u64>,
+    pub reviews: crate::review::Queue,
 }
 
 impl Default for AppState {
     fn default() -> Self {
+        let changes = tokio::sync::watch::Sender::new(0);
         Self {
             data: Arc::new(RwLock::new(StateData::default())),
             policy_path: None,
-            changes: tokio::sync::watch::Sender::new(0),
+            reviews: crate::review::Queue::new(changes.clone()),
+            changes,
         }
     }
 }
@@ -221,10 +230,12 @@ impl AppState {
                 },
             );
         }
+        let changes = tokio::sync::watch::Sender::new(0);
         Ok(Self {
             data: Arc::new(RwLock::new(data)),
             policy_path: Some(Arc::new(path)),
-            changes: tokio::sync::watch::Sender::new(0),
+            reviews: crate::review::Queue::new(changes.clone()),
+            changes,
         })
     }
 
@@ -259,6 +270,18 @@ impl AppState {
                 })?,
             )
             .context("container policy change was not applied")?;
+        }
+        for (name, old) in &state.containers {
+            let changed = containers
+                .get(name)
+                .is_none_or(|new| new.approved != old.approved || new.pinned_ip != old.pinned_ip)
+                || state.killed.contains(name) != killed.contains(name);
+            if changed {
+                if let Some(record) = containers.get_mut(name) {
+                    record.policy_epoch = Uuid::new_v4();
+                }
+                self.reviews.cancel_container(name);
+            }
         }
         state.containers = containers;
         state.killed = killed;
@@ -328,6 +351,59 @@ impl AppState {
         self.notify();
     }
 
+    /// Admission is the consistency boundary: policy changes before this
+    /// check cancel the review. Already-admitted upstream work is not undone.
+    pub fn admit_review(&self, id: Uuid, container: &str, peer: IpAddr, epoch: Uuid) -> bool {
+        let mut state = self.data.write().expect("state lock poisoned");
+        if state.killed.contains(container)
+            || state.containers.get(container).is_none_or(|record| {
+                !record.approved
+                    || record.policy_epoch != epoch
+                    || record.pinned_ip.is_some_and(|pin| pin != peer)
+            })
+        {
+            return false;
+        }
+        if let Some(event) = state.requests.iter_mut().rev().find(|event| event.id == id) {
+            event.verdict = Verdict::Allowed;
+            event.detail = Some("approved once by host; forwarding original request".into());
+        }
+        drop(state);
+        self.notify();
+        true
+    }
+
+    pub fn review_epoch(&self, container: &str, peer: IpAddr) -> Option<Uuid> {
+        let state = self.data.read().expect("state lock poisoned");
+        let record = state.containers.get(container)?;
+        (record.approved
+            && !state.killed.contains(container)
+            && record.pinned_ip.is_none_or(|pin| pin == peer))
+        .then_some(record.policy_epoch)
+    }
+
+    pub fn enqueue_review(
+        &self,
+        detail: crate::review::Detail,
+        peer: IpAddr,
+        epoch: Uuid,
+    ) -> Result<crate::review::Ticket> {
+        let state = self.data.read().expect("state lock poisoned");
+        let name = &detail.summary.container;
+        let record = state
+            .containers
+            .get(name)
+            .context("container removed before review")?;
+        if record.policy_epoch != epoch
+            || !record.approved
+            || state.killed.contains(name)
+            || record.pinned_ip.is_some_and(|pin| pin != peer)
+        {
+            anyhow::bail!("container policy changed before review");
+        }
+        self.reviews.enqueue(detail)
+    }
+
     /// Search the retained history before paginating, not just the live
     /// snapshot. Sequence cursors stay stable when new traffic arrives.
     pub fn log_page(&self, query: &LogQuery) -> LogPage {
@@ -338,6 +414,7 @@ impl AppState {
             let verdict = match event.verdict {
                 Verdict::Allowed => "allowed",
                 Verdict::Blocked => "blocked",
+                Verdict::Pending => "pending",
             };
             query.before.is_none_or(|before| event.sequence < before)
                 && (query.container.is_empty() || query.container == event.container)
@@ -492,6 +569,7 @@ impl AppState {
         });
         StateView {
             containers,
+            pending_requests: self.reviews.summaries(),
             requests: state.requests.iter().rev().take(200).cloned().collect(),
         }
     }
@@ -500,6 +578,42 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn restart_restores_guest_permission_but_never_pending_request_or_grant() {
+        let dir = TestDir::new();
+        let state = AppState::load(&dir.0).unwrap();
+        state.add_container("guest").unwrap();
+        let peer = "127.0.0.1".parse().unwrap();
+        let epoch = state.review_epoch("guest", peer).unwrap();
+        let detail = crate::review::Detail::from_request(
+            "guest",
+            &hudsucker::hyper::Request::builder()
+                .method("DELETE")
+                .uri("https://api.github.com/repos/x/y")
+                .body(hudsucker::Body::empty())
+                .unwrap(),
+            b"",
+        )
+        .unwrap();
+        let id = detail.summary.id;
+        let ticket = state.enqueue_review(detail.clone(), peer, epoch).unwrap();
+        let reloaded = AppState::load(&dir.0).unwrap();
+        assert!(reloaded.view().containers[0].approved);
+        assert!(reloaded.view().pending_requests.is_empty());
+        assert!(
+            reloaded
+                .reviews
+                .decide(
+                    id,
+                    &detail.summary.fingerprint,
+                    crate::review::Decision::Approve
+                )
+                .is_err()
+        );
+        assert!(!reloaded.admit_review(id, "guest", peer, epoch));
+        drop(ticket);
+    }
 
     struct TestDir(PathBuf);
     impl TestDir {

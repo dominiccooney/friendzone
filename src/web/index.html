@@ -18,11 +18,27 @@
       <form id="add-container" class="filters"><input id="new-container-name" placeholder="new container name (becomes the proxy username)" required><button type="submit">Add container</button></form>
       <p class="meta">Approved is a network permission, not an activity indicator. Agent working/idle status is not monitored. Approvals, IP pins and kill state are saved across broker restarts.</p>
       <p id="container-error" role="alert"></p>
+      <section class="request-inbox" aria-labelledby="request-inbox-title">
+        <div class="page-heading"><div><h2 id="request-inbox-title">Requests awaiting review</h2><p>Approve once releases the exact waiting request. Nothing is replayed after a restart.</p></div><button id="enable-notifications" type="button">Enable notifications</button></div>
+        <p id="notification-status" class="meta" role="status"></p>
+        <p class="meta">Keep this UI open for desktop notifications. Requests expire after 2 minutes; a client's own timeout may be shorter. Deny old requests before retrying a timed-out write.</p>
+        <div id="pending-requests"></div>
+        <section id="request-review" hidden>
+          <h3 id="request-review-title"></h3>
+          <p id="request-review-reason"></p>
+          <p id="request-review-meta" class="meta"></p>
+          <p><strong>Untrusted guest content below.</strong> Review the complete URL, headers and body. Approving does not validate that this operation is safe. Credential headers are hidden; the original values or configured escrow substitution will be used.</p>
+          <h4>Headers</h4><pre id="request-review-headers"></pre>
+          <h4>Exact request body</h4><pre id="request-review-body"></pre>
+          <div class="mcp-card-actions"><button id="request-approve" type="button" disabled>Approve once</button><button id="request-deny" type="button" disabled>Deny</button><button id="request-close" type="button">Close review</button></div>
+        </section>
+        <p id="request-review-status" role="status"></p>
+      </section>
       <div id="containers" class="containers"></div>
     </section>
     <section id="log-view" class="view">
       <div class="page-heading"><div><h1>Request log</h1><p>Search the last 10,000 application requests (memory only). Successful CONNECT setup and authentication challenges are omitted.</p><p id="log-status" class="meta"></p></div></div>
-      <div class="filters"><input id="search" type="search" placeholder="Search method, URL, status, detail, or container"><select id="container-filter"><option value="">All containers</option></select><select id="verdict-filter"><option value="">All verdicts</option><option>allowed</option><option>blocked</option></select></div>
+      <div class="filters"><input id="search" type="search" placeholder="Search method, URL, status, detail, or container"><select id="container-filter"><option value="">All containers</option></select><select id="verdict-filter"><option value="">All verdicts</option><option>allowed</option><option>blocked</option><option>pending</option></select></div>
       <div class="log-table"><div class="log-head"><span>Time</span><span>Container</span><span>Request</span><span>Verdict</span></div><div id="requests"></div></div>
       <div class="filters"><button id="log-live">Latest / live</button><button id="log-more">Older matches</button></div>
     </section>

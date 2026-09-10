@@ -1,9 +1,9 @@
-//! Request classification: reads flow, writes queue (blocked for now).
+//! Request classification: reads flow, potential writes require review.
 //!
 //! Read vs write is semantic, not the HTTP method: git-upload-pack and
-//! GraphQL queries are reads despite being POSTs. This slice classifies
-//! GitHub origins conservatively; unknown origins keep flowing so the
-//! proxy stays useful while policy grows.
+//! GraphQL queries are reads despite being POSTs. Without a GraphQL parser
+//! we conservatively require review of ALL GraphQL POSTs, queries included.
+//! Unknown origins remain unpoliced while policy grows.
 
 use hudsucker::{Body, hyper::Request};
 
@@ -19,9 +19,8 @@ pub enum Decision {
     Unpoliced,
     /// Policed origin, read-class: flows.
     AllowRead,
-    /// Policed origin, write-class: blocked with a note until the
-    /// pending-request inbox exists.
-    BlockWrite,
+    /// Policed origin, potential write: explicit one-shot host review.
+    RequireReview,
 }
 
 const GITHUB_HOSTS: &[&str] = &[
@@ -42,20 +41,23 @@ pub fn classify(req: &Request<Body>) -> Decision {
     let Some(host) = req.uri().host() else {
         return Decision::Unpoliced;
     };
-    if !GITHUB_HOSTS.contains(&host) {
+    if !GITHUB_HOSTS
+        .iter()
+        .any(|github| host.eq_ignore_ascii_case(github))
+    {
         return Decision::Unpoliced;
     }
     match github_access(req) {
         Access::Read => Decision::AllowRead,
-        Access::Write => Decision::BlockWrite,
+        Access::Write => Decision::RequireReview,
     }
 }
 
 pub fn note(decision: Decision) -> Option<&'static str> {
     match decision {
-        Decision::BlockWrite => Some(
-            "friendzone: GitHub writes are gated; this slice blocks them (pending-request inbox not built yet)",
-        ),
+        Decision::RequireReview => {
+            Some("friendzone: GitHub writes require review; this request format is not reviewable")
+        }
         _ => None,
     }
 }
@@ -102,19 +104,23 @@ mod tests {
     #[test]
     fn github_writes_block() {
         assert_eq!(
+            classify(&req("POST", "https://API.GITHUB.COM/graphql")),
+            Decision::RequireReview
+        );
+        assert_eq!(
             classify(&req(
                 "POST",
                 "https://api.github.com/repos/x/y/issues/1/comments"
             )),
-            Decision::BlockWrite
+            Decision::RequireReview
         );
         assert_eq!(
             classify(&req("POST", "https://github.com/x/y.git/git-receive-pack")),
-            Decision::BlockWrite
+            Decision::RequireReview
         );
         assert_eq!(
             classify(&req("DELETE", "https://api.github.com/repos/x/y")),
-            Decision::BlockWrite
+            Decision::RequireReview
         );
     }
 

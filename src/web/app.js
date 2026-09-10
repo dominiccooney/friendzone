@@ -1,11 +1,16 @@
 const $ = (s) => document.querySelector(s);
-let snapshot = { containers: [], requests: [] };
+let snapshot = { containers: [], requests: [], pending_requests: [] };
 let logRows = [], logCursor = null, logPaused = false, logGeneration = 0, logTimer;
 let order = readStoredOrder();
 let mcpConnectData = null, mcpHostInitialized = false, mcpConnectGeneration = 0, mcpGuestSignature = "";
 const mcpOAuthPolls = new Map();
 let reviewingMcp = null;
 let activeMcpOAuth = null;
+let activeReview = null, reviewGeneration = 0, pendingSignature = "";
+let notificationTimer = null, newNotificationIds = new Set();
+let notificationsEnabled = readStoredValue("fz-notifications") === "enabled";
+let notifiedIds;
+try { const saved = JSON.parse(readStoredValue("fz-notified-requests") || "[]"); notifiedIds = new Set(Array.isArray(saved)?saved.filter(id=>typeof id==="string").slice(-128):[]); } catch { notifiedIds = new Set(); }
 
 function esc(value) { return String(value).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;"); }
 function displayTime(value) { return new Date(value).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"}); }
@@ -45,6 +50,7 @@ async function changeContainerPolicy(url, options) {
 }
 
 function renderContainers() {
+  renderPendingRequests();
   updateMcpConnectionGuests();
   const root = $("#containers"); root.innerHTML = "";
   if (!snapshot.containers.length) { root.append($("#empty-template").content.cloneNode(true)); return; }
@@ -94,6 +100,110 @@ function renderLog() {
   $("#container-filter").innerHTML='<option value="">All containers</option>'+names.map(id=>`<option value="${esc(id)}">${esc(id)}</option>`).join(""); $("#container-filter").value=selected;
 }
 
+function updateNotificationStatus() {
+  const supported = typeof Notification !== "undefined" && window.isSecureContext;
+  const button = $("#enable-notifications");
+  button.disabled = !supported;
+  button.textContent = notificationsEnabled ? "Disable notifications" : "Enable notifications";
+  $("#notification-status").textContent = !supported ? "Desktop notifications unavailable. Use localhost/HTTPS and a supported desktop browser; Inbox still works."
+    : Notification.permission === "denied" ? "Notifications blocked by browser permission. Change site settings to enable them; Inbox still works."
+    : notificationsEnabled && Notification.permission === "granted" ? "Notifications enabled while this page is open. Clicking a notification opens Inbox, never approves a request."
+    : "Desktop notifications are off. Enable them to be alerted when a guest requests approval.";
+}
+
+$("#enable-notifications").onclick = async () => {
+  if (notificationsEnabled) {
+    notificationsEnabled = false; clearTimeout(notificationTimer); notificationTimer = null; newNotificationIds.clear();
+  } else if (typeof Notification !== "undefined" && window.isSecureContext) {
+    try { notificationsEnabled = (Notification.permission === "granted" ? "granted" : await Notification.requestPermission()) === "granted"; }
+    catch { notificationsEnabled = false; }
+  }
+  storeValue("fz-notifications", notificationsEnabled ? "enabled" : "disabled");
+  updateNotificationStatus();
+  notifyPendingRequests(snapshot.pending_requests || []);
+};
+
+function notifyPendingRequests(pending) {
+  if (!notificationsEnabled || typeof Notification === "undefined" || !window.isSecureContext || Notification.permission !== "granted") return;
+  for (const request of pending) if (!notifiedIds.has(request.id)) newNotificationIds.add(request.id);
+  if (!newNotificationIds.size || notificationTimer) return;
+  notificationTimer = setTimeout(() => {
+    notificationTimer = null;
+    const live = new Set((snapshot.pending_requests || []).map(request=>request.id));
+    const ids = [...newNotificationIds].filter(id=>live.has(id) && !notifiedIds.has(id));
+    newNotificationIds.clear();
+    if (!ids.length || !notificationsEnabled || Notification.permission !== "granted") return;
+    for (const id of ids) notifiedIds.add(id);
+    notifiedIds = new Set([...notifiedIds].slice(-128));
+    storeValue("fz-notified-requests", JSON.stringify([...notifiedIds]));
+    try {
+      const notification = new Notification("Friendzone: request approval needed", {
+        body: `${ids.length} new request${ids.length===1?"":"s"} waiting. Open the host Inbox to review.`, tag:"friendzone-pending",
+      });
+      notification.onclick = () => { window.focus(); selectView("inbox"); $("#pending-requests").scrollIntoView({behavior:"smooth",block:"center"}); notification.close(); };
+    } catch { $("#notification-status").textContent = "Browser could not display a notification. Requests remain in Inbox."; }
+  }, 750);
+}
+
+function renderPendingRequests() {
+  const pending = snapshot.pending_requests || [];
+  $("#inbox-count").textContent = pending.length + snapshot.containers.filter(container=>!container.approved).length;
+  const signature = JSON.stringify(pending);
+  if (signature !== pendingSignature) {
+    pendingSignature = signature;
+    $("#pending-requests").innerHTML = pending.map(request=>`<article class="pending-request"><strong>${esc(request.container)}</strong> · ${esc(request.method)} <code>${esc(request.url)}</code><p class="meta">${request.body_bytes} body bytes · expires ${esc(displayTime(request.expires_at))}</p><button type="button" data-review="${esc(request.id)}">Review request</button></article>`).join("") || '<p>No requests waiting for review.</p>';
+    document.querySelectorAll("[data-review]").forEach(button=>button.onclick=()=>openRequestReview(button.dataset.review));
+  }
+  if (activeReview && !pending.some(request=>request.id===activeReview.id)) {
+    activeReview = null; ++reviewGeneration;
+    $("#request-approve").disabled = true; $("#request-deny").disabled = true;
+    $("#request-review-status").textContent = "This request is no longer waiting (decided, cancelled or expired). Check the log for its outcome.";
+  }
+  updateNotificationStatus(); notifyPendingRequests(pending);
+}
+
+async function openRequestReview(id) {
+  const generation = ++reviewGeneration; activeReview = null;
+  $("#request-review").hidden = true; $("#request-approve").disabled = true; $("#request-deny").disabled = true;
+  $("#request-review-status").textContent = "Loading exact request…";
+  try {
+    const response = await fetch(`/api/requests/${encodeURIComponent(id)}`, {cache:"no-store"});
+    if (!response.ok) throw new Error(await response.text());
+    const detail = await response.json();
+    if (generation !== reviewGeneration) return;
+    activeReview = detail;
+    $("#request-review-title").textContent = `${detail.container}: ${detail.method} ${detail.url}`;
+    $("#request-review-reason").textContent = detail.reason;
+    $("#request-review-meta").textContent = `Expires ${new Date(detail.expires_at).toLocaleString()} · SHA-256 ${detail.fingerprint}`;
+    $("#request-review-headers").textContent = detail.headers.map(([name,value])=>`${name}: ${value}`).join("\n");
+    $("#request-review-body").textContent = detail.body || "(empty body)";
+    $("#request-review").hidden = false;
+    $("#request-approve").disabled = false; $("#request-deny").disabled = false;
+    $("#request-review-status").textContent = "Review all fields before approving. Approval is for this request only; upstream success is not guaranteed.";
+    $("#request-review").scrollIntoView({behavior:"smooth",block:"start"});
+  } catch (error) { if (generation === reviewGeneration) $("#request-review-status").textContent = String(error); }
+}
+
+async function decideRequest(decision) {
+  if (!activeReview) return;
+  const reviewed = activeReview;
+  if (decision === "approve" && !confirm("Forward this exact request once? Only approve if the requesting client is still waiting. Retried writes are separate requests and may duplicate an operation.")) return;
+  $("#request-approve").disabled = true; $("#request-deny").disabled = true;
+  try {
+    const response = await fetch(`/api/requests/${encodeURIComponent(reviewed.id)}/decision`, {method:"POST",headers:{"content-type":"application/json","x-friendzone-review":"1"},body:JSON.stringify({fingerprint:reviewed.fingerprint,decision})});
+    if (!response.ok) throw new Error(await response.text());
+    activeReview = null; ++reviewGeneration;
+    $("#request-review-status").textContent = decision === "approve" ? "Approved once. Check the request log for upstream status; do not blindly retry." : "Denied. The request was not forwarded.";
+    await refresh();
+  } catch (error) {
+    $("#request-review-status").textContent = `Could not confirm the decision: ${error}. Refresh the Inbox/log before retrying.`;
+  }
+}
+$("#request-approve").onclick = () => decideRequest("approve");
+$("#request-deny").onclick = () => decideRequest("deny");
+$("#request-close").onclick = () => { activeReview = null; ++reviewGeneration; $("#request-review").hidden = true; };
+updateNotificationStatus();
+
 async function loadLog(older = false) {
   const generation = ++logGeneration;
   const query = new URLSearchParams({search:$("#search").value, container:$("#container-filter").value, verdict:$("#verdict-filter").value});
@@ -131,7 +241,7 @@ const PROVIDER_PRESETS = {
   },
   github: {
     name: "github", hosts: "api.github.com,github.com,codeload.github.com", header: "authorization", prefix: "Bearer ", guest: "GITHUB_TOKEN",
-    hint: "Use a fine-grained PAT from github.com → Settings → Developer settings → Personal access tokens (read-only scopes recommended), or reuse the gh CLI's token: run `gh auth token`. Agents and gh read it from GITHUB_TOKEN. Note: GitHub writes are blocked by policy regardless of the token's scopes.",
+    hint: "Use a fine-grained PAT from github.com → Settings → Developer settings → Personal access tokens (narrow scopes recommended), or reuse the gh CLI's token: run `gh auth token`. Agents and gh read it from GITHUB_TOKEN. GitHub JSON/text writes and GraphQL POSTs require one-shot Inbox review; approval cannot grant scopes your token lacks. Binary git pushes remain blocked.",
   },
   custom: { name: "", hosts: "", header: "", prefix: "", guest: "", hint: "Fill the advanced fields: pinned hosts, credential header, optional 'Bearer ' prefix, and the env var the agent expects." },
 };

@@ -9,6 +9,25 @@ use hudsucker::{
 
 use crate::state::{AppState, Verdict};
 
+/// A cancelled HTTP handler must not leave an apparently live review in
+/// the log. Ticket drop independently removes the queue item.
+struct ReviewLogGuard {
+    state: AppState,
+    event: uuid::Uuid,
+    finished: bool,
+}
+impl Drop for ReviewLogGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.state.mark_blocked(
+                self.event,
+                403,
+                "review cancelled; waiting proxy handler ended without forwarding".into(),
+            );
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct EventHandler {
     state: AppState,
@@ -120,14 +139,17 @@ impl EventHandler {
             return req.into();
         }
         let decision = crate::policy::classify(&req);
-        let blocked = killed || decision == crate::policy::Decision::BlockWrite;
+        let needs_review = decision == crate::policy::Decision::RequireReview;
+        let blocked = killed;
         let host = req.uri().host().unwrap_or_default().to_owned();
         let id = self.state.record(
-            container,
+            container.clone(),
             req.method().to_string(),
             req.uri().to_string(),
             if blocked {
                 Verdict::Blocked
+            } else if needs_review {
+                Verdict::Pending
             } else {
                 Verdict::Allowed
             },
@@ -143,15 +165,21 @@ impl EventHandler {
                 .body(Body::from("container is killed"))
                 .expect("static blocked response")
                 .into()
-        } else if blocked {
-            let note = crate::policy::note(decision).unwrap_or("friendzone: blocked");
-            self.state.annotate(id, Some(403), Some(note.into()));
-            Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::from(note))
-                .expect("static blocked response")
-                .into()
         } else {
+            if needs_review {
+                match self.await_review(&container, peer.ip(), req, id).await {
+                    Ok(reviewed) => req = reviewed,
+                    Err(reason) => {
+                        self.pending = None;
+                        self.state.mark_blocked(id, 403, reason.clone());
+                        return Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .body(Body::from(reason))
+                            .expect("review denial")
+                            .into();
+                    }
+                }
+            }
             let host = req.uri().host().unwrap_or_default().to_owned();
             let substitution = self.settings.substitute(&host, |name| {
                 req.headers()
@@ -182,6 +210,99 @@ impl EventHandler {
                 }
             }
         }
+    }
+
+    async fn await_review(
+        &self,
+        container: &str,
+        peer: std::net::IpAddr,
+        req: Request<Body>,
+        event: uuid::Uuid,
+    ) -> Result<Request<Body>, String> {
+        use http_body_util::BodyExt;
+        let mut guard = ReviewLogGuard {
+            state: self.state.clone(),
+            event,
+            finished: false,
+        };
+        let error = |reason: String| format!("friendzone: GitHub request not forwarded: {reason}");
+        let epoch = self
+            .state
+            .review_epoch(container, peer)
+            .ok_or_else(|| error("container is no longer authorized".into()))?;
+        // Escrow leak/missing-secret denials are not permissions the user
+        // may override. Check before collecting or advertising the request.
+        if let crate::settings::Substitution::Block(reason) =
+            self.settings
+                .substitute(req.uri().host().unwrap_or_default(), |name| {
+                    req.headers()
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned)
+                })
+        {
+            return Err(error(reason));
+        }
+        if req.headers().contains_key("content-encoding")
+            || req.uri().path().ends_with("/git-receive-pack")
+        {
+            return Err(error(
+                crate::policy::note(crate::policy::Decision::RequireReview)
+                    .unwrap_or("unreviewable request")
+                    .into(),
+            ));
+        }
+        let _slot = crate::review::buffer_slots()
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| error("review buffer capacity exceeded".into()))?;
+        let (parts, body) = req.into_parts();
+        let collected = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            http_body_util::Limited::new(body, crate::review::MAX_BODY).collect(),
+        )
+        .await
+        .map_err(|_| error("request body upload timed out".into()))?
+        .map_err(|_| error("request body exceeds 64 KiB or could not be read".into()))?;
+        if collected.trailers().is_some() {
+            return Err(error("HTTP trailers are not reviewable".into()));
+        }
+        let bytes = collected.to_bytes();
+        let req = Request::from_parts(parts, Body::from(bytes.clone()));
+        let mut detail = crate::review::Detail::from_request(container, &req, &bytes)
+            .map_err(|e| error(e.to_string()))?;
+        // Keep the review ID searchable/correlatable with its single audit row.
+        detail.summary.id = event;
+        for entry in self.settings.entries() {
+            for (name, value) in &mut detail.headers {
+                if name.eq_ignore_ascii_case(&entry.header) {
+                    *value = "[redacted]".into();
+                }
+            }
+        }
+        self.state.annotate(
+            event,
+            None,
+            Some(format!(
+                "awaiting host review {} (120s limit)",
+                detail.summary.id
+            )),
+        );
+        let ticket = self
+            .state
+            .enqueue_review(detail, peer, epoch)
+            .map_err(|e| error(e.to_string()))?;
+        match ticket.wait().await.map_err(|e| error(e.to_string()))? {
+            crate::review::Decision::Deny => return Err(error("denied by host reviewer".into())),
+            crate::review::Decision::Approve => {}
+        }
+        if !self.state.admit_review(event, container, peer, epoch) {
+            return Err(error(
+                "container policy changed while awaiting approval".into(),
+            ));
+        }
+        guard.finished = true;
+        Ok(req)
     }
 }
 
@@ -282,6 +403,138 @@ pub fn basic_username(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn wait_for_review(state: &AppState) -> crate::review::Summary {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(summary) = state.reviews.summaries().into_iter().next() {
+                    break summary;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request entered review")
+    }
+
+    #[tokio::test]
+    async fn kill_resume_pin_removal_and_cancellation_invalidate_waiting_writes() {
+        let dir = std::env::temp_dir().join(format!("fz-review-gates-{}", uuid::Uuid::new_v4()));
+        let state = AppState::default();
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        let peer: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        for action in ["kill", "pin", "remove", "cancel"] {
+            state.add_container("guest").unwrap();
+            state.set_killed("guest".into(), false).unwrap();
+            state.set_pinned_ip("guest", None).unwrap();
+            let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081);
+            let task = tokio::spawn(async move {
+                handler
+                    .handle_from_peer(
+                        peer,
+                        request("POST", "https://api.github.com/graphql", Some("guest")),
+                    )
+                    .await
+            });
+            let summary = wait_for_review(&state).await;
+            match action {
+                "kill" => {
+                    state.set_killed("guest".into(), true).unwrap();
+                    state.set_killed("guest".into(), false).unwrap();
+                }
+                "pin" => state
+                    .set_pinned_ip("guest", Some("127.0.0.2".parse().unwrap()))
+                    .unwrap(),
+                "remove" => {
+                    state.remove_container("guest").unwrap();
+                    state.add_container("guest").unwrap();
+                }
+                _ => {
+                    task.abort();
+                }
+            }
+            if action != "cancel" {
+                assert_eq!(status(task.await.unwrap()), StatusCode::FORBIDDEN);
+            } else {
+                assert!(task.await.unwrap_err().is_cancelled());
+            }
+            assert!(state.reviews.summaries().is_empty());
+            assert!(
+                state
+                    .reviews
+                    .decide(
+                        summary.id,
+                        &summary.fingerprint,
+                        crate::review::Decision::Approve
+                    )
+                    .is_err()
+            );
+            assert!(matches!(state.view().requests[0].verdict, Verdict::Blocked));
+        }
+        // Approval racing with a later kill cannot slip through a resume.
+        state.set_pinned_ip("guest", None).unwrap();
+        let epoch = state.review_epoch("guest", peer.ip()).unwrap();
+        state.set_killed("guest".into(), true).unwrap();
+        state.set_killed("guest".into(), false).unwrap();
+        assert!(!state.admit_review(uuid::Uuid::new_v4(), "guest", peer.ip(), epoch));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_encoded_binary_and_escrow_denials_never_enter_inbox() {
+        let dir = std::env::temp_dir().join(format!("fz-review-body-{}", uuid::Uuid::new_v4()));
+        let state = AppState::default();
+        state.add_container("guest").unwrap();
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081);
+        for (body, encoding) in [
+            (vec![b'x'; crate::review::MAX_BODY + 1], None),
+            (vec![255], None),
+            (vec![b'x'], Some("gzip")),
+        ] {
+            let mut req = request("POST", "https://api.github.com/graphql", Some("guest"));
+            req.headers_mut()
+                .insert("content-type", "application/json".parse().unwrap());
+            if let Some(encoding) = encoding {
+                req.headers_mut()
+                    .insert("content-encoding", encoding.parse().unwrap());
+            }
+            *req.body_mut() = Body::from(body);
+            assert_eq!(
+                status(
+                    handler
+                        .handle_from_peer("127.0.0.1:12345".parse().unwrap(), req)
+                        .await
+                ),
+                StatusCode::FORBIDDEN
+            );
+            assert!(state.reviews.summaries().is_empty());
+        }
+        settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "wrong-host".into(),
+                hosts: vec!["example.test".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fake".into(),
+                guest_env: None,
+                real_env: None,
+            })
+            .unwrap();
+        let mut req = request("POST", "https://api.github.com/graphql", Some("guest"));
+        req.headers_mut()
+            .insert("authorization", "Bearer fake".parse().unwrap());
+        assert_eq!(
+            status(
+                handler
+                    .handle_from_peer("127.0.0.1:12345".parse().unwrap(), req)
+                    .await
+            ),
+            StatusCode::FORBIDDEN
+        );
+        assert!(state.reviews.summaries().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn management_port_is_denied_before_http_forwarding_or_connect() {

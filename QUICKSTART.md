@@ -129,6 +129,27 @@ the full sign-in URL into the host browser address bar, not a terminal.
 If the provider still rejects it, compare the callback shown in the panel;
 do not substitute the guest MCP endpoint for an OAuth redirect URI.
 
+### Reviewing a GitHub request
+
+If a guest submits a GitHub write (including any GraphQL POST), keep the
+host UI open and go to **Inbox → Requests awaiting review → Review request**.
+Inspect the full URL, headers and body, then **Approve once** or **Deny**.
+The original HTTP call waits up to two minutes; nothing is replayed on
+restart. Approval uses the normal configured credential and requires its
+upstream scopes; it does not override GitHub permissions or future requests.
+
+Click **Enable notifications** in Inbox and allow the browser prompt for
+desktop alerts. Click an alert to focus Inbox. This works with the UI open
+in a background tab on localhost, not after closing the browser. Denied or
+unsupported notification permission does not prevent manual review.
+
+GraphQL queries and mutations both require manual review in this version.
+Only inspectable JSON/text or empty-body writes up to 64 KiB are supported;
+binary git pushes remain blocked. **If the guest times out, deny its old
+pending request before retrying.** Retried requests are separate and may
+duplicate a write. See [GitHub policy](README.md#github-policy) for limits,
+security boundaries and cancellation details.
+
 ## 3. Container: bootstrap
 
 Cross-OS note: `/bootstrap/fz` is the *host's* binary. On a Linux guest

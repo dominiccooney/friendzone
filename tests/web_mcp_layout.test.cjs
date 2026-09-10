@@ -20,11 +20,22 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     guests: ["scratch-kali"], auth: "oauth", guest_endpoint: endpoint };
   const state = { containers: [{ id: "scratch-kali", name: "scratch-kali", approved: true,
     state: "approved", request_count: 0, last_activity: null, pinned_ip: null }], requests: [] };
+  const pending = {id:"request-id",container:"scratch-kali",method:"POST",url:"https://api.github.com/graphql?long="+"x".repeat(180),
+    body_bytes:64,fingerprint:"immutable-hash",created_at:"2026-09-09T00:00:00Z",expires_at:"2099-01-01T00:00:00Z",reason:"GraphQL request needs review"};
+  state.pending_requests=[pending];
+  const detail={...pending,headers:[["content-type","application/json"],["authorization","[redacted]"]],body:'{"query":"<img src=x onerror=window.pwned=true>","variables":{"value":"' + "payload".repeat(200) + '"}}'};
+  const decisions=[];
   const server = http.createServer((request, response) => {
     const route = request.url.split("?")[0];
     if (route === "/api/events") {
       response.writeHead(200, { "content-type": "text/event-stream" });
       response.write("data: " + JSON.stringify(state) + "\n\n"); return;
+    }
+    if (route === "/api/requests/request-id/decision") {
+      let body=""; request.on("data",chunk=>body+=chunk); request.on("end",()=>{
+        decisions.push({headers:request.headers,body:JSON.parse(body)}); state.pending_requests=[];
+        response.writeHead(204); response.end();
+      }); return;
     }
     const assets = { "/": ["index.html", "text/html"], "/app.js": ["app.js", "text/javascript"], "/app.css": ["app.css", "text/css"] };
     if (assets[route]) {
@@ -35,6 +46,7 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
       "/api/state": state, "/api/escrow": { entries: [] },
       "/api/mcp": { forwards: [forward], guest_host: "172.31.208.1", guest_port: 8082 },
       "/api/mcp/config": [], "/api/log": { requests: [], next_before: null, retained: 0, capacity: 10000, evicted: 0 },
+      "/api/requests/request-id":detail,
     };
     if (route === "/api/guest-env") { response.end("# environment"); return; }
     if (route.endsWith("/guest-config")) replies[route] = { endpoint, authorization: "Basic c2NyYXRjaC1rYWxpOng=", warnings: [], cline_config: { mcpServers: {} } };
@@ -121,6 +133,26 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
         assert.match(await evaluate("document.querySelector('.container .meta').textContent"), /No guest traffic observed/);
       }
     }
+    await evaluate("document.querySelector('[data-view=inbox]').click()");
+    for(let i=0;i<100 && !await evaluate("!!document.querySelector('[data-review]')");i++) await delay(25);
+    await evaluate("document.querySelector('[data-review]').click()");
+    for(let i=0;i<100 && !await evaluate("!document.querySelector('#request-review').hidden");i++) await delay(25);
+    assert.equal(await evaluate("document.querySelector('#request-review-body').textContent"),detail.body);
+    assert.equal(await evaluate("document.querySelector('#request-review-body').children.length"),0);
+    assert.equal(await evaluate("!!window.pwned"),false);
+    assert.equal(await evaluate("document.querySelector('#inbox-count').textContent"),"1");
+    for(const width of [1058,480]) {
+      await send("Emulation.setDeviceMetricsOverride",{width,height:1000,deviceScaleFactor:1,mobile:false});
+      const layout=await evaluate(`(() => {const body=document.querySelector('#request-review-body'), button=document.querySelector('#request-approve');return {page:document.documentElement.scrollWidth,body:body.clientWidth,scroll:body.scrollWidth,button:button.getBoundingClientRect().right,disabled:button.disabled};})()`);
+      assert.ok(layout.page<=width+1,JSON.stringify(layout)); assert.ok(layout.scroll<=layout.body+1,JSON.stringify(layout)); assert.ok(layout.button<=width,JSON.stringify(layout)); assert.equal(layout.disabled,false);
+    }
+    await evaluate("window.confirm=()=>true; document.querySelector('#request-approve').click()");
+    for(let i=0;i<100 && !decisions.length;i++) await delay(25);
+    assert.deepEqual(decisions.map(d=>d.body),[{fingerprint:"immutable-hash",decision:"approve"}]);
+    assert.equal(decisions[0].headers["x-friendzone-review"],"1");
+    for(let i=0;i<100 && await evaluate("document.querySelector('#inbox-count').textContent !== '0'");i++) await delay(25);
+    assert.equal(await evaluate("document.querySelector('#request-approve').disabled"),true);
+    assert.equal(await evaluate("document.querySelector('#inbox-count').textContent"),"0");
     assert.deepEqual(errors, []);
   } finally {
     socket?.close(); browser.kill();

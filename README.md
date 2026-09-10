@@ -146,8 +146,45 @@ resumed.
 ## GitHub policy
 
 GitHub reads (GET/HEAD/OPTIONS and `git-upload-pack`) flow through the
-proxy; writes are blocked with a note until the pending-request inbox
-exists. Other origins are logged and unpoliced.
+proxy. Potential writes wait in **Inbox → Requests awaiting review**.
+Open **Review request**, inspect the complete URL, headers and literal
+payload, then **Approve once** or **Deny**. Approval releases only that
+immutable request through the normal escrow path, not a rule for future
+requests. The log shows pending, denied, approved and upstream status.
+
+`POST https://api.github.com/graphql` can be a query or mutation: both
+require review until semantic GraphQL parsing is implemented. Inspect
+`query`, `operationName`, and `variables`, not just the operation's name.
+Broker credentials never appear in the review; credential headers are
+redacted. URLs and request bodies may themselves contain sensitive guest
+data, so don't share screenshots casually. Payloads are untrusted text,
+not instructions to the reviewer and not a broker-validated action summary.
+
+The queue is memory-only: 32 requests globally, 8 per guest, 64 KiB per body,
+16 KiB of headers and 8 KiB of URL, with a 10-second upload and 120-second
+decision deadline. Compressed, binary, multipart/form and git push payloads
+remain blocked because this UI cannot faithfully review them. Kill,
+removal, approval/pin changes, expiry, or cancellation of the waiting HTTP
+handler discard the pending request; restart never replays it. A permission
+change after the final admission check cannot undo already-admitted work.
+No approve-for-session/always rules or MCP write approval are added here.
+Other origins remain logged and unpoliced.
+
+**Retry caution:** clients may time out before 120 seconds, and the HTTP
+stack may not immediately cancel its handler on a disconnect. Deny a stale
+pending write before retrying; each retry needs independent approval and
+may duplicate the upstream operation. A lost response after approval does
+not prove failure: check upstream state before retrying. Approvals are
+one-shot authorization, **not exactly-once delivery**.
+
+**Desktop notifications:** click **Enable notifications** in Inbox and
+grant the browser permission. Requires a supported desktop browser and a
+secure context (the default `http://127.0.0.1:8081`/`localhost` qualifies).
+Keep the UI open, including in a background tab. Notifications coalesce
+bursts and remember recently notified IDs across reloads; clicking one
+focuses Inbox, never approves a request. Their text contains no payload or
+URL. Browser/OS notification settings can suppress them; the Inbox works
+without permission. No push service or closed-browser delivery is included.
 
 ## MCP forwarding (read tools)
 
