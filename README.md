@@ -118,6 +118,32 @@ resumed.
 
 ## GitHub policy
 
+### Git HTTPS authentication
+
+Git's `Authorization: Basic base64(username:fake-token)` is supported. The
+broker matches the **entire password** to an Authorization escrow entry's
+fake, checks its host pin, and re-encodes `username:real-token`. The username
+is preserved; the entry's API `Bearer ` prefix is **not** part of the Basic
+password. Existing API Bearer substitution is unchanged. Missing secrets
+and known fakes sent to non-pinned hosts are denied; anonymous requests and
+unrelated/malformed credentials do not cause token injection.
+
+Git must actually supply the fake token as its HTTPS password (through a
+credential helper or prompt). Exporting `GITHUB_TOKEN` alone does not make
+plain Git use it. The guest bootstrap does not install a Git credential
+helper; do not put the real token in the guest. No global Git configuration
+is changed by the broker.
+
+`GET .../info/refs?service=git-receive-pack` is push-service **discovery**, not
+a write. GitHub can return `401` with a Basic challenge before Git retries
+with credentials, even on a public repository. The log's `allowed` verdict
+means Friendzone forwarded the request; its HTTP status is GitHub's response.
+**This auth support does not enable branch pushes:** the subsequent binary
+`POST .../git-receive-pack` is still blocked. Creating a PR through the API
+therefore still requires an already-published head branch.
+
+### Reads and manual review
+
 GitHub reads (GET/HEAD/OPTIONS, `git-upload-pack`, and parsed GraphQL queries) flow through the
 proxy. Potential writes wait in **Inbox → Requests awaiting review**.
 Open **Review request**, inspect the complete URL, headers and literal

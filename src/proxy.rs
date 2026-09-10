@@ -9,6 +9,9 @@ use hudsucker::{
 
 use crate::state::{AppState, Verdict};
 
+#[cfg(test)]
+mod basic_auth_tests;
+
 /// A cancelled HTTP handler must not leave an apparently live review in
 /// the log. Ticket drop independently removes the queue item.
 struct ReviewLogGuard {

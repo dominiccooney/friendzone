@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -190,10 +191,28 @@ pub enum Substitution {
     Block(String),
 }
 
+/// HTTP Basic is an encoding of user:password, not a token prefix. Decode only
+/// Authorization (never Proxy-Authorization); preserve the username's bytes.
+/// RFC 7617 forbids control characters and splits on the first colon, so a
+/// password may itself contain colons. Malformed credentials are not escrow.
+fn basic_credentials(value: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    let (scheme, encoded) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Basic") {
+        return None;
+    }
+    let decoded = STANDARD.decode(encoded.trim_start_matches(' ')).ok()?;
+    if decoded.iter().any(u8::is_ascii_control) {
+        return None;
+    }
+    let colon = decoded.iter().position(|byte| *byte == b':')?;
+    Some((decoded[..colon].to_vec(), decoded[colon + 1..].to_vec()))
+}
+
 impl Settings {
     /// The single substitution resolver. Looks for each entry's exact
-    /// fake in its declared header; only an exact match substitutes,
-    /// and only toward a pinned host.
+    /// fake in its declared header or the password of HTTP Basic Authorization.
+    /// Both transports share the host pin and current-secret resolver. Rotation
+    /// takes effect on the next substitution; no real credential is cached here.
     pub fn substitute(
         &self,
         host: &str,
@@ -204,7 +223,16 @@ impl Settings {
                 continue;
             };
             let presented = value.strip_prefix(entry.prefix.as_str()).unwrap_or(&value);
-            if presented != entry.fake {
+            let basic = entry
+                .header
+                .eq_ignore_ascii_case("authorization")
+                .then(|| basic_credentials(&value))
+                .flatten()
+                .filter(|(_, password)| {
+                    !entry.fake.is_empty() && password == entry.fake.as_bytes()
+                });
+            let literal_match = presented == entry.fake;
+            if !literal_match && basic.is_none() {
                 continue;
             }
             if !entry.hosts.iter().any(|h| h == host) {
@@ -219,9 +247,24 @@ impl Settings {
                     entry.name
                 ));
             };
+            let replacement = if literal_match {
+                // Preserve existing raw/prefixed (including whole-header) fakes.
+                format!("{}{real}", entry.prefix)
+            } else {
+                if real.is_empty() || real.bytes().any(|byte| byte.is_ascii_control()) {
+                    return Substitution::Block(format!(
+                        "friendzone: real value for '{}' is invalid for Basic authentication",
+                        entry.name
+                    ));
+                }
+                let (mut username, _) = basic.expect("matched Basic password");
+                username.push(b':');
+                username.extend_from_slice(real.as_bytes());
+                format!("Basic {}", STANDARD.encode(username))
+            };
             return Substitution::Replace {
                 header: entry.header.clone(),
-                value: format!("{}{real}", entry.prefix),
+                value: replacement,
             };
         }
         Substitution::None
@@ -252,6 +295,165 @@ fn write_json_private<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn basic_settings() -> (Settings, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("fz-basic-{}", Uuid::new_v4()));
+        let settings = Settings::load(&dir).unwrap();
+        settings
+            .add_entry(EscrowEntry {
+                name: "github".into(),
+                hosts: vec!["github.com".into(), "api.github.com".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fake-github-token".into(),
+                real_env: None,
+                guest_env: Some("GITHUB_TOKEN".into()),
+            })
+            .unwrap();
+        settings.set_secret("github", "real-token").unwrap();
+        (settings, dir)
+    }
+
+    fn basic_substitution(settings: &Settings, host: &str, value: &str) -> Substitution {
+        settings.substitute(host, |name| (name == "authorization").then(|| value.into()))
+    }
+
+    #[test]
+    fn basic_password_substitution_preserves_username_and_reads_rotated_secret() {
+        let (settings, dir) = basic_settings();
+        for username in ["x-access-token", "octocat", "", "naïve"] {
+            for scheme in ["Basic ", "basic ", "bAsIc   "] {
+                let auth = format!(
+                    "{scheme}{}",
+                    STANDARD.encode(format!("{username}:fake-github-token"))
+                );
+                let Substitution::Replace { header, value } =
+                    basic_substitution(&settings, "github.com", &auth)
+                else {
+                    panic!("Basic substitution expected")
+                };
+                assert_eq!(header, "authorization");
+                assert_eq!(
+                    STANDARD
+                        .decode(value.strip_prefix("Basic ").unwrap())
+                        .unwrap(),
+                    format!("{username}:real-token").as_bytes()
+                );
+            }
+        }
+        let auth = format!("Basic {}", STANDARD.encode(b"octocat:fake-github-token"));
+        settings.set_secret("github", "rotated:token").unwrap();
+        let Substitution::Replace { value, .. } =
+            basic_substitution(&settings, "github.com", &auth)
+        else {
+            panic!("rotated Basic substitution")
+        };
+        assert_eq!(
+            value,
+            format!("Basic {}", STANDARD.encode(b"octocat:rotated:token"))
+        );
+        for presented in ["Bearer fake-github-token", "fake-github-token"] {
+            let Substitution::Replace { value, .. } =
+                basic_substitution(&settings, "api.github.com", presented)
+            else {
+                panic!("existing API auth")
+            };
+            assert_eq!(value, "Bearer rotated:token");
+        }
+        // Split only the first colon; never substring-match a password.
+        let mut entry = settings.entries()[0].clone();
+        entry.name = "colon".into();
+        entry.fake = "fake:with:colons".into();
+        settings.add_entry(entry).unwrap();
+        settings.set_secret("colon", "replacement").unwrap();
+        let auth = format!("Basic {}", STANDARD.encode(b"user:fake:with:colons"));
+        let Substitution::Replace { value, .. } =
+            basic_substitution(&settings, "github.com", &auth)
+        else {
+            panic!("colon password")
+        };
+        assert_eq!(
+            value,
+            format!("Basic {}", STANDARD.encode(b"user:replacement"))
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn basic_fake_keeps_host_pin_and_missing_or_invalid_secret_denials() {
+        let (settings, dir) = basic_settings();
+        let auth = format!("Basic {}", STANDARD.encode(b"octocat:fake-github-token"));
+        for host in ["evil.example", "github.com.evil.example", "github.com."] {
+            let Substitution::Block(reason) = basic_substitution(&settings, host, &auth) else {
+                panic!("pin bypass")
+            };
+            assert!(reason.contains("non-pinned host"));
+            assert!(!reason.contains("real-token"));
+            assert!(!reason.contains(&auth));
+        }
+        settings.remove_secret("github").unwrap();
+        assert!(matches!(
+            basic_substitution(&settings, "github.com", &auth),
+            Substitution::Block(_)
+        ));
+        for secret in ["", "private\r\nsecret", "private\0secret"] {
+            settings.set_secret("github", secret).unwrap();
+            let Substitution::Block(reason) = basic_substitution(&settings, "github.com", &auth)
+            else {
+                panic!("invalid secret")
+            };
+            assert!(!reason.contains("private"));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn basic_nonmatches_and_malformed_values_do_not_inject_credentials() {
+        let (settings, dir) = basic_settings();
+        assert!(matches!(
+            settings.substitute("github.com", |_| None),
+            Substitution::None
+        ));
+        let mut values = vec![
+            "Basic !!!".into(),
+            "Basic".into(),
+            "Basic ".into(),
+            "Bearer unrelated".into(),
+            "Digest fake-github-token".into(),
+        ];
+        for decoded in [
+            b"user".as_slice(),
+            b"user:wrong-token",
+            b"fake-github-token:x",
+            b"user:fake-github-token-extra",
+            b"user:Bearer fake-github-token",
+            b"user\n:fake-github-token",
+            b"user:fake-github-token\0",
+            b"user:\xff",
+        ] {
+            values.push(format!("Basic {}", STANDARD.encode(decoded)));
+        }
+        for value in values {
+            assert!(matches!(
+                basic_substitution(&settings, "github.com", &value),
+                Substitution::None
+            ));
+        }
+        // Don't reinterpret an x-api-key or proxy identity as HTTP origin auth.
+        let mut entry = settings.entries()[0].clone();
+        entry.name = "custom".into();
+        entry.header = "x-api-key".into();
+        entry.prefix = String::new();
+        settings.add_entry(entry).unwrap();
+        let auth = format!("Basic {}", STANDARD.encode(b"guest:fake-github-token"));
+        assert!(matches!(
+            settings.substitute("github.com", |name| (name == "x-api-key"
+                || name == "proxy-authorization")
+                .then(|| auth.clone())),
+            Substitution::None
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn failed_secret_write_keeps_last_good_memory_value() {

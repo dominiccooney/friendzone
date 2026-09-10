@@ -158,6 +158,14 @@ head/base branches, body, file/line and review event—`APPROVE` and
 `REQUEST_CHANGES` are more than comment text. The host's token needs the
 appropriate GitHub write scopes. Binary git pushes are still blocked.
 
+For Git HTTPS, give Git the **fake** token as its password via a credential
+helper/prompt. Friendzone substitutes it inside HTTP Basic credentials,
+preserving the username and host restriction. Merely setting `GITHUB_TOKEN`
+does not configure plain Git. An initial `401` on `info/refs?service=git-receive-pack`
+is GitHub's authentication challenge, not a Friendzone read-policy denial.
+Authenticating discovery does not unblock the subsequent binary push; a PR's
+head branch must already exist remotely. See [Git authentication](README.md#git-https-authentication).
+
 Queries use the actual parsed `query` operation, including fragments and
 introspection. Ambiguous operation selection, unsupported directives/headers,
 URL query parameters and malformed requests still require review or fail
