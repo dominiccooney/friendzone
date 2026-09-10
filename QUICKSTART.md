@@ -144,6 +144,13 @@ in a background tab on localhost, not after closing the browser. Denied or
 unsupported notification permission does not prevent manual review.
 
 GraphQL queries and mutations both require manual review in this version.
+The review panel now parses and formats GraphQL, showing the selected
+operation, actual fields (not just aliases), resolved arguments, variables,
+and known target paths. `addComment` shows the comment separately from its
+`subjectId`. That ID is opaque: it is **not** an issue/PR number. Explicit
+`repository(owner, name).pullRequest/issue(number)` arguments are shown with
+their repository context; these are unverified request values, not saved
+permissions. Unknown targets stay unknown. See [GRAPHQL-REVIEW.md](GRAPHQL-REVIEW.md).
 Only inspectable JSON/text or empty-body writes up to 64 KiB are supported;
 binary git pushes remain blocked. **If the guest times out, deny its old
 pending request before retrying.** Retried requests are separate and may

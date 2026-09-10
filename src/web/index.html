@@ -29,7 +29,16 @@
           <p id="request-review-meta" class="meta"></p>
           <p><strong>Untrusted guest content below.</strong> Review the complete URL, headers and body. Approving does not validate that this operation is safe. Credential headers are hidden; the original values or configured escrow substitution will be used.</p>
           <h4>Headers</h4><pre id="request-review-headers"></pre>
-          <h4>Exact request body</h4><pre id="request-review-body"></pre>
+          <section id="request-graphql" hidden>
+            <h4>GraphQL operation</h4>
+            <p id="request-graphql-operation"></p>
+            <p id="request-graphql-warning" role="status"></p>
+            <div id="request-graphql-fields"></div>
+            <h4>Formatted document</h4><pre id="request-graphql-document"></pre>
+            <h4>Supplied variables</h4><pre id="request-graphql-variables"></pre>
+            <details><summary>Effective variables and structured data (for future rules)</summary><pre id="request-graphql-data"></pre></details>
+          </section>
+          <h4>Exact request body (unchanged on approval)</h4><pre id="request-review-body"></pre>
           <div class="mcp-card-actions"><button id="request-approve" type="button" disabled>Approve once</button><button id="request-deny" type="button" disabled>Deny</button><button id="request-close" type="button">Close review</button></div>
         </section>
         <p id="request-review-status" role="status"></p>

@@ -41,6 +41,9 @@ pub struct Detail {
     pub headers: Vec<(String, String)>,
     /// Literal UTF-8, not rendered HTML/Markdown or an AI-generated summary.
     pub body: String,
+    /// Broker-parsed view of the same body, not an alternate authorization or
+    /// request representation. Kept out of SSE and notifications with bodies.
+    pub graphql: Option<crate::graphql::Review>,
 }
 
 impl Detail {
@@ -121,10 +124,20 @@ impl Detail {
         }
         field(bytes);
         let created_at = Utc::now();
-        let reason = if request.uri().host() == Some("api.github.com")
-            && request.uri().path() == "/graphql"
-        {
-            "GitHub GraphQL POST may be a query or mutation. Review the entire query, operationName and variables; this version does not semantically classify GraphQL."
+        let is_graphql = request
+            .uri()
+            .host()
+            .is_some_and(|host| host.eq_ignore_ascii_case("api.github.com"))
+            && request.uri().path() == "/graphql";
+        let graphql = is_graphql.then(|| {
+            if request.uri().query().is_some() {
+                crate::graphql::Review::Unavailable { message: "URL query parameters may change GraphQL operation selection; structured review is unavailable. Inspect the complete URL and raw body.".into() }
+            } else {
+                crate::graphql::review(body, request.headers().get("content-type").and_then(|v|v.to_str().ok()).unwrap_or(""))
+            }
+        });
+        let reason = if is_graphql {
+            "GitHub GraphQL: inspect the selected operation, actual fields, arguments and targets. Parsed views are advisory; all GraphQL POSTs still require one-shot approval."
         } else {
             "GitHub operation requires one-shot approval. Review the full destination and payload; this does not grant future requests."
         };
@@ -142,6 +155,7 @@ impl Detail {
             },
             headers,
             body: body.into(),
+            graphql,
         })
     }
 }
@@ -318,6 +332,78 @@ pub fn buffer_slots() -> &'static Arc<tokio::sync::Semaphore> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graphql_analysis_is_advisory_and_never_changes_raw_snapshot_or_fingerprint() {
+        let request = |uri: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let body=br#"{"query":"query($n:Int=42){repository(owner:\"cline\",name:\"cline\"){pullRequest(number:$n){id}}}"}"#;
+        let detail =
+            Detail::from_request("guest", &request("https://api.github.com/graphql"), body)
+                .unwrap();
+        let crate::graphql::Review::Parsed { analysis } = detail.graphql.as_ref().unwrap() else {
+            panic!("parsed query")
+        };
+        assert_eq!(analysis.operation_type, "query");
+        assert_eq!(detail.body.as_bytes(), body);
+        assert!(
+            !serde_json::to_string(&detail.summary)
+                .unwrap()
+                .contains("pullRequest"),
+            "parsed bodies must not leak into SSE/notifications"
+        );
+        let repeated =
+            Detail::from_request("guest", &request("https://api.github.com/graphql"), body)
+                .unwrap();
+        assert_eq!(detail.summary.fingerprint, repeated.summary.fingerprint);
+        let formatted = serde_json::json!({"query":analysis.formatted_document}).to_string();
+        let rewritten = Detail::from_request(
+            "guest",
+            &request("https://api.github.com/graphql"),
+            formatted.as_bytes(),
+        )
+        .unwrap();
+        assert_ne!(
+            detail.summary.fingerprint, rewritten.summary.fingerprint,
+            "formatting is not the authorization identity"
+        );
+        let ambiguous = Detail::from_request(
+            "guest",
+            &request("https://api.github.com/graphql?operationName=Other"),
+            body,
+        )
+        .unwrap();
+        assert!(matches!(
+            ambiguous.graphql,
+            Some(crate::graphql::Review::Unavailable { .. })
+        ));
+        let invalid = Detail::from_request(
+            "guest",
+            &request("https://api.github.com/graphql"),
+            br#"{"query":"mutation {"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            invalid.graphql,
+            Some(crate::graphql::Review::Unavailable { .. })
+        ));
+        assert!(
+            Detail::from_request(
+                "guest",
+                &request("https://api.github.com/repos/x/y/issues"),
+                body
+            )
+            .unwrap()
+            .graphql
+            .is_none()
+        );
+    }
     fn detail(guest: &str) -> Detail {
         Detail::from_request(
             guest,

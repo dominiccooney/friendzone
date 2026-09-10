@@ -24,6 +24,9 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     body_bytes:64,fingerprint:"immutable-hash",created_at:"2026-09-09T00:00:00Z",expires_at:"2099-01-01T00:00:00Z",reason:"GraphQL request needs review"};
   state.pending_requests=[pending];
   const detail={...pending,headers:[["content-type","application/json"],["authorization","[redacted]"]],body:'{"query":"<img src=x onerror=window.pwned=true>","variables":{"value":"' + "payload".repeat(200) + '"}}'};
+  detail.graphql={status:"parsed",analysis:{version:1,operation_type:"mutation",operation_name:"Comment",operation_count:1,
+    formatted_document:'mutation Comment($input: AddCommentInput!) {\n  harmless: addComment(input: $input) {\n    clientMutationId\n  }\n}',supplied_variables:'{\n  "input": {"subjectId":"opaque","body":"<img src=x onerror=window.pwned=true>"}\n}',
+    effective_variables:[],warnings:["Parsed syntax only; target is not verified."],fields:[{field:"addComment",response_name:"harmless",path:["harmless"],parent:null,arguments:{},arguments_text:"input: "+"long-argument-".repeat(250),conditions:[],action:"Post comment",comment_body:"<img src=x onerror=window.pwned=true>",target:{kind:"node_id",input_path:"input.subjectId",id:"opaque-"+"node".repeat(80),expected_type:"Issue or PullRequest"}}]}};
   const decisions=[];
   const server = http.createServer((request, response) => {
     const route = request.url.split("?")[0];
@@ -139,6 +142,10 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     for(let i=0;i<100 && !await evaluate("!document.querySelector('#request-review').hidden");i++) await delay(25);
     assert.equal(await evaluate("document.querySelector('#request-review-body').textContent"),detail.body);
     assert.equal(await evaluate("document.querySelector('#request-review-body').children.length"),0);
+    assert.equal(await evaluate("document.querySelector('#request-graphql-document').textContent"),detail.graphql.analysis.formatted_document);
+    assert.equal(await evaluate("document.querySelector('#request-graphql-fields').querySelectorAll('img').length"),0);
+    assert.match(await evaluate("document.querySelector('#request-graphql-fields').textContent"),/Post comment.*Actual field:/s);
+    assert.match(await evaluate("document.querySelector('#request-graphql-fields').textContent"),/NOT an issue\/PR number/);
     assert.equal(await evaluate("!!window.pwned"),false);
     assert.equal(await evaluate("document.querySelector('#inbox-count').textContent"),"1");
     for(const width of [1058,480]) {

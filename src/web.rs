@@ -1240,7 +1240,7 @@ mod tests {
         state.add_container("guest").unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
         let observed = hits.clone();
-        let payload = r#"{"query":"mutation Add { addComment(input: {body: \"<script>not HTML</script>\"}) { clientMutationId } }","variables":{"subjectId":"exact"}}"#;
+        let payload = r#"{"query":"mutation Add($target: ID!, $text: String!) { harmless: addComment(input: {subjectId: $target, body: $text}) { clientMutationId } }","variables":{"target":"opaque-target","text":"<script>not HTML</script>"}}"#;
         let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
         let upstream_task = tokio::spawn(async move {
@@ -1367,6 +1367,22 @@ mod tests {
             assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
             let detail: serde_json::Value = response.json().await.unwrap();
             assert_eq!(detail["body"], payload);
+            assert_eq!(detail["graphql"]["status"], "parsed");
+            let analysis = &detail["graphql"]["analysis"];
+            assert_eq!(analysis["operation_type"], "mutation");
+            assert_eq!(analysis["fields"][0]["field"], "addComment");
+            assert_eq!(analysis["fields"][0]["response_name"], "harmless");
+            assert_eq!(analysis["fields"][0]["target"]["id"], "opaque-target");
+            assert_eq!(
+                analysis["fields"][0]["comment_body"],
+                "<script>not HTML</script>"
+            );
+            assert!(
+                analysis["formatted_document"]
+                    .as_str()
+                    .unwrap()
+                    .contains('\n')
+            );
             assert!(!detail.to_string().contains("fake-github"));
             assert!(!detail.to_string().contains("host-secret"));
             let body = serde_json::json!({"fingerprint":summary.fingerprint,"decision":decision});

@@ -152,9 +152,16 @@ payload, then **Approve once** or **Deny**. Approval releases only that
 immutable request through the normal escrow path, not a rule for future
 requests. The log shows pending, denied, approved and upstream status.
 
-`POST https://api.github.com/graphql` can be a query or mutation: both
-require review until semantic GraphQL parsing is implemented. Inspect
-`query`, `operationName`, and `variables`, not just the operation's name.
+`POST https://api.github.com/graphql` now has a **GraphQL operation** viewer:
+selected query/mutation/subscription, actual fields behind aliases, expanded
+fragments, resolved arguments, variable defaults, formatted document and
+supplied variables. Comment text is shown literally, separately from its
+target. The exact original body remains visible and is forwarded unchanged.
+**Both queries and mutations still require review**; parsing is not a grant
+or full GitHub schema validation. Malformed, ambiguous or unsupported input
+shows a diagnostic and raw body instead of a partial structured summary.
+See [GRAPHQL-REVIEW.md](GRAPHQL-REVIEW.md) for supported syntax and the
+operation/target model intended for future issue/PR-scoped rules.
 Broker credentials never appear in the review; credential headers are
 redacted. URLs and request bodies may themselves contain sensitive guest
 data, so don't share screenshots casually. Payloads are untrusted text,

@@ -1,8 +1,8 @@
 //! Request classification: reads flow, potential writes require review.
 //!
 //! Read vs write is semantic, not the HTTP method: git-upload-pack and
-//! GraphQL queries are reads despite being POSTs. Without a GraphQL parser
-//! we conservatively require review of ALL GraphQL POSTs, queries included.
+//! GraphQL queries are reads despite being POSTs. The review parser is
+//! advisory, not an authorization resolver: ALL GraphQL POSTs still queue.
 //! Unknown origins remain unpoliced while policy grows.
 
 use hudsucker::{Body, hyper::Request};

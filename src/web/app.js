@@ -177,11 +177,37 @@ async function openRequestReview(id) {
     $("#request-review-meta").textContent = `Expires ${new Date(detail.expires_at).toLocaleString()} · SHA-256 ${detail.fingerprint}`;
     $("#request-review-headers").textContent = detail.headers.map(([name,value])=>`${name}: ${value}`).join("\n");
     $("#request-review-body").textContent = detail.body || "(empty body)";
+    renderGraphqlReview(detail.graphql);
     $("#request-review").hidden = false;
     $("#request-approve").disabled = false; $("#request-deny").disabled = false;
     $("#request-review-status").textContent = "Review all fields before approving. Approval is for this request only; upstream success is not guaranteed.";
     $("#request-review").scrollIntoView({behavior:"smooth",block:"start"});
   } catch (error) { if (generation === reviewGeneration) $("#request-review-status").textContent = String(error); }
+}
+
+function renderGraphqlReview(graphql) {
+  $("#request-graphql").hidden = !graphql;
+  for (const id of ["operation","warning","document","variables","data"]) $("#request-graphql-"+id).textContent = "";
+  $("#request-graphql-fields").innerHTML = "";
+  if (!graphql) return;
+  if (graphql.status !== "parsed") {
+    $("#request-graphql-warning").textContent = `Structured review unavailable: ${graphql.message || "unsupported response"}. No operation or target was inferred. Review the raw body; this does not make the request safe.`;
+    return;
+  }
+  const analysis = graphql.analysis;
+  $("#request-graphql-operation").textContent = `${analysis.operation_type.toUpperCase()} · ${analysis.operation_name || "(anonymous)"} · ${analysis.operation_count} operation(s) in document. Names and aliases are guest-chosen, not permissions.`;
+  $("#request-graphql-warning").textContent = analysis.warnings.join("\n");
+  $("#request-graphql-document").textContent = analysis.formatted_document;
+  $("#request-graphql-variables").textContent = analysis.supplied_variables;
+  $("#request-graphql-data").textContent = JSON.stringify({version:analysis.version, effective_variables:analysis.effective_variables, fields:analysis.fields},null,2);
+  $("#request-graphql-fields").innerHTML = analysis.fields.map(field=>{
+    const target = field.target;
+    const conditions = field.conditions_text || [];
+    const targetText = !target ? "Target not identified for this field. Do not infer a target from unrelated variables or response selections."
+      : target.kind === "node_id" ? `Unverified ${target.expected_type} node ID at ${target.input_path}: ${target.id}. This is NOT an issue/PR number; a trusted GitHub lookup is needed.`
+      : `Unverified ${target.expected_type}: ${target.owner}/${target.repository} #${target.number} (explicit request arguments, not a verified pin).`;
+    return `<article class="graphql-field"><strong>${esc(field.action || field.field)}</strong><p>Actual field: <code>${esc(field.field)}</code> · response path: <code>${esc(field.path.join(" → "))}</code>${field.parent===null?" · root operation field":" · nested response selection"}</p><p class="graphql-target">${esc(targetText)}</p>${conditions.length?`<p>Conditions (all branches retained): ${esc(conditions.join("; "))}</p>`:""}${field.comment_body!==null && field.comment_body!==undefined?`<h4>Comment text (literal, not Markdown)</h4><pre>${esc(field.comment_body)}</pre>`:""}<details${field.parent===null?" open":""}><summary>Resolved arguments</summary><pre>${esc(field.arguments_text || "(none)")}</pre></details></article>`;
+  }).join("");
 }
 
 async function decideRequest(decision) {

@@ -102,6 +102,47 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
 
 const pendingRequest = {id:"request-id",container:"guest<script>",method:"POST",url:"https://api.github.com/graphql?x=<script>",body_bytes:42,expires_at:"2099-01-01T00:00:00Z",fingerprint:"exact-hash",reason:"Review complete GraphQL payload",headers:[["authorization","[redacted]"]],body:'{"query":"<script>alert(1)</script>","variables":{"id":42}}'};
 
+const parsedGraphql = {status:"parsed",analysis:{version:1,operation_type:"mutation",operation_name:"InnocentName",operation_count:1,
+  formatted_document:'mutation InnocentName($input: AddCommentInput!) {\n  harmless: addComment(input: $input) {\n    clientMutationId\n  }\n}',
+  supplied_variables:'{\n  "input": {"subjectId":"opaque-node","body":"<img src=x onerror=steal()>"}\n}',effective_variables:[],warnings:["Not schema validated; targets are unverified."],
+  fields:[{field:"addComment",response_name:"harmless",path:["harmless"],parent:null,arguments:{},arguments_text:'input: {subjectId: "opaque-node", body: "<img src=x onerror=steal()>"}',conditions:[{kind:"directive",name:"skip",arguments:{if:{kind:"boolean",value:false}}}],conditions_text:["@skip(if: false) (not evaluated)"],action:"Post comment",comment_body:"<img src=x onerror=steal()>",target:{kind:"node_id",input_path:"input.subjectId",id:"opaque-node",expected_type:"Issue or PullRequest"}}]}};
+
+test("GraphQL review shows actual action, opaque target and comment separately without executing markup", async () => {
+  const f=fixture();
+  const opening=f.run('openRequestReview("request-id")');
+  f.calls.at(-1).resolve({ok:true,json:async()=>({...pendingRequest,graphql:parsedGraphql})}); await opening;
+  const element=id=>f.sandbox.document.querySelector("#request-graphql-"+id);
+  assert.match(element("operation").textContent,/MUTATION.*InnocentName/);
+  assert.equal(element("document").textContent,parsedGraphql.analysis.formatted_document);
+  assert.equal(element("variables").textContent,parsedGraphql.analysis.supplied_variables);
+  const markup=element("fields").innerHTML;
+  assert.match(markup,/Post comment/); assert.match(markup,/Actual field: <code>addComment/);
+  assert.match(markup,/harmless/); assert.match(markup,/opaque-node/); assert.match(markup,/NOT an issue\/PR number/);
+  assert.match(markup,/Comment text \(literal, not Markdown\)/); assert.match(markup,/&lt;img/); assert.doesNotMatch(markup,/<img/);
+  assert.match(markup,/Conditions \(all branches retained\)/);
+  assert.equal(f.sandbox.document.querySelector("#request-review-body").textContent,pendingRequest.body);
+  assert.equal(f.run("activeReview.fingerprint"),"exact-hash");
+});
+
+test("structured GraphQL warnings and non-GraphQL reviews clear previously displayed targets", () => {
+  const f=fixture(); f.run(`renderGraphqlReview(${JSON.stringify(parsedGraphql)})`);
+  f.run('renderGraphqlReview({status:"unavailable",message:"fragment cycle <script>"})');
+  assert.equal(f.sandbox.document.querySelector("#request-graphql-fields").innerHTML,"");
+  assert.equal(f.sandbox.document.querySelector("#request-graphql-document").textContent,"");
+  assert.match(f.sandbox.document.querySelector("#request-graphql-warning").textContent,/fragment cycle.*No operation or target was inferred/);
+  assert.equal(f.sandbox.document.querySelector("#request-graphql-warning").innerHTML,"");
+  f.run('renderGraphqlReview(null)'); assert.equal(f.sandbox.document.querySelector("#request-graphql").hidden,true);
+});
+
+test("repository issue/PR targets preserve repository context rather than extracting a bare number", () => {
+  const f=fixture(); const graph=JSON.parse(JSON.stringify(parsedGraphql));
+  Object.assign(graph.analysis,{operation_type:"query",operation_name:null});
+  Object.assign(graph.analysis.fields[0],{field:"pullRequest",parent:0,action:null,comment_body:null,target:{kind:"repository_number",owner:"cline",repository:"cline",number:"482",expected_type:"PullRequest"}});
+  f.run(`renderGraphqlReview(${JSON.stringify(graph)})`);
+  assert.match(f.sandbox.document.querySelector("#request-graphql-fields").innerHTML,/cline\/cline #482.*not a verified pin/);
+  assert.match(f.sandbox.document.querySelector("#request-graphql-operation").textContent,/QUERY.*anonymous/);
+});
+
 test("review renders guest payload literally and only submits the loaded fingerprint", async () => {
   const f=fixture();
   f.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)}]; renderPendingRequests()`);
