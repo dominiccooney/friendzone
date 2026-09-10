@@ -200,9 +200,14 @@ line. The header is the dashboard: live/killed, doctor state, ruleset,
 agent dots, working/waiting/idle, kill switch. At inbox zero the surface
 is just headers.
 
-Current implementation has no trustworthy agent busy/idle signal: it shows
-authorization state (Approved / Awaiting approval / Killed) and last observed
-guest traffic instead. Approval is not evidence of work. Browser tab choice
+Current hierarchy separates decisions from configuration: Inbox shows pending
+requests, guest joins, then recent outcomes. Settings → Guests owns the
+approved/killed guest list, Kill/Resume/Pin/Remove controls, saved permissions,
+and one expandable setup flow (with manual name preapproval as an advanced
+option). Each guest has one card: actionable joins in Inbox, all others in
+Settings. No trustworthy agent busy/idle signal exists: the cards show
+authorization state and last observed guest traffic instead. Approval is not
+evidence of work. Browser tab choice
 persists locally; host policy (approval, IP pin, kill state, removal) persists
 atomically in the broker data directory, separately from session-local logs
 and activity. A failed policy save does not publish a change.

@@ -185,7 +185,7 @@ For an eligible pending `addComment` request, the review pane offers:
 3. **Approve once** or **Deny** the existing request separately. Saving a
    permission does not release already-waiting requests or replay anything.
 
-**Saved comment permissions** in Inbox lists these grants with Revoke.
+**Settings → Guests → Saved comment permissions** lists these grants with Revoke.
 They are saved atomically alongside guest policy in `containers.json` (at
 most 32 per guest). Removing a guest removes its grants. Kill/IP/approval
 changes remain enforced. Grant/revoke events appear in the memory-only log

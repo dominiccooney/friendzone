@@ -15,15 +15,16 @@
   <main>
     <section id="inbox-view" class="view active">
       <div class="page-heading"><div><h1>Inbox</h1></div><button class="quiet" id="refresh">Refresh</button></div>
-      <form id="add-container" class="filters"><input id="new-container-name" placeholder="new container name (becomes the proxy username)" required><button type="submit">Add container</button></form>
-      <p class="meta">Guest approval grants network access; it does not indicate activity.</p>
-      <p id="container-error" role="alert"></p>
       <section class="request-inbox" aria-labelledby="request-inbox-title">
-        <div class="page-heading"><h2 id="request-inbox-title">Requests</h2><button id="enable-notifications" type="button">Enable notifications</button></div>
+        <div class="page-heading"><h2 id="request-inbox-title">Needs attention</h2><button id="enable-notifications" type="button">Enable notifications</button></div>
         <p id="notification-status" class="meta" role="status"></p>
-        <h3>Pending <span id="pending-count" class="request-count">0</span></h3>
+        <h3>Requests <span id="pending-count" class="request-count">0</span></h3>
         <div id="pending-requests"></div>
-        <details id="recent-reviews-panel" open><summary>Recent <span id="recent-count" class="request-count">0</span></summary><div id="recent-reviews"></div></details>
+        <section id="guest-joins" aria-labelledby="guest-joins-title" hidden>
+          <h3 id="guest-joins-title">Guest join requests <span id="join-count" class="request-count">0</span></h3>
+          <div id="joining-guests" class="containers"></div>
+          <p id="join-error" role="alert"></p>
+        </section>
         <section id="request-review" hidden>
           <div class="request-outcome"><span id="request-review-badge" class="request-badge"></span><span id="request-review-outcome" role="status"></span></div>
           <h3 id="request-review-title"></h3>
@@ -51,10 +52,9 @@
           <details id="request-raw"><summary>Exact request body</summary><pre id="request-review-body"></pre></details>
         </section>
         <p id="request-review-status" role="status"></p>
+        <details id="recent-reviews-panel" open><summary>Recent <span id="recent-count" class="request-count">0</span></summary><div id="recent-reviews"></div></details>
         <details class="review-help"><summary>About approvals</summary><p>Approve once sends the exact request. Pending requests expire after 2 minutes. Deny a timed-out request before retrying to avoid duplicate writes.</p><p>Recent keeps the last 100 reviews in this broker session. A restart clears this history and never replays requests. Credential headers are redacted.</p></details>
       </section>
-      <div id="containers" class="containers"></div>
-      <section class="request-inbox"><h2>Saved comment permissions</h2><p>One guest, one issue/PR. Revocable and saved across restarts.</p><div id="comment-permissions"></div><p id="comment-permissions-status" role="status"></p></section>
     </section>
     <section id="log-view" class="view">
       <div class="page-heading"><div><h1>Request log</h1><p>Search the last 10,000 application requests (memory only). Successful CONNECT setup and authentication challenges are omitted.</p><p id="log-status" class="meta"></p></div></div>
@@ -174,8 +174,13 @@
       </details>
       </section>
       <section id="settings-guests" class="settings-panel">
-      <section id="guest-setup" aria-labelledby="guest-setup-title">
-        <h2 id="guest-setup-title">Set up a guest</h2>
+      <div class="page-heading"><h2>Guests</h2><button id="show-guest-setup" type="button" class="quiet" aria-expanded="false" aria-controls="guest-setup">Set up guest</button></div>
+      <p id="guest-management-hint" class="meta">Approval grants network access, not an activity status. Kill blocks new requests.</p>
+      <button id="review-guest-joins" type="button" class="quiet" hidden>Review join requests in Inbox</button>
+      <p id="container-error" role="alert"></p>
+      <div id="containers" class="containers"></div>
+      <section id="guest-setup" aria-labelledby="guest-setup-title" hidden>
+        <h2 id="guest-setup-title" tabindex="-1">Set up a guest</h2>
         <p>Download and run a script in the guest to connect it to Friendzone.</p>
         <div class="filters"><label>Broker host reachable from guest<input id="setup-host" placeholder="Host IP or DNS name" autocomplete="off"></label><label>Guest name<input id="setup-container" placeholder="Default: guest hostname" autocomplete="off"></label></div>
         <p id="setup-address" class="meta"></p>
@@ -205,11 +210,17 @@
           <p>Linux profile hooks are added once, with backups. Windows writes user—not machine—environment values and records previous values for rollback. Non-interactive bash inherits BASH_ENV from an activated parent; zsh reads .zshenv. Plain sh and services need an activated launcher.</p>
           <p>The script does not change firewall rules or install the CA in a system trust store. It uses runtime CA variables instead. Bootstrap trusts the host/network on first download; inspect the script if unsure. Windows execution policy is not changed.</p>
         </details>
+        <details id="guest-preapprove"><summary>Advanced: preapprove a name</summary>
+          <p>Normally, run setup and approve the guest's observed IP in Inbox. Preapproval allows this name from any IP before it connects; it does not configure the guest.</p>
+          <form id="add-container" class="preapprove-form"><label for="new-container-name">Guest name<input id="new-container-name" required autocomplete="off"></label><button type="submit" id="preapprove-guest">Preapprove name</button></form>
+          <p id="preapprove-status" role="status"></p>
+        </details>
       </section>
+      <details id="saved-comment-permissions"><summary>Saved comment permissions</summary><p>One guest, one issue/PR. Revocable and saved across restarts.</p><div id="comment-permissions"></div><p id="comment-permissions-status" role="status"></p></details>
       </section>
     </section>
   </main>
-  <template id="empty-template"><div class="empty"><h2>No guests connected</h2></div></template>
+  <template id="empty-template"><p class="guest-empty">No approved guests. Set up a guest, then approve its join request in Inbox.</p></template>
   <script src="/app.js"></script>
 </body>
 </html>

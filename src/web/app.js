@@ -38,31 +38,47 @@ async function setKilled(id, killed) {
 }
 
 function rejectedContainerChange(message) { const error = new Error(message); error.policyUnchanged = true; return error; }
-function showContainerError(error) {
-  $("#container-error").textContent = error.policyUnchanged
+function showContainerError(error, target = "#container-error") {
+  if (target === "#join-error") $("#guest-joins").hidden = false;
+  $(target).textContent = error.policyUnchanged
     ? `Change not applied: ${error.message}. Existing policy remains in effect.`
     : `Could not confirm the change: ${error.message || error}. Refresh to check the actual policy; do not assume Kill or approval succeeded.`;
 }
-async function changeContainerPolicy(url, options) {
-  $("#container-error").textContent = "";
+async function changeContainerPolicy(url, options, errorTarget = "#container-error") {
+  $(errorTarget).textContent = "";
   try {
     const response = await fetch(url, options);
     if (!response.ok) throw rejectedContainerChange(await response.text());
     await refresh();
     return true;
-  } catch (error) { showContainerError(error); return false; }
+  } catch (error) { showContainerError(error, errorTarget); return false; }
 }
+
+function guestJoinRequests() { return snapshot.containers.filter(c=>!c.approved && c.state!=="killed"); }
 
 function renderContainers() {
   renderPendingRequests();
   updateMcpConnectionGuests();
+  renderGuestRegistry();
+}
+
+// A guest has one card: actionable joins in Inbox, managed guests in Settings.
+// Both use the same policy handlers; moving a card never changes its permissions.
+function renderGuestRegistry() {
+  const joins = guestJoinRequests();
+  const joining = $("#joining-guests"); joining.innerHTML = "";
   const root = $("#containers"); root.innerHTML = "";
-  if (!snapshot.containers.length) { root.append($("#empty-template").content.cloneNode(true)); return; }
+  $("#join-count").textContent = joins.length;
+  $("#guest-joins").hidden = !joins.length && !$("#join-error").textContent;
+  $("#review-guest-joins").hidden = !joins.length;
+  $("#review-guest-joins").textContent = `Review ${joins.length} join request${joins.length===1?"":"s"} in Inbox`;
+  if (snapshot.containers.length === joins.length) root.append($("#empty-template").content.cloneNode(true));
   for (const c of ordered(snapshot.containers)) {
     const killed = c.state === "killed";
     const pending = !killed && !c.approved;
     const section = document.createElement("section");
-    section.className = "container"; section.draggable = true; section.dataset.id = c.id;
+    section.className = "container"; section.draggable = !pending; section.dataset.id = c.id;
+    const errorTarget = pending ? "#join-error" : "#container-error";
     const pin = c.pinned_ip ? (c.pinned_ip.startsWith("~") ? `last seen ${esc(c.pinned_ip.slice(1))}, not pinned` : `pinned to ${esc(c.pinned_ip)}`) : "any address";
     const actions = pending
       ? `<span class="state killed">awaiting approval</span><button class="approve">Approve</button><button class="approve-pin">Approve + pin IP</button><button class="quiet remove">Deny</button>`
@@ -70,10 +86,10 @@ function renderContainers() {
     section.innerHTML = `<div class="container-head"><span class="status-dot" style="background:${killed?"var(--red)":"#999"}" title="${esc(containerStatus(c))}; agent activity is not monitored"></span><div><div class="container-name">${esc(c.name)}</div><div class="meta">${c.request_count} retained requests · ${esc(containerTraffic(c))} · ${pin}</div></div><div class="actions">${actions}</div></div>${pending?'<div class="container-body">Join request · approve to grant network access.</div>':""}`;
     section.querySelector(".stop")?.addEventListener("click", () => {$("#container-error").textContent="";return setKilled(c.id, !killed).catch(showContainerError);});
     section.querySelector(".approve")?.addEventListener("click", async () => {
-      await changeContainerPolicy(`/api/containers/${encodeURIComponent(c.id)}/approve`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pin_to_last_ip:false})});
+      await changeContainerPolicy(`/api/containers/${encodeURIComponent(c.id)}/approve`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pin_to_last_ip:false})}, errorTarget);
     });
     section.querySelector(".approve-pin")?.addEventListener("click", async () => {
-      await changeContainerPolicy(`/api/containers/${encodeURIComponent(c.id)}/approve`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pin_to_last_ip:true})});
+      await changeContainerPolicy(`/api/containers/${encodeURIComponent(c.id)}/approve`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pin_to_last_ip:true})}, errorTarget);
     });
     section.querySelector(".pin-edit")?.addEventListener("click", async () => {
       const current = c.pinned_ip && !c.pinned_ip.startsWith("~") ? c.pinned_ip : "";
@@ -82,12 +98,12 @@ function renderContainers() {
       await changeContainerPolicy(`/api/containers/${encodeURIComponent(c.id)}/pin`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({ip:ip||null})});
     });
     section.querySelector(".remove").onclick = async () => {
-      if (!confirm(`Remove container '${c.name}'? Kill it first if it is still running.`)) return;
-      await changeContainerPolicy(`/api/containers/${encodeURIComponent(c.id)}`, {method:"DELETE"});
+      if (!confirm(pending ? `Dismiss join request from '${c.name}'? It remains unapproved and may ask again.` : `Remove guest '${c.name}'? Kill it first if it is still running.`)) return;
+      await changeContainerPolicy(`/api/containers/${encodeURIComponent(c.id)}`, {method:"DELETE"}, errorTarget);
     };
     section.addEventListener("dragstart", () => section.classList.add("dragging"));
     section.addEventListener("dragend", () => { section.classList.remove("dragging"); order=[...root.querySelectorAll(".container")].map(n=>n.dataset.id);storeValue("fz-order",JSON.stringify(order)); });
-    root.append(section);
+    (pending ? joining : root).append(section);
   }
   root.ondragover = e => { e.preventDefault(); const active=root.querySelector(".dragging");if(!active)return;const next=[...root.querySelectorAll(".container:not(.dragging)")].find(n=>e.clientY<n.getBoundingClientRect().top+n.offsetHeight/2);root.insertBefore(active,next||null); };
 }
@@ -152,7 +168,7 @@ function notifyPendingRequests(pending) {
 function renderPendingRequests() {
   renderCommentPermissions();
   const pending = snapshot.pending_requests || [];
-  $("#inbox-count").textContent = pending.length + snapshot.containers.filter(container=>!container.approved).length;
+  $("#inbox-count").textContent = pending.length + guestJoinRequests().length;
   const recent = snapshot.recent_reviews || [];
   $("#pending-count").textContent = pending.length;
   $("#recent-count").textContent = recent.length;
@@ -871,8 +887,27 @@ $("#mcp-add").onclick = async () => {
 
 $("#add-container").onsubmit = async (e) => {
   e.preventDefault();
-  if (await changeContainerPolicy("/api/containers",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name:$("#new-container-name").value})})) e.target.reset();
+  const name = $("#new-container-name").value.trim(), button = $("#preapprove-guest");
+  if (button.disabled || !name) return;
+  $("#preapprove-status").textContent = "";
+  if (snapshot.containers.some(c=>c.id===name)) { $("#preapprove-status").textContent = "This guest already exists. Use its existing approval or management controls."; return; }
+  if (!confirm(`Preapprove '${name}' from any IP? This grants network access but does not set up the guest.`)) return;
+  button.disabled = true;
+  try {
+    if (await changeContainerPolicy("/api/containers",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name})}, "#preapprove-status")) {
+      e.target.reset(); $("#preapprove-status").textContent = `Preapproved '${name}'. Use Pin on its guest card to restrict the address.`;
+    }
+  } finally { button.disabled = false; }
 };
+
+$("#show-guest-setup").onclick = () => {
+  const open = $("#guest-setup").hidden;
+  $("#guest-setup").hidden = !open;
+  $("#show-guest-setup").textContent = open ? "Close setup" : "Set up guest";
+  $("#show-guest-setup").setAttribute("aria-expanded", String(open));
+  if (open) { $("#guest-setup-title").focus({preventScroll:true}); $("#guest-setup").scrollIntoView({behavior:"smooth",block:"start"}); }
+};
+$("#review-guest-joins").onclick = () => { selectView("inbox"); $("#guest-joins").scrollIntoView({behavior:"smooth",block:"start"}); };
 
 let editingEntry = null;
 

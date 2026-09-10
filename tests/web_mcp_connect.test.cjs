@@ -20,6 +20,7 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
     scrollIntoView() { this.scrolled = true; },
     append(child) { this.child=child; },
     content: {cloneNode(){return {}; }},
+    attributes: {}, setAttribute(name,value){this.attributes[name]=value;},
   }]));
   const calls = [];
   const timers = [];
@@ -384,6 +385,61 @@ test("failed policy API change is visible and not reported as saved", async () =
   await change;
   assert.match(f.sandbox.document.querySelector("#container-error").textContent,/Change not applied:.*disk full/);
   assert.match(f.sandbox.document.querySelector("#container-error").textContent,/Existing policy remains in effect/);
+});
+
+test("join errors stay in Inbox while preapproval errors stay in Settings", async () => {
+  const f=fixture(), element=id=>f.sandbox.document.querySelector("#"+id);
+  element("guest-joins").hidden=true;
+  const join=f.run('changeContainerPolicy("/api/containers/guest/approve", {method:"POST"}, "#join-error")');
+  f.calls.at(-1).resolve({ok:false,text:async()=>"join save failed"});await join;
+  assert.match(element("join-error").textContent,/join save failed/);
+  assert.equal(element("guest-joins").hidden,false);
+  assert.equal(element("container-error").textContent,"");
+  const create=f.run('changeContainerPolicy("/api/containers", {method:"POST"}, "#preapprove-status")');
+  f.calls.at(-1).resolve({ok:false,text:async()=>"preapproval save failed"});await create;
+  assert.match(element("preapprove-status").textContent,/preapproval save failed/);
+  assert.doesNotMatch(element("join-error").textContent,/preapproval/);
+});
+
+test("guest setup opens one panel without granting access or clearing entered values", () => {
+  const f=fixture(), element=id=>f.sandbox.document.querySelector("#"+id);
+  element("guest-setup").hidden=true;
+  element("setup-container").value="guest-name";
+  const calls=f.calls.length;
+  element("show-guest-setup").onclick();
+  assert.equal(element("guest-setup").hidden,false);
+  assert.equal(element("show-guest-setup").attributes["aria-expanded"],"true");
+  element("show-guest-setup").onclick();
+  assert.equal(element("guest-setup").hidden,true);
+  assert.equal(element("setup-container").value,"guest-name");
+  assert.equal(f.calls.length,calls,"no policy write from showing setup");
+});
+
+test("manual preapproval confirms wildcard scope, rejects existing guests and preserves input on failure", async () => {
+  const f=fixture(), element=id=>f.sandbox.document.querySelector("#"+id);
+  let resets=0, confirmation="";
+  const event={preventDefault(){},target:{reset(){resets++;}}};
+  element("new-container-name").value=" new-guest ";
+  const submit=element("add-container").onsubmit(event);
+  const call=f.calls.at(-1);
+  assert.equal(call.url,"/api/containers");assert.deepEqual(JSON.parse(call.options.body),{name:"new-guest"});
+  assert.equal(element("preapprove-guest").disabled,true);
+  call.resolve({ok:false,text:async()=>"disk full"});await submit;
+  assert.match(element("preapprove-status").textContent,/disk full/);assert.equal(resets,0);
+  assert.equal(element("preapprove-guest").disabled,false);
+  f.sandbox.confirm=message=>{confirmation=message;return false;};
+  let count=f.calls.length;await element("add-container").onsubmit(event);assert.equal(f.calls.length,count);
+  assert.match(confirmation,/any IP/);assert.match(confirmation,/does not set up/);
+  f.run('snapshot.containers=[{id:"new-guest",approved:false,state:"pending"}]');
+  await element("add-container").onsubmit(event);assert.equal(f.calls.length,count);
+  assert.match(element("preapprove-status").textContent,/already exists/);
+});
+
+test("killed unapproved guests are not actionable joins or badge counts", () => {
+  const f=fixture();
+  f.run('snapshot.containers=[{id:"joined",approved:false,state:"pending"},{id:"killed",approved:false,state:"killed"},{id:"ready",approved:true,state:"approved"}];renderPendingRequests()');
+  assert.equal(f.run('guestJoinRequests().length'),1);
+  assert.equal(f.sandbox.document.querySelector("#inbox-count").textContent,1);
 });
 
 test("a lost policy response is reported as unconfirmed rather than unchanged", async () => {

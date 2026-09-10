@@ -52,12 +52,17 @@ containers are denied**: first contact (traffic or the guest setup script) creat
 join request in the Inbox, and nothing flows until you approve it —
 "Approve + pin IP" also locks the name to the address it connected
 from, so containers cannot use each other's names. Pins are editable
-per container (Pin…; empty = any address). "Add container"
-pre-approves a name (wildcard address) before its VM boots. Kill/Resume
+under **Settings → Guests** (Pin…; empty = any address). The advanced
+**Set up guest → Preapprove a name** option pre-approves a name (wildcard
+address) before its VM boots; it does not install or configure the guest. Kill/Resume
 stops traffic reversibly; Remove forgets the container (its log rows
 remain for audit).
 
-The overview reports **Approved**, **Awaiting approval**, or **Killed**.
+Inbox is for decisions: pending requests, guest joins, then recent outcomes.
+Approved/killed guests and saved comment permissions live under
+**Settings → Guests**, alongside the single expandable **Set up guest** flow.
+The guest list reports **Approved** or **Killed**; actionable joins appear only
+in Inbox as **Awaiting approval**.
 These describe network authorization, not whether an agent is working, idle,
 or online. Last observed guest traffic is shown separately; administrative
 actions do not count as traffic. The selected Inbox/Log/Settings tab is
@@ -82,7 +87,7 @@ changing the data directory also starts a separate policy store.
 
 ## Set up a guest
 
-Use **Settings → Guests**. Select Linux or Windows, copy the `curl` download
+Use **Settings → Guests → Set up guest**. Select Linux or Windows, copy the `curl` download
 command, and run the downloaded script in the guest account. No guest binary,
 compiler, or platform-specific build is needed. Linux requires Python 3;
 Windows requires curl.exe and PowerShell 5.1 or 7.
@@ -151,7 +156,7 @@ Future supported comments with different text are verified against GitHub
 and reconstructed by the broker, without repeated approval. Other
 operations or unsupported request shapes still go to Inbox. The current
 waiting request still needs **Approve once** or **Deny** separately.
-Use **Saved comment permissions → Revoke** to remove the permission.
+Use **Settings → Guests → Saved comment permissions → Revoke** to remove the permission.
 Grants survive restart; guest removal removes them and token changes make
 them inactive. See [the exact contract](GRAPHQL-REVIEW.md#verified-per-guest-comment-permissions).
 Broker credentials never appear in the review; credential headers are

@@ -1,6 +1,6 @@
 # Set up a guest
 
-Open **Settings → Guests** on the host. Choose the guest platform/name, copy
+Open **Settings → Guests → Set up guest** on the host. Choose the guest platform/name, copy
 the curl command, and run it in the guest terminal. The command only downloads
 a script. Inspect it if desired, then run the separate command shown below it.
 No guest fz binary, architecture-specific build or compiler is involved.

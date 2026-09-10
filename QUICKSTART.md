@@ -39,19 +39,22 @@ a dedicated internal switch, static addresses, and explicit port ACLs.
 
 Open <http://127.0.0.1:8081>.
 
-- **Containers**: either pre-add one (Inbox → Add container, e.g.
-  `reviewer`), or just run the guest setup script in the guest — it appears in the
+- **Guests**: open **Settings → Guests → Set up guest** and run the script
+  in the guest — it appears in the
   Inbox as "awaiting approval"; click **Approve + pin IP** to admit it
   and lock the name to its address. Unknown containers are denied until
-  approved.
-- **Overview and restarts:** "Approved" means permitted to use the network,
+  approved. Manual name preapproval is an advanced option inside the same
+  setup flow; it allows any source IP and does not configure the guest.
+- **Management and restarts:** approved/killed guests, Kill/Resume, Pin,
+  Remove and saved comment permissions are in **Settings → Guests**.
+  "Approved" means permitted to use the network,
   not "working" or "online". The last traffic timestamp is separate and is
   reset on broker restart. Inbox/Log/Settings selection survives browser
   reloads. Host approval/pin/kill/remove actions are saved in `containers.json`
   under the broker data directory; reuse that directory when restarting.
   Old in-memory approvals require one new approval after upgrading. Pending
   unreviewed joins are not saved and reappear when the guest reconnects.
-  A save error leaves the previous policy in effect and appears in the Inbox;
+  A save error leaves the previous policy in effect and appears beside the action;
   do not assume a failed Kill succeeded. Invalid saved policy stops startup.
 - **Settings → Escrowed credentials** — pick a provider preset
   (Anthropic, Cline, GitHub, or Custom…), paste the real key in the one
@@ -171,7 +174,7 @@ single `addComment` using Friendzone's fake GitHub Bearer token:
 Later supported comments on that target can have different text and need no
 new approval; the broker rechecks GitHub and reconstructs a narrow mutation.
 Other targets, bundled mutations or unsupported fields/headers still queue.
-Revoke from **Saved comment permissions** in Inbox. Permissions survive
+Revoke from **Settings → Guests → Saved comment permissions**. Permissions survive
 restart and are removed with the guest; token changes need a new grant.
 The review panel now parses and formats GraphQL, showing the selected
 operation, actual fields (not just aliases), resolved arguments, variables,
@@ -188,7 +191,7 @@ security boundaries and cancellation details.
 
 ## 3. Guest: download and run the setup script
 
-In **Settings → Guests**, select the guest platform and name. The UI supplies
+In **Settings → Guests → Set up guest**, select the guest platform and name. The UI supplies
 a short curl download command and a separate run command. Run both in the
 guest, not the host. Linux uses Python 3's standard library; Windows uses
 PowerShell. Neither needs an fz binary or Rust compiler.
@@ -334,6 +337,6 @@ flow while writes remain gated.
 | Where     | What                                                              |
 |-----------|-------------------------------------------------------------------|
 | Host      | `cargo run -- broker --proxy-addr HOST_IP:8080 --ui-addr 127.0.0.1:8081 --bootstrap-addr HOST_IP:8082` |
-| Browser   | `http://127.0.0.1:8081` — add container, escrow entries, connect MCP |
-| Guest     | Settings → Guests → curl script → run → activate environment → approve in host Inbox |
+| Browser   | `http://127.0.0.1:8081` — Inbox for decisions; Settings for guests, credentials and MCP |
+| Guest     | Settings → Guests → Set up guest → curl script → run → activate → approve in host Inbox |
 

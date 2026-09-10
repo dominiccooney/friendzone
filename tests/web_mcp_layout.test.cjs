@@ -31,6 +31,8 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     effective_variables:[],warnings:["Parsed syntax only; target is not verified."],fields:[{field:"addComment",response_name:"harmless",path:["harmless"],parent:null,arguments:{},arguments_text:"input: "+"long-argument-".repeat(250),conditions:[],action:"Post comment",comment_body:"<img src=x onerror=window.pwned=true>",target:{kind:"node_id",input_path:"input.subjectId",id:"opaque-"+"node".repeat(80),expected_type:"Issue or PullRequest"}}]}};
   const decisions=[];
   const permissionActions=[];
+  const guestActions=[];
+  let failGuestChange = false;
   const resolvedTarget={target:{node_id:"canonical",repository_id:"repo-id",repository:"cline/cline",kind:"Issue",number:482,title:"<img src=x onerror=window.pwned=true> A real issue",url:"https://github.com/cline/cline/issues/482"},credential:"github"};
   detail.comment_permission_supported=true;
   const server = http.createServer((request, response) => {
@@ -61,6 +63,21 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
         state.recent_reviews=[{...pending,status:detail.status,http_status:201,outcome:detail.outcome,updated_at:detail.updated_at}];
         response.writeHead(204); response.end();
       }); return;
+    }
+    if (route === "/api/containers" || /^\/api\/containers\/[^/]+(?:\/(approve|kill|pin))?$/.test(route)) {
+      let body="";request.on("data",chunk=>body+=chunk);request.on("end",()=>{
+        const data=body?JSON.parse(body):{};
+        guestActions.push({route,method:request.method,body:data});
+        if(failGuestChange){failGuestChange=false;response.writeHead(500);response.end("fixture policy save failed");return;}
+        const parts=route.split("/"),name=decodeURIComponent(parts[3]||data.name), action=parts[4];
+        const guest=state.containers.find(c=>c.id===name);
+        if(route==="/api/containers")state.containers.push({id:name,name,approved:true,state:"approved",request_count:0,last_activity:null,pinned_ip:null});
+        else if(request.method==="DELETE")state.containers=state.containers.filter(c=>c.id!==name);
+        else if(action==="approve"){guest.approved=true;guest.state="approved";if(data.pin_to_last_ip)guest.pinned_ip="10.0.0.2";}
+        else if(action==="kill")guest.state=data.killed?"killed":"approved";
+        else if(action==="pin")guest.pinned_ip=data.ip;
+        response.writeHead(204);response.end();
+      });return;
     }
     const assets = { "/": ["index.html", "text/html"], "/app.js": ["app.js", "text/javascript"], "/app.css": ["app.css", "text/css"] };
     if (assets[route]) {
@@ -111,11 +128,91 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     await send("Runtime.enable"); await send("Page.enable");
     await send("Page.navigate", { url: `http://127.0.0.1:${server.address().port}/` });
     for (let i = 0; i < 100 && !await evaluate("!!document.querySelector('[data-view=settings]')?.onclick"); i++) await delay(25);
+    const joinGuest={id:"joining-guest",name:"joining-guest",approved:false,state:"pending",request_count:1,last_activity:null,pinned_ip:"~10.0.0.2"};
+    state.containers.push(joinGuest);
+    await evaluate("refresh()");
+    for(const width of [1058,480]) {
+      await send("Emulation.setDeviceMetricsOverride",{width,height:1000,deviceScaleFactor:1,mobile:false});
+      await evaluate("window.scrollTo(0,0)");
+      const hierarchy=await evaluate(`(() => {const inbox=document.querySelector('#inbox-view'),rect=s=>document.querySelector(s).getBoundingClientRect();return {
+        forms:inbox.querySelectorAll('form').length,setup:inbox.contains(document.querySelector('#guest-setup')),
+        management:inbox.querySelectorAll('.stop,.pin-edit').length,joins:inbox.querySelectorAll('.container').length,
+        pendingY:rect('#pending-requests').top,joinY:rect('#guest-joins').top,recentY:rect('#recent-reviews-panel').top,
+        hasDupes:[...document.querySelectorAll('[id]')].length!==new Set([...document.querySelectorAll('[id]')].map(n=>n.id)).size,
+        page:document.documentElement.scrollWidth,firstAction:inbox.querySelector('[data-review]').getBoundingClientRect().bottom,
+        setupParent:document.querySelector('#add-container').closest('.settings-panel').id,
+        manual:document.querySelector('#guest-preapprove').open,settingsCards:document.querySelectorAll('#settings-guests .container').length};})()`);
+      assert.deepEqual([hierarchy.forms,hierarchy.setup,hierarchy.management,hierarchy.hasDupes,hierarchy.manual],[0,false,0,false,false]);
+      assert.equal(hierarchy.joins,1);assert.equal(hierarchy.settingsCards,1);assert.equal(hierarchy.setupParent,'settings-guests');
+      assert.ok(hierarchy.pendingY<hierarchy.joinY && hierarchy.joinY<hierarchy.recentY,JSON.stringify(hierarchy));
+      assert.ok(hierarchy.firstAction<400,JSON.stringify(hierarchy));assert.ok(hierarchy.page<=width+1,JSON.stringify(hierarchy));
+      if(process.env.FZ_SCREENSHOT_DIR){fs.mkdirSync(process.env.FZ_SCREENSHOT_DIR,{recursive:true});const shot=await send('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(process.env.FZ_SCREENSHOT_DIR,`inbox-hierarchy-${width}.png`),Buffer.from(shot.data,'base64'));}
+    }
+    // Failure stays with the join; a successful approval moves, not copies, its card.
+    await evaluate("selectView('settings');selectSettings('guests')");
+    assert.equal(await evaluate("document.querySelector('#review-guest-joins').hidden"),false);
+    await evaluate("document.querySelector('#review-guest-joins').click()");
+    assert.equal(await evaluate("document.querySelector('.view.active').id"),'inbox-view');
+    assert.equal(guestActions.length,0,"navigation never grants access");
+    failGuestChange=true;
+    await evaluate("document.querySelector('#joining-guests .approve-pin').click()");
+    for(let i=0;i<100 && !await evaluate("document.querySelector('#join-error').textContent");i++)await delay(25);
+    assert.match(await evaluate("document.querySelector('#join-error').textContent"),/fixture policy save failed/);
+    assert.equal(await evaluate("document.querySelector('#container-error').textContent"),"");
+    assert.equal(await evaluate("document.querySelector('#inbox-count').textContent"),"2");
+    await evaluate("document.querySelector('#joining-guests .approve-pin').click()");
+    for(let i=0;i<100 && await evaluate("!!document.querySelector('#joining-guests .container')");i++)await delay(25);
+    assert.equal(await evaluate("document.querySelector('#guest-joins').hidden"),true);
+    assert.equal(await evaluate("document.querySelector('#inbox-count').textContent"),"1");
+    assert.equal(await evaluate("document.querySelectorAll('[data-id=joining-guest]').length"),1);
+    assert.deepEqual(guestActions.at(-1).body,{pin_to_last_ip:true});
     await evaluate("document.querySelector('[data-view=settings]').click()");
     for (let i = 0; i < 100 && !await evaluate("!!document.querySelector('.mcp-card')"); i++) await delay(25);
     assert.equal(await evaluate("document.querySelector('#settings-guests').hidden"),false);
     assert.equal(await evaluate("document.querySelector('#settings-mcp').hidden"),true);
     assert.equal(await evaluate("document.querySelector('#setup-platform-powershell').hidden"),true);
+    assert.equal(await evaluate("document.querySelector('#guest-setup').hidden"),true);
+    for(const width of [1058,480]) {
+      await send('Emulation.setDeviceMetricsOverride',{width,height:1000,deviceScaleFactor:1,mobile:false});
+      await evaluate("window.scrollTo(0,0)");await delay(50);
+      assert.ok(await evaluate(`document.documentElement.scrollWidth<=${width+1}`));
+      if(process.env.FZ_SCREENSHOT_DIR){const shot=await send('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(process.env.FZ_SCREENSHOT_DIR,`guest-management-${width}.png`),Buffer.from(shot.data,'base64'));}
+    }
+    assert.equal(await evaluate("document.querySelector('#guest-preapprove').open"),false);
+    // Managed operations still use the same API and expose failures beside the card.
+    failGuestChange=true;
+    await evaluate("document.querySelector('[data-id=joining-guest] .stop').click()");
+    for(let i=0;i<100 && !await evaluate("document.querySelector('#container-error').textContent");i++)await delay(25);
+    assert.match(await evaluate("document.querySelector('#container-error').textContent"),/fixture policy save failed/);
+    await evaluate("document.querySelector('[data-id=joining-guest] .stop').click()");
+    for(let i=0;i<100 && !await evaluate("!!document.querySelector('[data-id=joining-guest] .resume')");i++)await delay(25);
+    assert.equal(await evaluate("document.querySelector('[data-id=joining-guest] .state').textContent"),"Killed");
+    await evaluate("document.querySelector('[data-id=joining-guest] .resume').click()");
+    for(let i=0;i<100 && await evaluate("!!document.querySelector('[data-id=joining-guest] .resume')");i++)await delay(25);
+    assert.equal(await evaluate("document.querySelector('[data-id=joining-guest] .state').textContent"),"Approved");
+    assert.deepEqual(guestActions.at(-1).body,{killed:false});
+    await evaluate("window.prompt=()=> '10.0.0.3';document.querySelector('[data-id=joining-guest] .pin-edit').click()");
+    for(let i=0;i<100 && !await evaluate("document.querySelector('[data-id=joining-guest] .meta').textContent.includes('pinned to 10.0.0.3')");i++)await delay(25);
+    assert.deepEqual(guestActions.at(-1).body,{ip:'10.0.0.3'});
+    await evaluate("window.confirm=()=>true;document.querySelector('[data-id=joining-guest] .remove').click()");
+    for(let i=0;i<100 && await evaluate("!!document.querySelector('[data-id=joining-guest]')");i++)await delay(25);
+    await evaluate("document.querySelector('#show-guest-setup').click();document.querySelector('#guest-preapprove').open=true;document.querySelector('#new-container-name').value='preapproved';document.querySelector('#preapprove-guest').click()");
+    for(let i=0;i<100 && !await evaluate("!!document.querySelector('[data-id=preapproved]')");i++)await delay(25);
+    assert.deepEqual(guestActions.at(-1).body,{name:'preapproved'});
+    assert.match(await evaluate("document.querySelector('#preapprove-status').textContent"),/Preapproved/);
+    assert.equal(await evaluate("document.querySelector('#inbox-count').textContent"),"1");
+    await evaluate("document.querySelector('[data-id=preapproved] .remove').click();document.querySelector('#guest-preapprove').open=false;document.querySelector('#show-guest-setup').click()");
+    for(let i=0;i<100 && await evaluate("!!document.querySelector('[data-id=preapproved]')");i++)await delay(25);
+    assert.equal(await evaluate("document.querySelector('#guest-setup').hidden"),true);
+    state.containers.push({...joinGuest,approved:false,state:'pending'});
+    await evaluate("refresh();selectView('inbox')");
+    for(let i=0;i<100 && !await evaluate("!!document.querySelector('#joining-guests .remove')");i++)await delay(25);
+    await evaluate("document.querySelector('#joining-guests .remove').click()");
+    for(let i=0;i<100 && await evaluate("!!document.querySelector('#joining-guests .remove')");i++)await delay(25);
+    assert.equal(await evaluate("document.querySelector('#guest-joins').hidden"),true);
+    assert.equal(guestActions.at(-1).method,'DELETE');
+    assert.equal(await evaluate("document.querySelector('#inbox-count').textContent"),'1');
+    await evaluate("selectView('settings');selectSettings('guests')");
     for (const width of [1058, 480]) {
       await send("Emulation.setDeviceMetricsOverride", { width, height: 1000, deviceScaleFactor: 1, mobile: false });
       await evaluate("document.querySelector('[data-settings=mcp]').click()");
@@ -140,6 +237,7 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
       assert.ok(layout.copyLeft >= 0 && layout.copyRight <= width, JSON.stringify(layout));
       assert.ok(layout.pageWidth <= width + 1, JSON.stringify(layout));
       await evaluate("document.querySelector('[data-settings=guests]').click()");
+      await evaluate("if(document.querySelector('#guest-setup').hidden)document.querySelector('#show-guest-setup').click()");
       const setup=await evaluate(`(() => {const panel=document.querySelector('#guest-setup'), command=document.querySelector('#setup-sh');return {width:panel.clientWidth,scroll:panel.scrollWidth,value:command.value,copyDisabled:document.querySelector('#setup-copy-sh').disabled,inspect:document.querySelector('#setup-view-sh').href};})()`);
       assert.ok(setup.width>100);
       assert.ok(setup.scroll<=setup.width+1,JSON.stringify(setup));
@@ -188,8 +286,9 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
       assert.equal(await evaluate("document.querySelector('.view.active').id"), `${tab}-view`);
       if (tab === "inbox") {
         for (let i=0;i<100 && !await evaluate("!!document.querySelector('.container')");i++) await delay(25);
-        assert.equal(await evaluate("document.querySelector('.container .state').textContent"), "Approved");
-        assert.match(await evaluate("document.querySelector('.container .meta').textContent"), /No guest traffic observed/);
+        assert.equal(await evaluate("document.querySelector('#settings-guests .container .state').textContent"), "Approved");
+        assert.match(await evaluate("document.querySelector('#settings-guests .container .meta').textContent"), /No guest traffic observed/);
+        assert.equal(await evaluate("document.querySelectorAll('#inbox-view .container, #inbox-view form').length"),0);
       }
     }
     assert.equal(await evaluate("document.querySelector('#settings-credentials').hidden"),false);
@@ -216,9 +315,10 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     assert.equal(permissionActions[1].headers["x-friendzone-review"],"1");
     assert.deepEqual(permissionActions[1].body,{fingerprint:"immutable-hash",resolution_id:"resolution"});
     assert.equal(await evaluate("document.querySelector('#inbox-count').textContent"),"1");
-    await evaluate("document.querySelector('[data-comment-revoke]').click()");
+    await evaluate("selectView('settings');selectSettings('guests');document.querySelector('#saved-comment-permissions').open=true;document.querySelector('[data-comment-revoke]').click()");
     for(let i=0;i<100 && await evaluate("!!document.querySelector('[data-comment-revoke]')");i++) await delay(25);
     assert.equal(permissionActions.length,3);
+    await evaluate("selectView('inbox')");
     for(const width of [1058,480]) {
       await send("Emulation.setDeviceMetricsOverride",{width,height:1000,deviceScaleFactor:1,mobile:false});
       const layout=await evaluate(`(() => {document.querySelector('#request-raw').open=true;const body=document.querySelector('#request-review-body'), button=document.querySelector('#request-approve');return {page:document.documentElement.scrollWidth,body:body.clientWidth,scroll:body.scrollWidth,button:button.getBoundingClientRect().right,disabled:button.disabled};})()`);
