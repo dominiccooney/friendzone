@@ -23,7 +23,7 @@ Local demo without a VM? Use `127.0.0.1` everywhere `HOST_IP` appears.
 |-----------|-------------------|-----------------------------------------------|
 | proxy     | `HOST_IP:8080`    | containers (HTTP/HTTPS via `HTTP(S)_PROXY`)   |
 | UI        | `127.0.0.1:8081`  | you, in the host browser                      |
-| bootstrap | `HOST_IP:8082`    | containers (`fz` binary, CA, fakes, MCP)      |
+| bootstrap | `HOST_IP:8082`    | guests (setup scripts, CA, fakes, MCP)         |
 
 The broker rejects non-loopback UI binds and proxy traffic to its management
 port. Proxied loopback destinations (including `127.0.0.1`, `localhost`, and
@@ -40,7 +40,7 @@ a dedicated internal switch, static addresses, and explicit port ACLs.
 Open <http://127.0.0.1:8081>.
 
 - **Containers**: either pre-add one (Inbox → Add container, e.g.
-  `reviewer`), or just run `fz setup` in the guest — it appears in the
+  `reviewer`), or just run the guest setup script in the guest — it appears in the
   Inbox as "awaiting approval"; click **Approve + pin IP** to admit it
   and lock the name to its address. Unknown containers are denied until
   approved.
@@ -64,7 +64,7 @@ Open <http://127.0.0.1:8081>.
   the tokens in the background and auto-refreshes them. Edit fixes a wrong
   header/host without changing the fake; Delete removes the entry and
   its stored key together.
-- **Settings → MCP forwards** — find a server in host Cline or enter its
+- **Settings → MCP servers** — find a server in host Cline or enter its
   name and upstream URL. **Add & authorize** creates it and starts host
   sign-in in one step. Complete login, then **Next: choose tools and guests**
   and **Save guest access**. Until that last step, a new server is private
@@ -186,136 +186,66 @@ pending request before retrying.** Retried requests are separate and may
 duplicate a write. See [GitHub policy](README.md#github-policy) for limits,
 security boundaries and cancellation details.
 
-## 3. Container: bootstrap
+## 3. Guest: download and run the setup script
 
-**Preferred: host UI → Settings → Set up a guest.** Choose the guest-reachable
-host/name, inspect the script, copy either the Linux (sh/bash/zsh) or Windows
-PowerShell command, and run it **in the guest**, with guest Cline stopped.
-This downloads the exact matching build and runs setup with persistent guest
-configuration. Linux adds profile hooks once; Windows sets user environment,
-not machine environment. No sudo, firewall or system trust-store changes.
-Start a fresh shell or use the printed activation command; on Windows sign
-out/in to refresh GUI launchers. [Full behavior and rollback](GUEST-BOOTSTRAP.md).
+In **Settings → Guests**, select the guest platform and name. The UI supplies
+a short curl download command and a separate run command. Run both in the
+guest, not the host. Linux uses Python 3's standard library; Windows uses
+PowerShell. Neither needs an fz binary or Rust compiler.
 
-The manual path below is useful when no matching guest build is hosted yet.
-
-Cross-OS note: `/bootstrap/fz` is the *host's* binary. On a Linux guest
-of a Windows host, build `fz` in the guest instead (needs rust +
-build-essential):
+For example, in a Linux guest:
 
 ```sh
-git clone https://github.com/dominiccooney/friendzone
-cd friendzone && cargo build --release
-sudo ./target/release/fz setup --broker http://HOST_IP:8082 --install
+curl --noproxy '*' -fsS 'http://HOST_IP:8082/bootstrap/setup?shell=sh&container=reviewer' -o friendzone-setup.sh
+sh ./friendzone-setup.sh
 ```
 
-On a guest matching the host platform:
+In Windows guest PowerShell:
 
-```sh
-curl -o fz http://HOST_IP:8082/bootstrap/fz
-chmod +x fz
-sudo ./fz setup --broker http://HOST_IP:8082 --install
+```powershell
+curl.exe --noproxy "*" -fsS 'http://HOST_IP:8082/bootstrap/setup?shell=powershell&container=reviewer' -o friendzone-setup.ps1
+& .\friendzone-setup.ps1
 ```
 
-Running under `sudo` is fine: setup detects the invoking user and
-writes the CA, env file, and Cline settings into *their* home
-(`~/.config/friendzone/`, `~/.cline/`), owned by them and
-readable by that user — only the CA trust-store install needs root.
-The CA/env are public; the merged Cline provider file is owner-only.
+The script updates the guest's Cline provider file, so close guest Cline before
+running it. Existing model/other-provider settings are retained. Real keys
+stay on the host. Download scripts only over a trusted host/network; the first
+HTTP download is not authenticated. The script does not change the guest's
+firewall or system CA store; runtime CA variables are configured instead.
 
-This installs the CA into the trust store and writes two files next to
-each other (path is printed; typically `~/.config/friendzone/`):
+## 4. Guest: activate and approve
 
-- `friendzone-ca.pem` — the CA for runtimes with their own bundle
-- `friendzone-env.sh` — the fake credentials, as `export` lines
+Linux prints an activation command; source it in the current terminal or open
+a new login shell. Managed hooks persist across bash/zsh starts without being
+added again on reruns. Zsh reads .zshenv for non-interactive shells; bash uses
+BASH_ENV inherited from an activated parent. Plain sh and service launchers
+need explicit environment inheritance.
 
-If a `CLINE_API_KEY` fake exists, setup also writes
-`~/.cline/data/settings/providers.json` registering the `cline`
-provider with the fake key — Cline CLI/IDE inference works immediately,
-no guest OAuth login. Run setup while guest Cline is stopped: model choice,
-other providers and last-used choice are preserved, but this provider's
-OAuth fields are removed so stale access tokens cannot override the fake.
-The v1 store includes `version`, `modes`, UTC `updatedAt`, and a valid
-`tokenSource: "manual"`. Older setup output lacked valid metadata, causing
-Cline to discard the store; rerun the updated setup to repair it.
+Windows activates its PowerShell process and saves user environment variables.
+Restart guest applications; sign out/in for other Windows launchers to acquire
+a fresh environment. Machine environment and execution policy are unchanged.
 
-## 4. Container: agent shell environment
+Approve/pin the guest in the host Inbox, then restart guest Cline. The generated
+environment includes broker and loopback NO_PROXY entries, both proxy cases on
+Linux, fake provider keys and runtime CA paths. See
+[GUEST-BOOTSTRAP.md](GUEST-BOOTSTRAP.md) for rollback and persistence details.
 
-`fz setup` writes everything — proxy vars (with this guest's identity),
-CA bundle vars, and the fake keys — into one file. Activate it:
+Read-only checks (use your guest name):
 
 ```sh
-. ~/.config/friendzone/friendzone-env.sh
-```
-
-The file also exports `FZ_HOST` and `FZ_BROKER`, both proxy-variable cases,
-and `NO_PROXY`/`no_proxy` for the broker host and guest loopback:
-`localhost`, `127.0.0.1`, `::1`, and `[::1]`. Existing exclusions from both
-variables are merged without duplicates. Cline hub health checks and other
-guest-local HTTP requests must stay inside the guest, not be sent to the
-host proxy's loopback. `GIT_SSL_CAINFO` trusts the intercepted origin certificate;
-`GIT_PROXY_SSL_CAINFO` alone was not sufficient for an HTTP proxy.
-
-If you used an older generated env file, update/rebuild the **guest** `fz`,
-rerun setup with the same broker/container arguments, and source the new file.
-No broker restart or CA reinstall is needed for this environment fix. Restart
-the guest Cline CLI/hub (or its service) with the new environment: changing a
-shell variable cannot update already-running processes. For an immediate
-temporary repair, after sourcing the old file in the guest shell:
-
-```sh
-export NO_PROXY="localhost,127.0.0.1,::1,[::1]${NO_PROXY:+,$NO_PROXY}${no_proxy:+,$no_proxy}"
-export no_proxy="$NO_PROXY"
-```
-
-This is a client-routing fix, not access control: a guest can override it.
-Keep the host-enforced network restrictions in place, and do not expose
-host-local services through the proxy expecting `NO_PROXY` to protect them.
-
-Add the environment-file source line to the agent's shell profile so it persists.
-The served scripts automate that step, or run setup as the normal guest user with
-`--persist-profile`. Windows defaults to `friendzone-env.ps1` and persists
-user environment; `-NoProfile` processes inherit it from fresh launchers. The
-container identity defaults to the guest hostname; pass
-`--container reviewer` to `fz setup` to match a name you added in the
-UI. Then check everything:
-
-```sh
-./fz doctor --broker http://HOST_IP:8082 --proxy http://reviewer:x@HOST_IP:8080
-```
-
-Doctor checks broker health **directly**, ignoring proxy environment
-variables. Its proxy reachability check is **TCP only**: a pass does not
-verify container approval, proxy forwarding, or CA trust. If setup says
-"awaiting approval", open the **host's** UI at <http://127.0.0.1:8081> and
-approve the container in the Inbox before trying agent traffic.
-
-### Troubleshooting: doctor reports 403 after sourcing the env file
-
-Older builds sent even the broker health check through `HTTP_PROXY`, so
-an unapproved container produced a misleading "broker reachable" failure.
-Compare the direct and proxied paths (use your actual container name):
-
-```sh
-# Expect HTTP 200 and "ok", even before approval.
 curl --noproxy '*' -i http://HOST_IP:8082/health
-
-# A 403 body explains the proxy denial: pending approval, wrong IP pin, etc.
 curl --noproxy '' --proxy http://reviewer:x@HOST_IP:8080 -i http://HOST_IP:8082/health
 ```
 
-Approve the name in the host Inbox; if already approved, check its IP pin
-and Kill/Resume state. Rebuild the guest binary with `cargo build --release`
-after updating it to include the fix. `fz setup` also contacts the broker
-directly, so rerunning setup after sourcing the env works before approval.
-There is no need to disable TLS verification or globally bypass the proxy.
+The first should return 200 before approval. A 403 from the second explains
+pending approval, Kill, or IP-pin failures. Do not disable TLS verification.
 
 ## 5. Container: point the agent at MCP forwards
 
 In the host UI, each MCP server card has **Copy URL** next to its
 guest-facing URL; copying it requires no guest selection. The upstream URL
 is Linear's (or another provider's) server, not the URL to add in guest Cline.
-Use **Settings → MCP forwards → Copy Cline setup** for
+Use **Settings → MCP servers → Connect guest → Copy Cline configuration** for
 the guest endpoint and copyable Cline JSON for each forward. Select the
 guest and merge the generated entry into its Cline MCP settings; do not
 overwrite other servers. The broker host/port default comes from the
@@ -360,7 +290,7 @@ all apply. No upstream credential is given to the guest.
 That can be a missing guest `Authorization` header, not missing Linear OAuth.
 Older Friendzone returned 401 for missing Basic credentials, which Cline
 interprets as an OAuth server. The current broker returns a clear 403 instead.
-Copy the whole guest configuration from **Connect from Cline**, including
+Copy the whole guest configuration from the server's **Connect guest** action, including
 the header, not just the URL. If reusing an old Cline entry, remove its
 `oauth` and `oauthClient` fields (or add the generated entry under its new
 name), then reconnect. Do not run `authorizeMcpServerOAuth` for Friendzone
@@ -405,5 +335,5 @@ flow while writes remain gated.
 |-----------|-------------------------------------------------------------------|
 | Host      | `cargo run -- broker --proxy-addr HOST_IP:8080 --ui-addr 127.0.0.1:8081 --bootstrap-addr HOST_IP:8082` |
 | Browser   | `http://127.0.0.1:8081` — add container, escrow entries, connect MCP |
-| Container | fetch `fz` → `fz setup --install` → export proxy vars + source `friendzone-env.sh` → `fz doctor` |
+| Guest     | Settings → Guests → curl script → run → activate environment → approve in host Inbox |
 

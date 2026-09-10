@@ -157,7 +157,6 @@ fn ui_router(state: UiState) -> Router {
             axum::routing::put(update_escrow).delete(remove_escrow),
         )
         .route("/api/escrow/{name}/secret", post(set_escrow_secret))
-        .route("/api/guest-env", get(guest_env))
         .route("/api/bootstrap/commands", get(guest_setup_commands))
         .route("/api/mcp", get(list_forwards))
         .route("/api/mcp/config", get(get_mcp_config).put(put_mcp_config))
@@ -330,17 +329,6 @@ async fn set_escrow_secret(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
-}
-
-async fn guest_env(State(state): State<UiState>) -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        format!(
-            "# Fetch from a guest: curl http://HOST_IP:{}/bootstrap/env\n{}",
-            state.bootstrap_addr.port(),
-            state.settings.guest_env_lines()
-        ),
-    )
 }
 
 /// MCP forwards with connection state; tokens never leave as values.
@@ -777,18 +765,37 @@ fn bootstrap_router(state: BootstrapState) -> Router {
 #[serde(deny_unknown_fields)]
 struct ScriptQuery {
     shell: String,
-    broker: String,
+    broker: Option<String>,
     #[serde(default)]
     container: String,
 }
 async fn bootstrap_script(
+    State(state): State<BootstrapState>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(query): axum::extract::Query<ScriptQuery>,
 ) -> impl IntoResponse {
-    // Explicit broker origin avoids trusting Host/X-Forwarded-* as executable
-    // template input. Fetching a script never announces or approves a guest.
-    match crate::setup::Shell::parse(&query.shell)
-        .and_then(|shell| crate::bootstrap::script(shell, &query.broker, &query.container))
-    {
+    // Host describes the guest's route to this HTTP listener. Strict origin
+    // validation + base64 JSON encoding prevent it becoming executable code.
+    // X-Forwarded-* is deliberately ignored; fetching never approves a guest.
+    let broker = query.broker.unwrap_or_else(|| {
+        format!(
+            "http://{}",
+            headers
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+        )
+    });
+    match crate::bootstrap::Shell::parse(&query.shell).and_then(|shell| {
+        crate::bootstrap::script(
+            shell,
+            &broker,
+            &query.container,
+            &state.cert,
+            state.proxy_port,
+            &state.settings,
+        )
+    }) {
         Ok(script) => (
             [
                 (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
@@ -807,7 +814,7 @@ struct HelloQuery {
     container: String,
 }
 
-/// `fz setup` announces the guest: creates/updates the join request so
+/// The guest script announces itself: creates/updates the join request so
 /// it appears in the UI immediately, with the address to pin.
 async fn bootstrap_hello(
     State(state): State<BootstrapState>,
@@ -853,7 +860,7 @@ async fn mcp_message(
     else {
         // Cline interprets every 401 as OAuth. This endpoint uses guest
         // Basic identity, not OAuth; return a clear denial, not discovery.
-        return (StatusCode::FORBIDDEN, "Friendzone guest Authorization header is missing or invalid. Copy Cline JSON from the host UI's Connect from Cline panel. Do not authorize Linear OAuth in the guest; remove stale oauth/oauthClient fields from this guest entry.").into_response();
+        return (StatusCode::FORBIDDEN, "Friendzone guest Authorization header is missing or invalid. In host Settings → MCP servers, use Connect guest → Copy Cline configuration. Remove stale oauth/oauthClient fields from the guest entry; upstream OAuth belongs on the host.").into_response();
     };
     let response =
         crate::mcp::handle_message(&state.mcp, &name, &container, peer.ip(), message).await;
@@ -2282,7 +2289,7 @@ mod tests {
         let text = axum::body::to_bytes(missing.into_body(), 8192)
             .await
             .unwrap();
-        assert!(String::from_utf8_lossy(&text).contains("Copy Cline JSON"));
+        assert!(String::from_utf8_lossy(&text).contains("Copy Cline configuration"));
         assert_eq!(
             ui.clone()
                 .oneshot(request(format!(
@@ -2761,6 +2768,33 @@ mod tests {
 
     #[tokio::test]
     async fn guest_scripts_and_exact_target_selection_are_public_without_management() {
+        let response = bootstrap_app()
+            .oneshot(
+                Request::get("/bootstrap/setup?shell=sh&container=guest")
+                    .header(header::HOST, "192.0.2.1:9082")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let encoded = text
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("python3 - '")
+                    .and_then(|s| s.split('\'').next())
+            })
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+        assert_eq!(payload["broker"], "http://192.0.2.1:9082");
+        assert_eq!(payload["container"], "guest");
+        assert_eq!(payload["ca"], "CERTIFICATE");
+        assert_eq!(payload["proxy_port"], 8080);
         for shell in ["sh", "/bin/zsh", "powershell", "pwsh"] {
             let url = format!(
                 "/bootstrap/setup?shell={shell}&broker=http%3A%2F%2F192.0.2.1%3A9082&container=guest"
@@ -2775,8 +2809,9 @@ mod tests {
                 .await
                 .unwrap();
             let text = String::from_utf8(body.to_vec()).unwrap();
-            assert!(text.contains("http://192.0.2.1:9082"));
-            assert!(text.contains("--persist-profile"));
+            assert!(!text.contains("bootstrap/fz"));
+            assert!(!text.contains("fz setup"));
+            assert!(text.contains("Friendzone"));
             assert!(!text.contains("-addstore"));
             assert!(!text.contains("secrets.json"));
         }

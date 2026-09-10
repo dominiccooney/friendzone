@@ -24,7 +24,7 @@ below as deployment requirements, not optional diagnostics.
 | Guest destination | Protocol | Policy | Purpose |
 |---|---|---|---|
 | Broker's guest-facing IP, port 8080 | TCP | Allow | Explicit HTTP/HTTPS proxy |
-| Same IP, port 8082 | TCP | Allow | CA/binary/env bootstrap, health, guest announcement, MCP forwards |
+| Same IP, port 8082 | TCP | Allow | Setup scripts, CA/env, health, guest announcement, MCP forwards |
 | Any address, UI port 8081 | Any | Deny | Host management only |
 | Internet, LAN, other host ports, other guests | Any | Deny | Prevent direct bypass and host access |
 | Direct DNS (53), DoT (853), QUIC (UDP/443), SSH (22), other UDP | Any | Deny | No alternate guest egress |
@@ -91,11 +91,10 @@ policies are deliberately incomplete; see the README's scope limitations.
 ### A. Build a clean image (not an agent session)
 
 - Start with a trusted VM and **no autonomous agent/untrusted tasks running**.
-- Install OS updates, build tools, `fz`, Git, Cline, and diagnostic tools.
-  Build the correct guest OS/architecture binary before removing build-time
-  Internet access. You can alternatively supply it via ISO/offline transfer.
-- Keep a known-good `fz` binary and CA/env files available offline. Host
-  `/bootstrap/fz` is the host binary, not necessarily executable in Linux.
+- Install OS updates, Git, Cline, curl and diagnostic tools. Linux setup uses
+  Python 3; Windows setup uses PowerShell. Install those before sealing the
+  image. Guest setup does not require an fz binary or Rust toolchain.
+- Keep a known-good guest setup script and CA/env files available offline.
 - Make a clean snapshot/clone. Do not snapshot real provider secrets into it.
 - Open **VMConnect / hypervisor console** and prove login works. SSH over the
   network you are about to block is not a recovery plan.
@@ -317,7 +316,7 @@ shared broker just to test this without scheduling the interruption.
 - First stop the agent, then use VMConnect/host console. Check static IP,
   switch attachment, broker bind address, service-port ACLs, approval/IP pin,
   CA path and environment. Re-fetch/re-source through the allowed bootstrap
-  port; supply a replacement guest binary via ISO/offline transfer if needed.
+  port; supply a known-good setup script via ISO/offline transfer if needed.
 - If the broker is down, restart/repair it from the host. The VM being unable
   to reach the Internet in the meantime is the intended fail-closed behavior.
 - Keep an offline clean snapshot and host-side backup. Roll back **while the

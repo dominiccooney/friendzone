@@ -157,11 +157,11 @@ click "allow".
   misses; its job is to redirect scrutiny.
 - **Retention**: bodies ~1 hour, metadata ~1 week, searchable by
   container. Flagged and quarantined items never expire.
-- **`fz setup`** bootstraps a guest over the network: the broker serves
-  the `fz` binary and CA certificate over plain HTTP, and setup installs
-  the CA into the OS store and each language runtime. Trust-on-first-use
-  is sound because the broker is structurally the only reachable
-  endpoint.
+- **Guest setup scripts** are retrieved with curl from the bootstrap listener.
+  They configure CA/runtime environment, fake keys, Cline and persistent user
+  environment without downloading a guest binary. The initial HTTP connection
+  is trust-on-first-use and requires a trusted host/network; system trust-store
+  installation and firewall changes are not performed by the scripts.
 - **`fz doctor`** diagnoses from inside: direct IPs, DNS, UDP, and port
   22 must fail; CA trusted per runtime; broker reachable; fake
   credentials in place. Gates CI builds of images. Doctor diagnoses;
@@ -227,7 +227,7 @@ supposedly idle container is visible without opening anything. The big
 surface spends pixels: inbox, log, reading pane.
 
 **New containers.** Unknown proxy credentials create an ack item; until
-decided, the broker serves only `fz setup`/`fz doctor` and refuses the
+decided, the broker serves only the guest setup script/`fz doctor` and refuses the
 rest (agents retry as after a broker restart). Ack names the container
 and attaches a ruleset (default preselected); the section starts on top.
 Denying kills the container.

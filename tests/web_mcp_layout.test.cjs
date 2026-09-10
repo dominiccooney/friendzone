@@ -110,8 +110,12 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     for (let i = 0; i < 100 && !await evaluate("!!document.querySelector('[data-view=settings]')?.onclick"); i++) await delay(25);
     await evaluate("document.querySelector('[data-view=settings]').click()");
     for (let i = 0; i < 100 && !await evaluate("!!document.querySelector('.mcp-card')"); i++) await delay(25);
+    assert.equal(await evaluate("document.querySelector('#settings-guests').hidden"),false);
+    assert.equal(await evaluate("document.querySelector('#settings-mcp').hidden"),true);
+    assert.equal(await evaluate("document.querySelector('#setup-platform-powershell').hidden"),true);
     for (const width of [1058, 480]) {
       await send("Emulation.setDeviceMetricsOverride", { width, height: 1000, deviceScaleFactor: 1, mobile: false });
+      await evaluate("document.querySelector('[data-settings=mcp]').click()");
       await delay(50);
       const layout = await evaluate(`(() => {
         const card = document.querySelector('.mcp-card'), url = card.querySelector('[data-mcp-endpoint]');
@@ -123,6 +127,7 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
           pageWidth:document.documentElement.scrollWidth};
       })()`);
       assert.equal(layout.value, endpoint);
+      assert.ok(layout.cardWidth>100, "MCP panel must actually be visible");
       assert.ok(layout.cardScroll <= layout.cardWidth + 1, JSON.stringify(layout));
       assert.ok(layout.urlScroll <= layout.urlWidth + 1, JSON.stringify(layout));
       assert.ok(layout.urlScrollHeight <= layout.urlHeight + 1, "full endpoint must be visible without vertical scrolling: " + JSON.stringify(layout));
@@ -131,15 +136,41 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
       assert.equal(layout.copyText, "Copy URL");
       assert.ok(layout.copyLeft >= 0 && layout.copyRight <= width, JSON.stringify(layout));
       assert.ok(layout.pageWidth <= width + 1, JSON.stringify(layout));
+      await evaluate("document.querySelector('[data-settings=guests]').click()");
       const setup=await evaluate(`(() => {const panel=document.querySelector('#guest-setup'), command=document.querySelector('#setup-sh');return {width:panel.clientWidth,scroll:panel.scrollWidth,value:command.value,copyDisabled:document.querySelector('#setup-copy-sh').disabled,inspect:document.querySelector('#setup-view-sh').href};})()`);
+      assert.ok(setup.width>100);
       assert.ok(setup.scroll<=setup.width+1,JSON.stringify(setup));
       assert.match(setup.value,/--noproxy/);assert.equal(setup.copyDisabled,false);assert.match(setup.inspect,/bootstrap\/setup\?shell=sh/);
       if (process.env.FZ_SCREENSHOT_DIR) {
         fs.mkdirSync(process.env.FZ_SCREENSHOT_DIR, { recursive: true });
         const shot = await send("Page.captureScreenshot", { format: "png", captureBeyondViewport: false });
-        fs.writeFileSync(path.join(process.env.FZ_SCREENSHOT_DIR, `mcp-${width}.png`), Buffer.from(shot.data, "base64"));
+        fs.writeFileSync(path.join(process.env.FZ_SCREENSHOT_DIR, `guests-${width}.png`), Buffer.from(shot.data, "base64"));
       }
     }
+    // Normal-sized sample in addition to the deliberately hostile/long fixture.
+    const normal={name:'Linear',url:'https://mcp.linear.app/mcp',tools:['list_issues','get_issue'],guests:['scratch-kali'],auth:'oauth',guest_endpoint:'http://172.31.208.1:8082/mcp/Linear'};
+    await evaluate(`window.fixtureFetch=fetch;window.fetch=(url,options)=>url==='/api/mcp'?Promise.resolve({json:async()=>({forwards:[${JSON.stringify(normal)}],guest_host:'172.31.208.1',guest_port:8082})}):fixtureFetch(url,options);renderSettings()`);
+    for(const width of [1058,480]) {
+      await send('Emulation.setDeviceMetricsOverride',{width,height:1000,deviceScaleFactor:1,mobile:false});
+      await evaluate(`selectSettings('guests');document.querySelector('#setup-sh').value="curl --noproxy '*' -fsS 'http://172.31.208.1:8082/bootstrap/setup?shell=sh&container=scratch-kali' -o friendzone-setup.sh";window.scrollTo(0,0)`);
+      await delay(60);
+      if(process.env.FZ_SCREENSHOT_DIR){const shot=await send('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(process.env.FZ_SCREENSHOT_DIR,'guest-normal-'+width+'.png'),Buffer.from(shot.data,'base64'));}
+    }
+    await evaluate("selectSettings('mcp');document.querySelector('[data-mcp-connect]').click();window.scrollTo(0,0)");
+    await delay(60);
+    if(process.env.FZ_SCREENSHOT_DIR){const shot=await send('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});fs.writeFileSync(path.join(process.env.FZ_SCREENSHOT_DIR,'mcp-normal.png'),Buffer.from(shot.data,'base64'));}
+    await evaluate('window.fetch=window.fixtureFetch;renderSettings()');
+    await evaluate("document.querySelector('[data-settings=mcp]').click();document.querySelector('[data-mcp-connect]').click()");
+    for(let i=0;i<100 && await evaluate("document.querySelector('#mcp-copy-json').disabled");i++) await delay(25);
+    assert.equal(await evaluate("!!document.querySelector('#mcp-connect').closest('.mcp-card')"),true);
+    assert.equal(await evaluate("document.querySelector('#mcp-connect').hidden"),false);
+    assert.equal(await evaluate("document.querySelector('#mcp-connect details').open"),false);
+    await evaluate("Object.defineProperty(navigator,'clipboard',{value:{writeText:async text=>{window.copiedConfig=text}},configurable:true});document.querySelector('#mcp-copy-json').click()");
+    assert.equal(await evaluate("window.copiedConfig"),await evaluate("document.querySelector('#mcp-connect-json').value"));
+    if(process.env.FZ_SCREENSHOT_DIR){const shot=await send('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});fs.writeFileSync(path.join(process.env.FZ_SCREENSHOT_DIR,'mcp-inline.png'),Buffer.from(shot.data,'base64'));}
+    await evaluate("document.querySelector('#mcp-connect-close').click()");
+    assert.equal(await evaluate("document.querySelector('#mcp-connect').hidden"),true);
+    await evaluate("document.querySelector('[data-settings=credentials]').click();document.querySelector('#setup-platform').value='powershell';document.querySelector('#setup-platform').dispatchEvent(new Event('change'))");
     await evaluate("Object.defineProperty(navigator, 'clipboard', {value:{writeText:async text=>{window.copiedEndpoint=text}}, configurable:true}); document.querySelector('[data-mcp-copy-url]').click()");
     assert.equal(await evaluate("window.copiedEndpoint"), endpoint);
     for (const tab of ["log", "inbox", "settings"]) {
@@ -158,6 +189,8 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
         assert.match(await evaluate("document.querySelector('.container .meta').textContent"), /No guest traffic observed/);
       }
     }
+    assert.equal(await evaluate("document.querySelector('#settings-credentials').hidden"),false);
+    assert.equal(await evaluate("document.querySelector('#setup-platform').value"),'powershell');
     await evaluate("document.querySelector('[data-view=inbox]').click()");
     for(let i=0;i<100 && !await evaluate("!!document.querySelector('[data-review]')");i++) await delay(25);
     await evaluate("document.querySelector('[data-review]').click()");

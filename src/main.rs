@@ -5,7 +5,6 @@ mod doctor;
 mod github;
 mod graphql;
 mod guest_http;
-mod guest_profile;
 mod mcp;
 mod mcp_import;
 mod mcp_oauth;
@@ -15,7 +14,6 @@ mod proxy;
 mod proxy_server;
 mod review;
 mod settings;
-mod setup;
 mod state;
 mod storage;
 mod web;
@@ -51,25 +49,6 @@ enum Command {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
-    /// Fetch the broker CA certificate into this guest.
-    Setup {
-        #[arg(long, default_value = "http://127.0.0.1:8082")]
-        broker: String,
-        #[arg(long)]
-        output: Option<PathBuf>,
-        #[arg(long)]
-        install: bool,
-        /// Container name (the proxy username). Defaults to this
-        /// guest's hostname.
-        #[arg(long)]
-        container: Option<String>,
-        /// Environment file syntax (defaults to powershell on Windows, sh elsewhere).
-        #[arg(long, value_enum)]
-        shell: Option<setup::Shell>,
-        /// Persist guest profile hooks (Unix) or user environment (Windows).
-        #[arg(long)]
-        persist_profile: bool,
-    },
     /// Check this guest's Friendzone network setup.
     Doctor {
         #[arg(long, default_value = "http://127.0.0.1:8082")]
@@ -100,24 +79,6 @@ async fn main() -> Result<()> {
                 ui_addr,
                 bootstrap_addr,
                 data_dir.unwrap_or_else(default_data_dir),
-            )
-            .await
-        }
-        Command::Setup {
-            broker,
-            output,
-            install,
-            container,
-            shell,
-            persist_profile,
-        } => {
-            setup::run(
-                &broker,
-                output,
-                install,
-                container,
-                shell.unwrap_or_default(),
-                persist_profile,
             )
             .await
         }
@@ -156,7 +117,7 @@ async fn run_broker(
     let guest_binaries = web::discover_guest_binaries(&data_dir);
     if guest_binaries.is_empty() {
         println!(
-            "Guest binaries:       none beyond the host's own ({}-{}). Cross-OS guests: build fz in the guest (cargo build --release), or drop builds into {} to serve them.",
+            "Optional doctor binaries: host only ({}-{}); additional builds may be placed in {}. Guest setup uses scripts, not binaries.",
             std::env::consts::OS,
             std::env::consts::ARCH,
             data_dir.join("guest-bin").display()

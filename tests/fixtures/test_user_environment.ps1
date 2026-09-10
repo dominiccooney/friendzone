@@ -1,4 +1,4 @@
-param([string]$Implementation, [string]$TemporaryDirectory, [string]$EnvironmentFile, [string]$BootstrapScript, [string]$BootstrapCommand)
+param([string]$Implementation, [string]$TemporaryDirectory, [string]$BootstrapScript, [string]$BootstrapCommand)
 $ErrorActionPreference = 'Stop'
 # Loading a reviewed test helper as a script block keeps this test independent
 # of host script-file policy. No Set-ExecutionPolicy or -ExecutionPolicy flags.
@@ -43,7 +43,25 @@ catch { if ($_.Exception.Message -eq 'expected write failure') { throw } }
 if ($script:fakeUser.HTTP_PROXY -cne $originalProxy -or $script:fakeUser.NO_PROXY -cne $originalExclusions -or $script:fakeUser.CLINE_API_KEY -cne $originalKey) { throw 'partial write was not rolled back' }
 
 # Native environment activation affects ONLY this disposable child process.
-# Do not invoke the bootstrap installer itself; parse its syntax instead.
+# Load the actual self-contained script with main disabled, mock persistence,
+# then execute its configuration function against explicit temporary paths.
+. ([scriptblock]::Create([IO.File]::ReadAllText($BootstrapScript).TrimStart([char]0xfeff)))
+function Get-FzUserValue([string]$Name) { $script:fakeUser[$Name] }
+function Set-FzUserValue([string]$Name, $Value) { $script:fakeUser[$Name]=$Value }
+$homeDir=Join-Path $TemporaryDirectory 'guest-home'
+$configDir=Join-Path $TemporaryDirectory 'config'
+$provider=Join-Path $homeDir '.cline/data/settings/providers.json'
+[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($provider)) | Out-Null
+[IO.File]::WriteAllText($provider,'{"version":1,"lastUsedProvider":"other","modes":{},"providers":{"cline":{"settings":{"provider":"cline","model":"keep","auth":{"refreshToken":"stale"}}},"other":{"settings":{"key":"preserved"}}}}')
+$data=[pscustomobject]@{broker='http://192.0.2.1:9082';container='guest';proxy_port=9080;ca='CERTIFICATE';fakes=[pscustomobject]@{CLINE_API_KEY="fake'`$(not-a-command)"}}
+$EnvironmentFile=Invoke-FzConfigure $data $homeDir $configDir
+$EnvironmentFile=Invoke-FzConfigure $data $homeDir $configDir
+$root=Get-Content -Raw -Encoding UTF8 -LiteralPath $provider | ConvertFrom-Json
+if($root.providers.cline.settings.model -ne 'keep' -or $root.providers.cline.settings.auth -or $root.providers.other.settings.key -ne 'preserved' -or $root.lastUsedProvider -ne 'other'){throw 'Provider merge failed'}
+$beforeEnv=[IO.File]::ReadAllText($EnvironmentFile)
+[IO.File]::WriteAllText($provider,'{"version":99}')
+try {Invoke-FzConfigure $data $homeDir $configDir;throw 'expected invalid provider failure'} catch {if($_.Exception.Message -eq 'expected invalid provider failure'){throw}}
+if([IO.File]::ReadAllText($EnvironmentFile) -cne $beforeEnv){throw 'wrote configuration before validation'}
 . ([scriptblock]::Create([IO.File]::ReadAllText($EnvironmentFile).TrimStart([char]0xfeff)))
 if ($env:FZ_HOST -ne '192.0.2.1') { throw 'wrong broker host' }
 if ($env:CLINE_API_KEY -cne "fake'`$(not-a-command)") { throw 'fake changed or evaluated' }

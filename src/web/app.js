@@ -7,6 +7,7 @@ const mcpOAuthPolls = new Map();
 let reviewingMcp = null;
 let activeMcpOAuth = null;
 let setupInitialized = false, setupGeneration = 0;
+let connectedMcpName = null;
 let activeReview = null, reviewGeneration = 0, pendingSignature = "";
 let commentPermissionGeneration = 0, commentPermissionSignature = "";
 let notificationTimer = null, newNotificationIds = new Set();
@@ -352,23 +353,22 @@ $("#e-provider").onchange = () => {
 };
 
 async function renderSettings() {
-  const [escrow, mcp, env] = await Promise.all([
+  const [escrow, mcp] = await Promise.all([
     fetch("/api/escrow").then(r=>r.json()),
     fetch("/api/mcp").then(r=>r.json()),
-    fetch("/api/guest-env").then(r=>r.text()),
   ]);
   mcpConnectData = mcp;
   if (!setupInitialized) {
     $("#setup-host").value = mcp.guest_host || "";
     setupInitialized = true;
   }
-  $("#setup-address").textContent = `Scripts use bootstrap port ${mcp.guest_port}, not the UI/proxy port. ${mcp.guest_address_warning || "Run these commands in the guest user account."}`;
+  $("#setup-address").textContent = mcp.guest_address_warning || `Guest connections use port ${mcp.guest_port}.`;
   loadGuestSetup();
   if (!mcpHostInitialized) {
     $("#mcp-connect-host").value = mcp.guest_host || "";
     mcpHostInitialized = true;
   }
-  $("#mcp-connect-address").textContent = `Uses bootstrap port ${mcp.guest_port}, not the UI or proxy port. ${mcp.guest_address_warning || "The host is prefilled from the broker listener; change it only if your guest reaches the host by another address."}`;
+  $("#mcp-connect-address").textContent = mcp.guest_address_warning || `Guest endpoint uses port ${mcp.guest_port}.`;
   fillMcpConnectSelect("#mcp-connect-forward", mcp.forwards.map(f=>({value:f.name,label:f.name})), "Select a forward");
   updateMcpConnectionGuests();
   loadMcpConnection();
@@ -377,6 +377,8 @@ async function renderSettings() {
     const clineBtn = e.name === "cline" ? ` <button class="quiet" data-cline-oauth="${esc(e.name)}">Sign in with Cline…</button>` : "";
     return `<div class="log-row"><span>${esc(e.name)}</span><span>${esc(e.hosts.join(", "))}</span><span class="request">${esc(e.header)}${e.prefix?` · prefix '${esc(e.prefix)}'`:""} · fake <code>${esc(e.fake)}</code></span><span>${e.connected?'<span class="verdict allowed">connected</span>':`<button class="quiet" data-secret="${esc(e.name)}">Set key…</button>`}${clineBtn} <button class="quiet" data-escrow-edit="${esc(e.name)}">Edit</button> <button class="quiet" data-escrow-delete="${esc(e.name)}">Delete</button></span></div>`;
   }).join("") || '<div class="log-row">No escrow entries yet.</div>';
+  // Keep the single connection form alive while rebuilding server rows.
+  $("#mcp-connect-parking").append($("#mcp-connect"));
   $("#mcp-list").innerHTML = mcp.forwards.map(f=>{
     const expiry = f.expires_at ? ` · expires ${new Date(f.expires_at*1000).toLocaleString()}${f.refreshable?" (auto-refresh)":""}` : "";
     const status = f.auth==="cline-link" ? `<span class="verdict">Uses host Cline's credentials</span><p class="meta">Friendzone reads the saved token; host Cline must refresh it. For independent login and refresh, authorize in Friendzone. No guest OAuth login is needed.</p> <button class="quiet" data-oauth="${esc(f.name)}">Authorize in Friendzone…</button>`
@@ -385,18 +387,16 @@ async function renderSettings() {
       : `<button class="quiet" data-oauth="${esc(f.name)}">Authorize in Friendzone…</button>`;
     const endpoint = f.guest_endpoint
       ? `<textarea data-mcp-endpoint rows="2" readonly spellcheck="false" aria-label="Friendzone URL for ${esc(f.name)}">${esc(f.guest_endpoint)}</textarea><button type="button" data-mcp-copy-url="${esc(f.name)}">Copy URL</button>`
-      : `<code>/mcp/${esc(encodeURIComponent(f.name))}</code> — set the broker host in Connect from Cline below to get a complete URL.`;
-    return `<article class="mcp-card"><header class="mcp-card-heading"><h3>${esc(f.name)}</h3><span>${f.tools.length} allowed tools · guests: ${f.guests===null?"all approved":esc(f.guests.join(", ")||"none")}</span></header><div class="mcp-card-endpoint"><strong>URL to add in guest Cline</strong><div class="mcp-endpoint">${endpoint}</div><p class="meta">URL alone is not enough: <button type="button" data-mcp-connect="${esc(f.name)}">Copy Cline setup…</button> includes the guest Authorization header.</p></div><div class="mcp-card-auth">${status}${f.scope?`<p class="meta">OAuth scope: ${esc(f.scope)}</p>`:""}</div><div class="mcp-card-actions"><button type="button" data-mcp-review="${esc(f.name)}">Choose tools and guests</button><button type="button" class="quiet" data-mcp-delete="${esc(f.name)}">Remove</button></div><p class="mcp-upstream">Upstream (broker only): <code>${esc(f.url)}</code></p></article>`;
+      : `<code>/mcp/${esc(encodeURIComponent(f.name))}</code> — choose Connect guest to enter a reachable host.`;
+    return `<article class="mcp-card"><header class="mcp-card-heading"><h3>${esc(f.name)}</h3><span>${f.tools.length} allowed tools · guests: ${f.guests===null?"all approved":esc(f.guests.join(", ")||"none")}</span></header><div class="mcp-card-endpoint"><strong>Guest endpoint</strong><div class="mcp-endpoint">${endpoint}</div></div><div class="mcp-card-auth">${status}${f.scope?`<p class="meta">OAuth scope: ${esc(f.scope)}</p>`:""}</div><div class="mcp-card-actions"><button type="button" data-mcp-connect="${esc(f.name)}">Connect guest</button><button type="button" data-mcp-review="${esc(f.name)}">Tools and guests</button><button type="button" class="quiet" data-mcp-delete="${esc(f.name)}">Remove</button></div><p class="mcp-upstream">Upstream: <code>${esc(f.url)}</code></p><div data-mcp-connection="${esc(f.name)}"></div></article>`;
   }).join("") || '<p class="mcp-empty">No MCP servers yet. Add or import one below, sign in, then choose what guests may use.</p>';
   fitMcpEndpoints();
   document.querySelectorAll("[data-mcp-copy-url]").forEach(button => button.onclick = () => {
     const input = button.closest(".mcp-card").querySelector("[data-mcp-endpoint]");
-    return copyMcpText(input, $("#mcp-copy-status"), "Friendzone URL copied. Use Connect from Cline for the required guest Authorization header or complete JSON.", () => input.isConnected);
+    return copyMcpText(input, $("#mcp-copy-status"), "Endpoint copied.", () => input.isConnected);
   });
   document.querySelectorAll("[data-mcp-connect]").forEach(button => button.onclick = () => {
-    $("#mcp-connect-forward").value = button.dataset.mcpConnect;
-    loadMcpConnection();
-    $("#mcp-connect").scrollIntoView({behavior:"smooth", block:"start"});
+    openMcpConnection(button.dataset.mcpConnect);
   });
   document.querySelectorAll("[data-mcp-review]").forEach(button => button.onclick = () => reviewMcpAccess(button.dataset.mcpReview));
   document.querySelectorAll("[data-mcp-delete]").forEach(button => button.onclick = async () => {
@@ -406,9 +406,7 @@ async function renderSettings() {
       await saveMcp(configs.filter(f=>f.name!==button.dataset.mcpDelete));
     } catch (error) { $("#mcp-form-status").textContent = String(error); }
   });
-  const [curlLine, ...envRest] = env.split("\n");
-  $("#guest-env-curl").textContent = curlLine.replace(/^# Fetch from a guest: /, "");
-  $("#guest-env").textContent = envRest.join("\n");
+  if (connectedMcpName) attachMcpConnection();
   if (!$("#mcp-editor").value) {
     fetch("/api/mcp/config").then(r=>r.text()).then(text => { $("#mcp-editor").value = text; });
   }
@@ -548,6 +546,8 @@ $("#mcp-copy-oauth").onclick = () => {
 };
 
 async function reviewMcpAccess(name) {
+  $("#mcp-add-panel").hidden = false;
+  $("#mcp-setup-title").textContent = `Tools and guests: ${name}`;
   try {
     const configs = await (await fetch("/api/mcp/config")).json();
     const config = configs.find(f=>f.name===name);
@@ -607,7 +607,7 @@ async function loadMcpConnection() {
   $("#mcp-connect-warning").textContent = "";
   const name = $("#mcp-connect-forward").value, guest = $("#mcp-connect-guest").value, host = $("#mcp-connect-host").value.trim();
   if (!name || !guest || !host) {
-    $("#mcp-connect-status").textContent = !name ? "Select or add a forward to see its Cline configuration." : !guest ? "Select a guest. If none appear, run fz setup in the guest or add it in the Inbox." : "Enter the broker host address reachable from this guest.";
+    $("#mcp-connect-status").textContent = !name ? "Select or add a forward to see its Cline configuration." : !guest ? "Select a guest. Set up a new one under Settings → Guests." : "Enter the broker host address reachable from this guest.";
     return;
   }
   $("#mcp-connect-status").textContent = "Generating guest connection instructions…";
@@ -669,14 +669,56 @@ async function loadGuestSetup() {
       $("#setup-"+shell).value=commands[shell]; $("#setup-copy-"+shell).disabled=false;
       $("#setup-view-"+shell).href=commands[shell+"_url"]; $("#setup-view-"+shell).hidden=false;
     }
-    $("#setup-status").textContent=`Ready for ${commands.broker}. Downloaded scripts are executed only after a complete successful download. Run in the guest, not the host.`;
+    $("#setup-status").textContent="";
   } catch(error) { if(generation===setupGeneration) $("#setup-status").textContent=String(error); }
 }
 for (const id of ["setup-host","setup-container"]) $("#"+id).addEventListener("input",loadGuestSetup);
 for (const shell of ["sh","powershell"]) $("#setup-copy-"+shell).onclick=()=>{
   const generation=setupGeneration;
-  return copyMcpText($("#setup-"+shell),$("#setup-status"),"Copied. Run only in the guest user account, with Cline stopped.",()=>generation===setupGeneration);
+  return copyMcpText($("#setup-"+shell),$("#setup-status"),"Download command copied. Run it in the guest terminal.",()=>generation===setupGeneration);
 };
+
+function attachMcpConnection() {
+  const slot=[...document.querySelectorAll("[data-mcp-connection]")].find(node=>node.dataset.mcpConnection===connectedMcpName);
+  $("#mcp-connect").hidden=!slot;
+  if(slot) slot.append($("#mcp-connect")); else connectedMcpName=null;
+}
+function openMcpConnection(name) {
+  connectedMcpName=name; $("#mcp-connect-forward").value=name;
+  $("#mcp-connect-title").textContent="Connect guest Cline";
+  attachMcpConnection(); loadMcpConnection();
+  $("#mcp-connect").scrollIntoView({behavior:"smooth",block:"nearest"});
+}
+$("#mcp-connect-close").onclick=()=>{connectedMcpName=null;$("#mcp-connect").hidden=true;};
+$("#mcp-show-add").onclick=()=>{
+  const opening=$("#mcp-add-panel").hidden || reviewingMcp!==null;
+  $("#mcp-add-panel").hidden=!opening;
+  if(opening){
+    reviewingMcp=null;clineLink=null;validatedMcp=null;
+    for(const id of ["name","url","bearer","scope","guests"]) $("#mcp-"+id).value="";
+    $("#mcp-tools").innerHTML="";$("#mcp-owned-oauth").checked=true;
+    $("#mcp-source").textContent="Select a host Cline server or enter a URL.";
+    $("#mcp-form-status").textContent="";$("#mcp-setup-title").textContent="Add a server";
+  }
+};
+function selectSettings(section) {
+  const selected=["guests","credentials","mcp"].includes(section)?section:"guests";
+  for(const name of ["guests","credentials","mcp"]) $("#settings-"+name).hidden=name!==selected;
+  document.querySelectorAll("[data-settings]").forEach(button=>{button.classList.toggle("active",button.dataset.settings===selected);button.setAttribute("aria-pressed",String(button.dataset.settings===selected));});
+  storeValue("fz-settings-section",selected);
+  if(selected==="mcp") fitMcpEndpoints();
+}
+document.querySelectorAll("[data-settings]").forEach(button=>button.onclick=()=>selectSettings(button.dataset.settings));
+function selectSetupPlatform(value) {
+  const platform=value==="powershell"?"powershell":"sh";
+  $("#setup-platform").value=platform;
+  $("#setup-platform-sh").hidden=platform!=="sh";
+  $("#setup-platform-powershell").hidden=platform!=="powershell";
+  storeValue("fz-setup-platform",platform);
+}
+$("#setup-platform").onchange=()=>selectSetupPlatform($("#setup-platform").value);
+selectSettings(readStoredValue("fz-settings-section"));
+selectSetupPlatform(readStoredValue("fz-setup-platform"));
 
 let clineLink = null, validatedMcp = null;
 function mcpDraft() {
@@ -769,7 +811,8 @@ $("#mcp-add").onclick = async () => {
       await saveMcp(configs.map(f=>f.name===draft.name?{...f,tools:draft.tools,guests:draft.guests}:f));
     } else await saveMcp([...configs, draft]);
     validatedMcp = null;
-    $("#mcp-form-status").textContent = "Guest access saved. Use Copy Cline setup on the server card to connect the guest.";
+    $("#mcp-add-panel").hidden=true;
+    openMcpConnection(draft.name);
   } catch (error) { $("#mcp-form-status").textContent = String(error); }
 };
 

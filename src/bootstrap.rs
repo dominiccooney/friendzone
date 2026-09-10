@@ -1,7 +1,32 @@
-//! Public guest scripts contain only an explicit broker address and guest name.
-//! Render-time input is quoted as data, never interpolated as executable code.
-use crate::setup::{Shell, powershell_quote, shell_quote};
+//! Self-contained guest scripts; no guest Rust binary or compiler required.
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
+
+pub enum Shell {
+    Sh,
+    Powershell,
+}
+impl Shell {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value
+            .rsplit('/')
+            .next()
+            .unwrap_or(value)
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "sh" | "bash" | "zsh" => Ok(Self::Sh),
+            "powershell" | "pwsh" => Ok(Self::Powershell),
+            _ => bail!("Choose sh (Linux) or powershell (Windows)"),
+        }
+    }
+}
+fn quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+fn ps_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
 
 pub fn broker_origin(raw: &str) -> Result<String> {
     let url = reqwest::Url::parse(raw).context("invalid broker URL")?;
@@ -14,75 +39,120 @@ pub fn broker_origin(raw: &str) -> Result<String> {
         || url.fragment().is_some()
         || raw.chars().any(char::is_control)
     {
-        bail!("broker must be an HTTP(S) origin with no credentials, path, query or fragment");
+        bail!("broker must be an HTTP(S) origin without credentials, path, query or fragment");
     }
     if url
         .host_str()
         .and_then(|h| h.trim_matches(['[', ']']).parse::<std::net::IpAddr>().ok())
         .is_some_and(|ip| ip.is_unspecified())
     {
-        bail!("wildcard bind address is not a guest-reachable broker");
+        bail!("Enter a guest-reachable host, not a wildcard bind address");
     }
     Ok(url.as_str().trim_end_matches('/').into())
 }
-
-pub fn script(shell: Shell, broker: &str, container: &str) -> Result<String> {
-    let broker = broker_origin(broker)?;
+fn validate_container(container: &str) -> Result<()> {
     if container.len() > 128 || container.chars().any(|c| c.is_control() || c == ':') {
-        bail!("guest name must be at most 128 bytes without control characters or colon");
+        bail!("guest name must be at most 128 bytes without controls or colon");
     }
+    Ok(())
+}
+
+pub fn script(
+    shell: Shell,
+    broker: &str,
+    container: &str,
+    ca: &str,
+    proxy_port: u16,
+    settings: &crate::settings::Settings,
+) -> Result<String> {
+    let broker = broker_origin(broker)?;
+    validate_container(container)?;
+    let mut fakes = std::collections::BTreeMap::new();
+    for entry in settings.entries() {
+        if let Some(name) = entry.guest_env {
+            if name.is_empty()
+                || !name.bytes().enumerate().all(|(i, c)| {
+                    c == b'_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
+                })
+                || [
+                    "HTTP_PROXY",
+                    "HTTPS_PROXY",
+                    "NO_PROXY",
+                    "ALL_PROXY",
+                    "FZ_HOST",
+                    "FZ_BROKER",
+                    "BASH_ENV",
+                    "ENV",
+                    "NODE_EXTRA_CA_CERTS",
+                    "REQUESTS_CA_BUNDLE",
+                    "SSL_CERT_FILE",
+                    "GIT_SSL_CAINFO",
+                    "GIT_PROXY_SSL_CAINFO",
+                ]
+                .iter()
+                .any(|key| name.eq_ignore_ascii_case(key))
+                || fakes
+                    .keys()
+                    .any(|key: &String| key.eq_ignore_ascii_case(&name))
+            {
+                bail!("invalid/conflicting guest environment variable {name}");
+            }
+            fakes.insert(name, entry.fake);
+        }
+    }
+    let payload = serde_json::json!({"broker":broker,"container":container,"ca":ca,"proxy_port":proxy_port,"fakes":fakes,
+        "persistence":STANDARD.encode(include_bytes!("bootstrap/persist-environment.ps1"))});
+    let encoded = STANDARD.encode(serde_json::to_vec(&payload)?);
     Ok(match shell {
         Shell::Sh => format!(
-            "#!/bin/sh\n# GUEST ONLY: persists proxy/CA environment and shell profile hooks.\nbroker={}\ncontainer={}\n{}",
-            shell_quote(&broker),
-            shell_quote(container),
-            // A Windows-host checkout may use CRLF; guest sh must receive LF.
-            include_str!("bootstrap/setup.sh").replace("\r\n", "\n")
+            "#!/bin/sh\n# Configure this Linux guest; Python 3 standard library only.\nset -eu\ncommand -v python3 >/dev/null 2>&1 || {{ echo 'Python 3 is required in the guest.' >&2; exit 1; }}\npython3 - {} <<'FRIENDZONE_PYTHON'\n{}\nif __name__ == '__main__':\n    import sys\n    main(sys.argv[1])\nFRIENDZONE_PYTHON\n",
+            quote(&encoded),
+            include_str!("bootstrap/configure.py").replace("\r\n", "\n")
         ),
         Shell::Powershell => format!(
-            "\u{feff}# GUEST ONLY: persists proxy/CA user environment; never run on the broker host.\n$broker={}\n$container={}\n{}",
-            powershell_quote(&broker),
-            powershell_quote(container),
-            include_str!("bootstrap/setup.ps1")
+            "\u{feff}# Configure this Windows guest; dot-sourcing only defines testable functions.\n$ErrorActionPreference='Stop'\n{}\n{}\nif ($MyInvocation.InvocationName -ne '.') {{\n    $data=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String({})) | ConvertFrom-Json\n    Start-FzGuestSetup $data\n}}\n",
+            // Do not execute the persistence helper's command-line entry point.
+            include_str!("bootstrap/persist-environment.ps1")
+                .split("if ($MyInvocation.InvocationName -ne '.')")
+                .next()
+                .unwrap()
+                .lines()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            include_str!("bootstrap/setup.ps1"),
+            ps_quote(&encoded)
         ),
     })
 }
 
 pub fn commands(broker: &str, container: &str) -> Result<serde_json::Value> {
     let broker = broker_origin(broker)?;
-    let make_url = |shell: &str| -> Result<String> {
+    validate_container(container)?;
+    let make = |shell| -> Result<String> {
         let mut url = reqwest::Url::parse(&format!("{broker}/bootstrap/setup"))?;
         url.query_pairs_mut()
             .append_pair("shell", shell)
-            .append_pair("broker", &broker)
             .append_pair("container", container);
         Ok(url.into())
     };
-    // Validate the same contract before displaying an executable command.
-    script(Shell::Sh, &broker, container)?;
-    let sh_url = make_url("sh")?;
-    let ps_url = make_url("powershell")?;
-    let sh = format!(
-        "(set -eu; umask 077; f=$(mktemp); trap 'rm -f \"$f\"' EXIT HUP INT TERM; code=$(curl --noproxy '*' --silent --show-error --connect-timeout 5 --max-time 30 -o \"$f\" -w '%{{http_code}}' {}); [ \"$code\" = 200 ] || {{ cat \"$f\" >&2; exit 1; }}; sh \"$f\")",
-        shell_quote(&sh_url)
-    );
-    let ps = format!(
-        "& {{ $ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Net.Http; $h=New-Object Net.Http.HttpClientHandler; $h.UseProxy=$false; $h.AllowAutoRedirect=$false; $c=New-Object Net.Http.HttpClient($h); $c.Timeout=[TimeSpan]::FromSeconds(30); $p=Join-Path ([IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString('N')+'.ps1'); try {{ $r=$c.GetAsync({}).GetAwaiter().GetResult(); if ([int]$r.StatusCode -ne 200) {{ throw $r.Content.ReadAsStringAsync().GetAwaiter().GetResult() }}; [IO.File]::WriteAllBytes($p,$r.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()); & $p }} finally {{ $c.Dispose(); $h.Dispose(); if (Test-Path -LiteralPath $p) {{ Remove-Item -LiteralPath $p }} }} }}",
-        powershell_quote(&ps_url)
-    );
+    let sh_url = make("sh")?;
+    let ps_url = make("powershell")?;
     Ok(
-        serde_json::json!({"broker":broker,"sh_url":sh_url,"powershell_url":ps_url,"sh":sh,"powershell":ps}),
+        serde_json::json!({"broker":broker,"sh_url":sh_url,"powershell_url":ps_url,
+        "sh":format!("curl --noproxy '*' -fsS {} -o friendzone-setup.sh",quote(&sh_url)),
+        "powershell":format!("curl.exe --noproxy \"*\" -fsS {} -o friendzone-setup.ps1",ps_quote(&ps_url)),
+        "sh_run":"sh ./friendzone-setup.sh","powershell_run":"& .\\friendzone-setup.ps1"}),
     )
 }
 
+/// Legacy binary download endpoint remains for doctor/older clients, not setup.
 pub fn target_filename(target: &str) -> Result<String> {
     match target {
         "linux-x86_64" | "linux-aarch64" | "windows-x86_64" | "windows-aarch64" => {
             Ok(format!("fz-{target}"))
         }
-        _ => {
-            bail!("supported targets: linux-x86_64, linux-aarch64, windows-x86_64, windows-aarch64")
-        }
+        _ => bail!("unsupported binary target"),
     }
 }
 
@@ -90,93 +160,98 @@ pub fn target_filename(target: &str) -> Result<String> {
 mod tests {
     use super::*;
     #[test]
-    fn bootstrap_parameters_are_data_and_unknown_shells_targets_fail() {
-        assert!(Shell::parse("/bin/zsh").unwrap() == Shell::Sh);
-        assert!(Shell::parse("cmd.exe").is_err());
-        for broker in [
-            "http://u:p@host:8082",
+    fn scripts_are_binary_free_and_payload_never_interpolates_guest_code() {
+        let dir = std::env::temp_dir().join(format!("fz-bootstrap-{}", uuid::Uuid::new_v4()));
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        for shell in [Shell::Sh, Shell::Powershell] {
+            let text = script(
+                shell,
+                "http://[::1]:9082",
+                "guest'$(bad)",
+                "CERTIFICATE",
+                9080,
+                &settings,
+            )
+            .unwrap();
+            assert!(!text.contains("bootstrap/fz"));
+            assert!(!text.contains("fz setup"));
+            assert!(!text.contains("guest'$(bad)"));
+        }
+        let cmds = commands("http://host:9082", "guest").unwrap();
+        assert!(cmds["sh"].as_str().unwrap().starts_with("curl "));
+        assert!(
+            cmds["powershell"]
+                .as_str()
+                .unwrap()
+                .starts_with("curl.exe ")
+        );
+        assert!(!cmds["sh"].as_str().unwrap().contains(";"));
+        for raw in [
+            "file:///tmp",
+            "http://user:pass@host",
             "http://host/path",
             "http://0.0.0.0:8082",
-            "file:///tmp/x",
-            "http://host/?bad=1",
         ] {
-            assert!(broker_origin(broker).is_err(), "{broker}");
+            assert!(broker_origin(raw).is_err());
         }
-        assert!(target_filename("../../secrets.json").is_err());
-        let name = "guest'$(touch nope);\"";
-        let sh = script(Shell::Sh, "http://[::1]:9082", name).unwrap();
-        assert!(sh.contains(&format!("container={}\n", shell_quote(name))));
-        let ps = script(Shell::Powershell, "http://host:9082", name).unwrap();
-        assert!(ps.contains(&format!("$container={}\n", powershell_quote(name))));
-        let cmds = commands("http://host:9082", name).unwrap();
-        let url = reqwest::Url::parse(cmds["sh_url"].as_str().unwrap()).unwrap();
-        assert_eq!(
-            url.query_pairs().find(|(k, _)| k == "container").unwrap().1,
-            name
-        );
-        assert!(cmds["sh"].as_str().unwrap().contains("--noproxy '*'"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[tokio::test]
-    async fn shell_script_failure_never_changes_profiles_or_executes_error_body() {
-        // Git bash supplies POSIX tools on Windows. Fake uname only selects
-        // the Linux branch; the fixture returns a 404, never a real binary.
-        #[cfg(windows)]
-        let bash = "C:/Program Files/Git/bin/bash.exe";
-        #[cfg(not(windows))]
-        let bash = "/bin/bash";
-        let home = std::env::temp_dir().join(format!("fz-script-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&home).unwrap();
-        let marker = home.join(".profile");
-        std::fs::write(&marker, "untouched\n").unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let broker = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                axum::Router::new().fallback(|| async {
-                    (
-                        axum::http::StatusCode::NOT_FOUND,
-                        "missing exact guest build",
-                    )
-                }),
+    #[cfg(windows)]
+    #[test]
+    fn powershell_script_configures_temp_guest_with_mock_user_environment() {
+        let dir = std::env::temp_dir().join(format!("fz-cleanup-ps-{}", uuid::Uuid::new_v4()));
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        let script_path = dir.join("guest.ps1");
+        std::fs::write(
+            &script_path,
+            script(
+                Shell::Powershell,
+                "http://192.0.2.1:9082",
+                "guest'$(bad)",
+                "CERTIFICATE",
+                9080,
+                &settings,
             )
-            .await
-            .unwrap();
-        });
-        let path = home.join("setup.sh");
-        std::fs::write(&path, script(Shell::Sh, &broker, "guest").unwrap()).unwrap();
-        let command = format!(
-            "uname() {{ case \"$1\" in -s) printf Linux;; -m) printf x86_64;; esac; }}; export -f uname; bash --noprofile --norc {}",
-            shell_quote(&path.to_string_lossy())
-        );
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            tokio::process::Command::new(bash)
-                .args(["--noprofile", "--norc", "-c", &command])
-                .env("HOME", &home)
-                .env("XDG_CONFIG_HOME", home.join("config"))
-                .env("HTTP_PROXY", "http://127.0.0.1:1")
-                .env("http_proxy", "http://127.0.0.1:1")
-                .env_remove("SUDO_USER")
-                .env_remove("BASH_ENV")
-                .env_remove("ENV")
-                .kill_on_drop(true)
-                .output(),
+            .unwrap(),
         )
-        .await
-        .unwrap()
         .unwrap();
-        server.abort();
-        assert!(!output.status.success());
+        let command = dir.join("command.ps1");
+        std::fs::write(
+            &command,
+            commands("http://host:9082", "guest").unwrap()["powershell"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let inline = format!(
+            "& ([scriptblock]::Create([IO.File]::ReadAllText({}))) -Implementation {} -TemporaryDirectory {} -BootstrapScript {} -BootstrapCommand {}",
+            ps_quote(
+                &root
+                    .join("tests/fixtures/test_user_environment.ps1")
+                    .to_string_lossy()
+            ),
+            ps_quote(
+                &root
+                    .join("src/bootstrap/persist-environment.ps1")
+                    .to_string_lossy()
+            ),
+            ps_quote(&dir.to_string_lossy()),
+            ps_quote(&script_path.to_string_lossy()),
+            ps_quote(&command.to_string_lossy())
+        );
+        let output =
+            std::process::Command::new("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &inline])
+                .output()
+                .unwrap();
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("missing exact guest build"),
-            "{}",
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(std::fs::read_to_string(marker).unwrap(), "untouched\n");
-        assert!(!home.join(".bashrc").exists());
-        assert!(!home.join(".zshenv").exists());
-        std::fs::remove_dir_all(home).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

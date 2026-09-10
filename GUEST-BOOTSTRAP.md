@@ -1,119 +1,114 @@
-# Guest bootstrap scripts
+# Set up a guest
 
-Open **Settings → Set up a guest** in the host UI. Enter the guest-reachable
-broker host and optionally the container name, then copy the Linux or Windows
-command. **Execute it in the guest account, never on the broker host.** Stop
-guest Cline first: setup updates its provider settings and cannot coordinate
-with a running Cline writer.
+Open **Settings → Guests** on the host. Choose the guest platform/name, copy
+the curl command, and run it in the guest terminal. The command only downloads
+a script. Inspect it if desired, then run the separate command shown below it.
+No guest fz binary, architecture-specific build or compiler is involved.
 
-The commands download a complete script before executing it. **Inspect script**
-opens the same plain-text script for review. Bootstrap is trust-on-first-use:
-HTTP cannot authenticate the first script, binary, or CA. Only use a trusted
-host/isolated network. No firewall, machine environment, system trust store,
-privilege escalation, or execution-policy bypass is performed.
+Linux requires `curl` and Python 3.6+ (standard library only). Windows requires
+`curl.exe` and PowerShell 5.1 or 7. The scripts do not install these dependencies.
 
-## What happens
+```sh
+curl --noproxy '*' -fsS 'http://HOST_IP:8082/bootstrap/setup?shell=sh&container=reviewer' -o friendzone-setup.sh
+sh ./friendzone-setup.sh
+```
 
-1. Detect guest OS and architecture (Linux or Windows, x86_64 or aarch64).
-2. Fetch the exact build from `/bootstrap/fz?target=linux-x86_64` (for example).
-   A host binary is used only if **both** platform and architecture match.
-   Downloads bypass proxies and do not follow redirects.
-3. Invoke `fz setup --shell sh|powershell --persist-profile` with the chosen
-   broker/name. This reuses CA fetching, fake-key configuration, proxy identity,
-   Cline provider merging and guest announcement. Real credentials stay hosted.
-4. Save `fz` beside the guest config. The environment includes both proxy
-   variable cases, FZ_HOST/FZ_BROKER, broker/loopback NO_PROXY exclusions, runtime
-   CA variables, and configured fake keys. Existing NO_PROXY entries survive.
-5. Approve/pin the guest in the host Inbox. Setup does not approve itself.
+```powershell
+curl.exe --noproxy "*" -fsS 'http://HOST_IP:8082/bootstrap/setup?shell=powershell&container=reviewer' -o friendzone-setup.ps1
+& .\friendzone-setup.ps1
+```
 
-If the build is missing, the script stops before profile/user-environment
-changes. Build it in a trusted environment, put it into the broker data
-directory's `guest-bin/` as `fz-linux-x86_64`, `fz-linux-aarch64`,
-`fz-windows-x86_64.exe` or `fz-windows-aarch64.exe`, and restart the broker
-in a planned maintenance window (the file list is currently startup-scanned).
-No compiler is installed and no external release fallback is downloaded.
-Linux build labels do not guarantee libc compatibility: use a build suitable
-for the guest distro. A binary that cannot run fails before setup.
+Run the second command only after the download succeeds. Do not use curl's
+redirect-following flag. Windows execution policy still applies; this feature
+does not weaken or bypass it. Use a trusted host/network: initial HTTP is
+trust-on-first-use, not an authenticated software distribution channel.
+
+## What changes
+
+The script contains a snapshot of the public CA, proxy port and fake keys from
+the broker at download time. It registers the guest directly with the broker,
+then writes the guest account's environment and Cline settings. Refetch before
+rerunning if the CA, broker address or fake keys have changed. Downloading a
+script never registers or approves a guest; the host Inbox still owns approval.
+
+The environment contains FZ_HOST/FZ_BROKER, HTTP_PROXY/HTTPS_PROXY, CA variables
+for common runtimes, and fake provider keys. NO_PROXY/no_proxy includes the
+broker host, localhost, 127.0.0.1, ::1 and [::1], preserving existing exclusions.
+Real credentials and OAuth refresh tokens never enter the script.
+
+If Cline credentials are configured on the broker, the script merges the fake
+key into the guest's `.cline/data/settings/providers.json`. **Close guest Cline
+before running the script** because it writes this same file. The merge keeps
+model choice, other providers, and last-used provider; it removes stale Cline
+OAuth fields so they cannot override the fake key. Invalid provider JSON fails
+before environment/profile writes. Existing provider files get a backup.
+
+The script does not modify firewall rules or the system CA store. Runtime CA
+variables provide trust for supported clients; applications that ignore them
+need their own trust configuration. Network confinement remains host-enforced;
+see [NETWORK-ISOLATION.md](NETWORK-ISOLATION.md).
 
 ## Linux persistence
 
-Run as the guest user, without sudo. Configuration defaults to
-`${XDG_CONFIG_HOME:-$HOME/.config}/friendzone`. A managed hook sources
+Run as the guest user without sudo. Files are written under
+`${XDG_CONFIG_HOME:-$HOME/.config}/friendzone`. Managed hooks source
 `activate.sh` from `.profile`, `.bashrc`, existing `.bash_profile`/`.bash_login`,
-and `${ZDOTDIR:-$HOME}/.zshenv`. Existing file contents are preserved and a
-`.friendzone-backup` copy is made before the first edit. Reruns do not append
-the same hook twice. Simple existing source lines for the same environment
-file are upgraded in place (including common `$HOME`/`~/` forms); arbitrary
-compound shell code is not rewritten. Changing configuration directories with an old managed
-hook is rejected rather than silently adding competing hooks.
+and `${ZDOTDIR:-$HOME}/.zshenv`. Existing contents are retained; the first edit
+creates `.friendzone-backup` copies. Identical hooks are not duplicated. Simple
+existing source lines are upgraded in place; arbitrary compound shell code is
+not rewritten. A conflicting managed hook fails instead of adding a second one.
 
-`activate.sh` loads `friendzone-env.sh` and sets BASH_ENV to a managed wrapper.
-The wrapper sources the original BASH_ENV (recorded on first installation),
-then Friendzone's environment. This covers non-interactive bash launched from
-an activated parent. Zsh reads `.zshenv` for interactive and non-interactive
-shells (unless startup files are explicitly disabled).
+The activation script loads `friendzone-env.sh` and exports BASH_ENV pointing
+to a wrapper that preserves the original BASH_ENV. Non-interactive bash inherits
+it from an activated parent. Zsh reads `.zshenv` for interactive/non-interactive
+shells unless startup files are disabled. Plain non-interactive sh, cron,
+systemd and other services require an explicitly activated launcher.
 
-**Limits:** a process cannot alter its parent's environment. The installer
-prints a source command; run it in the existing terminal, or start a new login
-shell. Plain non-interactive `sh`, cron, systemd, SSH command runners and other
-services do not universally read user profiles. Launch those through an
-explicitly activated shell, or set their environment in their own launcher.
-Custom startup-file early returns and explicit environment clearing can also
-skip hooks. Do not use guest shell configuration as network enforcement.
+A child cannot alter its parent shell. Use the printed source command in the
+current terminal, or start a new login shell, then restart guest Cline.
 
-Rollback: remove only the marked Friendzone hook from the affected profiles
-(or restore each `.friendzone-backup` **only if you have not edited that file
-since**). Restore the previous BASH_ENV recorded in `previous-bash-env`, start
-a clean login/session, and remove the generated activation files when no
-profile references them. Do not delete unrelated shell configuration.
+Rollback: remove only the marked hooks, restore the original BASH_ENV recorded
+in `previous-bash-env`, and start a clean session. Restore profile backups only
+if you have not edited those profiles since installation. CA/provider files
+are separate; do not overwrite unrelated later edits.
 
 ## Windows persistence
 
-Windows PowerShell 5.1 and PowerShell 7 on Windows are supported. The script
-uses direct .NET HTTP, so it does not depend on the PowerShell `curl` alias or
-proxy auto-detection. Normal script execution policy applies; review and allow
-the saved script according to your policy rather than using a blanket bypass.
+Files live in `%APPDATA%\friendzone`. The script writes **User**, never
+**Machine**, environment values and activates its PowerShell process. Its
+children inherit the new environment; existing applications do not. Sign out
+and back in for GUI launchers, and restart guest agents/hubs. PowerShell
+profiles are not required, so non-interactive and `-NoProfile` processes still
+inherit values from a fresh launcher.
 
-Files live in `%APPDATA%\friendzone`. `friendzone-env.ps1` activates process
-environment. Persistence writes **User**, never **Machine**, environment
-variables; interactive and non-interactive programs launched with a fresh
-user environment receive them. Windows variable names are case-insensitive.
-Existing NO_PROXY exclusions are merged. `user-environment-backup.json` records
-previous values before any write; reruns preserve the original rollback values.
-
-The installer activates its current PowerShell process; new children inherit
-that environment. Existing processes do not change. **Sign out and back in**
-to refresh GUI launchers reliably, and restart agents/hubs. PowerShell profiles
-are not required, so `-NoProfile` programs still inherit fresh user environment.
-
-To undo saved user environment, execute in the guest:
+Before user-environment writes, `user-environment-backup.json` records original
+and applied values. Reruns retain the originals and skip unchanged writes. On
+write failure, completed writes are rolled back. To undo in the guest:
 
 ```powershell
 & "$env:APPDATA\friendzone\persist-environment.ps1" `
   -BackupPath "$env:APPDATA\friendzone\user-environment-backup.json" -Restore
 ```
 
-Rollback restores only values that still equal Friendzone's applied value;
-externally changed variables are preserved with a warning. Restart/sign in to
-drop inherited process variables too. CA files and Cline provider settings
-are separate from environment rollback.
+Rollback preserves externally changed variables with a warning. Start a fresh
+session afterward; already-inherited environment values do not disappear.
 
-## Explicit script API
+## Script endpoint
 
-`GET /bootstrap/setup?shell=sh&broker=http%3A%2F%2FHOST%3A8082&container=NAME`
-serves POSIX shell; `shell=powershell` serves PowerShell. `bash`, `zsh`,
-`/bin/zsh`, and `pwsh` are accepted selectors. Do not use a bare `?$SHELL`:
-an explicit encoded parameter is unambiguous. The required `broker` is a plain
-origin, not inferred from an untrusted Host header or the UI origin. Queries
-are data-quoted, unknown shells/targets are rejected, and script reads make
-no permission changes. These routes live on the guest bootstrap listener;
-management routes remain host-only.
+`GET /bootstrap/setup?shell=sh&container=NAME` serves a shell script;
+`shell=powershell` serves PowerShell. `bash`, `zsh`, `/bin/zsh`, and `pwsh` are
+accepted. Omit container to use the guest hostname at execution time.
 
-## Validation safety
+The bootstrap listener's HTTP Host determines the broker origin; it is strictly
+validated and encoded as data, never interpolated into code. An explicit
+`broker=` origin is supported for alternate routing. Forwarded headers are not
+trusted. Scripts are no-store and only contain the public configuration snapshot.
+Management routes remain unavailable on this listener.
 
-Tests use temporary homes, explicit profile paths, local fixture servers and
-isolated child environments. Windows user-environment adapters are mocked in
-memory. The full installer is not executed against the developer's real user,
-registry, CA store, network settings, or live broker. Actual Windows user
-registry persistence and Linux distro-specific startup behavior require a
-disposable guest acceptance test before using this on a valuable account.
+## Validation boundary
+
+Tests execute script configuration against explicit temporary homes and local
+fixtures. Windows environment writes are mocked in memory. The developer's
+real profiles, user registry, trust store, network settings and live broker
+are never used as installation test targets. Native zsh startup and real
+Windows persistence still require acceptance testing in a disposable guest.

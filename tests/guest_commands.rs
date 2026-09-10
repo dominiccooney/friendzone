@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, process::Output, time::Duration};
+use std::{net::SocketAddr, process::Output, time::Duration};
 
 use axum::{Router, http::StatusCode, routing::get};
 use tokio::{net::TcpListener, process::Command, task::JoinHandle};
@@ -30,22 +30,6 @@ impl TestServer {
 impl Drop for TestServer {
     fn drop(&mut self) {
         self.task.abort();
-    }
-}
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("fz-guest-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -142,53 +126,9 @@ async fn doctor_still_reports_broker_http_errors() {
 }
 
 #[tokio::test]
-async fn setup_fetches_all_bootstrap_endpoints_directly_with_proxy_env_set() {
-    let broker = TestServer::start(
-        Router::new()
-            .route("/bootstrap/ca.pem", get(|| async { "TEST CERTIFICATE" }))
-            .route(
-                "/bootstrap/env",
-                get(|| async { "export ANTHROPIC_API_KEY=fz-test-fake\n" }),
-            )
-            .route(
-                "/bootstrap/info",
-                get(|| async { axum::Json(serde_json::json!({"proxy_port": 8080})) }),
-            )
-            .route(
-                "/bootstrap/hello",
-                get(|| async { axum::Json(serde_json::json!({"approved": false})) }),
-            ),
-    )
-    .await;
+async fn obsolete_setup_command_is_not_a_second_installation_path() {
     let proxy = denying_proxy().await;
-    let dir = TempDir::new();
-    let cert_path = dir.0.join("friendzone-ca.pem");
-    // No --install or Cline fake: setup only writes into this temp dir,
-    // never the user's trust store or provider settings.
-    let output = run_fz(
-        &proxy,
-        &[
-            "setup",
-            "--broker",
-            &broker.url(),
-            "--container",
-            "scratch-kali",
-            "--shell",
-            "sh",
-            "--output",
-            cert_path.to_str().unwrap(),
-        ],
-    )
-    .await;
-    let text = output_text(&output);
-    assert!(output.status.success(), "{text}");
-    assert!(text.contains("awaiting approval"), "{text}");
-    assert_eq!(
-        std::fs::read_to_string(cert_path).unwrap(),
-        "TEST CERTIFICATE"
-    );
-    let env = std::fs::read_to_string(dir.0.join("friendzone-env.sh")).unwrap();
-    assert!(env.contains("export HTTP_PROXY='http://scratch-kali:x@127.0.0.1:8080'"));
-    assert!(env.contains("export FZ_HOST='127.0.0.1'"));
-    assert!(env.contains("export ANTHROPIC_API_KEY='fz-test-fake'"));
+    let output = run_fz(&proxy, &["setup"]).await;
+    assert!(!output.status.success());
+    assert!(output_text(&output).contains("unrecognized subcommand"));
 }

@@ -18,6 +18,7 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
     focus() { this.focused = true; },
     select() { this.selected = true; },
     scrollIntoView() { this.scrolled = true; },
+    append(child) { this.child=child; },
   }]));
   const calls = [];
   const timers = [];
@@ -334,7 +335,6 @@ async function resolveSettings(f, forwards = []) {
   await new Promise(setImmediate);
   f.calls.filter(c=>c.url==="/api/escrow").at(-1).resolve({json:async()=>({entries:[]})});
   f.calls.filter(c=>c.url==="/api/mcp").at(-1).resolve({json:async()=>({forwards,guest_host:"172.31.208.1",guest_port:8082})});
-  f.calls.filter(c=>c.url==="/api/guest-env").at(-1).resolve({text:async()=>"# environment"});
 }
 
 test("guest bootstrap commands discard stale responses, use explicit platform choices and copy safely", async () => {
@@ -352,7 +352,7 @@ test("guest bootstrap commands discard stale responses, use explicit platform ch
   assert.equal(element("view-sh").href,reply.sh_url);
   let copied;f.sandbox.navigator.clipboard={async writeText(text){copied=text;}};
   await element("copy-powershell").onclick(); assert.equal(copied,reply.powershell);
-  assert.match(element("status").textContent,/only in the guest/);
+  assert.match(element("status").textContent,/guest terminal/);
   element("host").value="";await f.run("loadGuestSetup()");
   assert.equal(element("sh").value,"");assert.equal(element("copy-sh").disabled,true);
   assert.equal(element("view-sh").hidden,true);
@@ -378,7 +378,7 @@ test("forward row explains Cline credential ownership and copies the Friendzone 
   await button.onclick();
   assert.equal(copied, linearForward.guest_endpoint);
   assert.notEqual(copied, linearForward.url);
-  assert.match(f.element("copy-status").textContent, /required guest Authorization header/);
+  assert.equal(f.element("copy-status").textContent, "Endpoint copied.");
   assert.ok(!f.calls.some(call=>call.url.includes("guest-config")), "URL copy does not need credentials or guest selection");
   delete f.sandbox.navigator.clipboard;
   await button.onclick();
@@ -391,7 +391,7 @@ test("wildcard endpoint does not offer to copy a partial URL and broker OAuth is
   const render=f.run("renderSettings()");
   await resolveSettings(f, [{...linearForward, auth:"oauth", guest_endpoint:null}]); await render;
   assert.match(f.element("list").innerHTML, /Friendzone manages OAuth/);
-  assert.match(f.element("list").innerHTML, /set the broker host/);
+  assert.match(f.element("list").innerHTML, /enter a reachable host/);
   assert.equal(f.copyButtons().length,0);
 });
 
@@ -511,7 +511,18 @@ test("Settings refresh does not overwrite an edited broker host", async () => {
   f.calls.find(c=>c.url==="/api/mcp").resolve({json:async()=>({
     forwards:[], guest_host:"172.31.208.1", guest_port:8082, guest_address_warning:null,
   })});
-  f.calls.find(c=>c.url==="/api/guest-env").resolve({text:async()=>"# environment"});
   await pending;
   assert.equal(f.element("connect-host").value, "my-broker.local");
+});
+
+test("settings sections and guest platform persist without exposing the long form", () => {
+  const storage=new Map([["fz-settings-section","mcp"],["fz-setup-platform","powershell"]]);
+  const f=fixture({storage});const element=id=>f.sandbox.document.querySelector('#'+id);
+  assert.equal(element('settings-mcp').hidden,false);assert.equal(element('settings-guests').hidden,true);
+  assert.equal(element('setup-platform-sh').hidden,true);assert.equal(element('setup-platform-powershell').hidden,false);
+  f.run('selectSettings("credentials");selectSetupPlatform("sh")');
+  assert.equal(storage.get('fz-settings-section'),'credentials');assert.equal(storage.get('fz-setup-platform'),'sh');
+  const reloaded=fixture({storage});assert.equal(reloaded.sandbox.document.querySelector('#settings-credentials').hidden,false);
+  assert.doesNotMatch(html,/fz setup|matching fz binary|Guest environment \(manual\)|URL alone is not enough/);
+  assert.doesNotMatch(script,/URL alone is not enough/);
 });

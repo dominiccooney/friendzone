@@ -48,7 +48,7 @@ see the network isolation guide for the remaining limitations.
 
 Containers are dynamic; the launch command never names them. A container
 is identified by the username in its proxy credentials. **Unknown
-containers are denied**: first contact (traffic or `fz setup`) creates a
+containers are denied**: first contact (traffic or the guest setup script) creates a
 join request in the Inbox, and nothing flows until you approve it —
 "Approve + pin IP" also locks the name to the address it connected
 from, so containers cannot use each other's names. Pins are editable
@@ -82,77 +82,20 @@ changing the data directory also starts a separate policy store.
 
 ## Set up a guest
 
-**Recommended:** use **Settings → Set up a guest**. Copy the Linux shell or
-Windows PowerShell command and execute it **in the guest user account**, not
-on the host. It downloads the exact platform/architecture binary, invokes
-setup, and persists user configuration: idempotent shell profile hooks on
-Linux, user-scoped environment variables on Windows. No firewall or system
-trust-store changes. See [GUEST-BOOTSTRAP.md](GUEST-BOOTSTRAP.md) for script
-inspection, non-interactive-shell behavior, missing builds, rollback, and
-Windows execution-policy requirements. Stop guest Cline before running it.
+Use **Settings → Guests**. Select Linux or Windows, copy the `curl` download
+command, and run the downloaded script in the guest account. No guest binary,
+compiler, or platform-specific build is needed. Linux requires Python 3;
+Windows requires curl.exe and PowerShell 5.1 or 7.
 
-Manual binary setup remains available below. Add `--persist-profile` as the
-normal guest user (without sudo) for persistence. `--shell sh` and
-`--shell powershell` explicitly choose output; Windows defaults to PowerShell.
+The script saves the CA, proxy/loopback exclusions and fake credentials, merges
+Cline provider settings, and persists user configuration. Linux gets idempotent
+profile hooks; Windows gets user-scoped environment values. Close guest Cline
+before running the script because it updates that application's settings, then
+restart Cline from the activated environment.
 
-The broker exposes its own binary at `http://HOST_IP:8082/bootstrap/fz`
-— right only when the guest matches the host's OS/arch.
-
-For a guest with a different OS (e.g. a Linux VM on a Windows host),
-build `fz` inside the guest from the repo:
-
-```text
-git clone https://github.com/dominiccooney/friendzone
-cd friendzone && cargo build --release
-sudo ./target/release/fz setup --broker http://HOST_IP:8082 --install
-```
-
-Optionally copy the built binary to the host's `<data-dir>/guest-bin/`
-(e.g. as `fz-linux-x86_64`) and restart the broker; further guests of
-that platform can then skip the build and fetch it from
-`/bootstrap/fz/fz-linux-x86_64` (`GET /bootstrap/targets` lists what is
-available; the broker prints it at startup).
-
-On a guest matching the host platform:
-
-```text
-curl -o fz http://HOST_IP:8082/bootstrap/fz
-chmod +x fz
-sudo ./fz setup --broker http://HOST_IP:8082 --install
-```
-
-`/bootstrap/fz` also takes a platform query — `?linux`, `?win`,
-`?macos` — which serves a matching build from `guest-bin/` (the bare
-URL always serves the host's own binary). Setup ends by announcing the
-container to the broker: if it is not yet approved, setup says so and
-the join request is already waiting in the UI inbox.
-
-Without `--install`, setup saves the certificate and prints manual and
-per-runtime instructions. Installation may require an elevated shell.
-
-Configure the explicit proxy with per-container credentials:
-
-```text
-HTTP_PROXY=http://reviewer:CHANGE_ME@HOST_IP:8080
-HTTPS_PROXY=http://reviewer:CHANGE_ME@HOST_IP:8080
-```
-
-For runtimes that use their own CA bundle, point them at the downloaded file:
-
-```text
-NODE_EXTRA_CA_CERTS=/path/to/friendzone-ca.pem
-REQUESTS_CA_BUNDLE=/path/to/friendzone-ca.pem
-```
-
-Check the setup:
-
-```text
-fz doctor --broker http://HOST_IP:8082 \
-  --proxy http://reviewer:CHANGE_ME@HOST_IP:8080
-```
-
-`fz doctor` reports checks not implemented by this first slice as `INFO`, not
-`PASS`.
+The former setup subcommand is removed. Existing guest environment files and
+profile hooks are reused. See [GUEST-BOOTSTRAP.md](GUEST-BOOTSTRAP.md) for the
+script endpoints, persistence details, trust model and rollback.
 
 ## Try the proxy locally
 
@@ -246,7 +189,7 @@ log rows say `read-only GitHub GraphQL query; automatically allowed`.
 
 ## MCP forwarding (read tools)
 
-Use **Settings → MCP forwards** to add, validate and apply a forward live,
+Use **Settings → MCP servers** to add, validate and apply a forward live,
 or link a selected streamable-HTTP server from a host Cline settings file.
 Select allowed tools and guests explicitly; the import grants neither by
 default and never executes host commands. See [QUICKSTART.md](QUICKSTART.md)
@@ -289,7 +232,7 @@ and opens host sign-in in one step. After login, **Next: choose tools and
 guests**, then **Save guest access**. Until then, the new server is private.
 Existing server cards offer **Authorize in Friendzone** and **Choose tools
 and guests**, plus a full, wrapping guest endpoint with **Copy URL**.
-**Copy Cline setup** includes the required guest Authorization header.
+**Connect guest → Copy Cline configuration** includes the required guest Authorization header.
 The broker discovers protected-resource and authorization-server metadata,
 registers a public client, uses PKCE S256 and a resource-bound grant, and
 stores its own session on the host. Concurrent requests share one refresh
@@ -341,7 +284,7 @@ and polls in the background until you confirm the code — no callback,
 no editor redirect. Tokens are registered with Cline's backend and
 auto-refresh from then on.
 
-`fz setup` fetches the fakes into the guest as `friendzone-env.sh`;
+The guest setup script saves the fakes as `friendzone-env.sh` (or `.ps1` on Windows);
 source it in the agent's shell. When the fakes include `CLINE_API_KEY`,
 setup also writes `~/.cline/data/settings/providers.json` (the settings
 file Cline's CLI, IDE extension, and SDK share) registering the `cline`
@@ -369,25 +312,16 @@ through untouched.
 
 ## Current scope
 
-Working now: multi-container identity with join-request approval, IP
-pinning, dynamic add/remove, and a
-reversible kill switch; request log with HTTP status, inference token
-counts, 10,000-event in-memory retention, server-side search and pagination;
-407 proxy authentication negotiation, CONNECT identity propagation and
-decrypted GitHub policy; in-UI MCP forwards editing with live
-reload; GitHub read/write policy (reads flow, writes
-block with a note); credential escrow with exact-fake-match,
-host-pinned substitution and leak blocking, provider presets, and
-add/edit/delete from the settings UI; Cline account sign-in with
-background token refresh; MCP forwarding of streamable-HTTP servers
-with tool allowlists and host-side OAuth (discovery, dynamic client
-registration, PKCE, refresh, reauthorize/disconnect); guest bootstrap
-of the CA, `fz` binary, and fake credentials.
+Working now: persistent container approval/IP pins/Kill, a searchable
+10,000-event in-memory log, CONNECT interception and credential substitution;
+parsed GitHub GraphQL reads, one-shot write review with desktop notifications,
+and narrow per-guest issue/PR comment permissions; live MCP configuration,
+tool/guest allowlists and host-side OAuth; Cline sign-in and token refresh;
+script-only guest setup with persistent Linux profiles or Windows user
+environment. Settings is organized into Guests, Credentials and MCP servers.
 
-Not yet: proxy password validation (identity is name + approval + IP
-pin, not a secret), the
-pending-request inbox (GitHub writes 403 instead of queueing),
-rulesets, on-disk log retention, OS-secret-store credentials,
-stdio MCP servers, Hyper-V/tart network provisioning
-(egress default-deny is the VM network's job), and terminating
-connections already in progress when the kill switch is pressed.
+Not yet: proxy password validation (identity is name + approval + IP pin),
+general rulesets, binary git push review, on-disk logs, OS-secret-store
+credentials, stdio MCP forwarding, automatic Hyper-V/tart network provisioning,
+general DNS-rebinding/LAN protection, or termination of already-forwarded
+connections when Kill is pressed. Guest egress enforcement remains external.
