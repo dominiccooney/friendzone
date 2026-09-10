@@ -258,8 +258,13 @@ valid v1 store metadata and `tokenSource: "manual"`. Run setup while guest
 Cline is stopped. Real OAuth refresh stays in the broker; substitution
 adds Cline's `workos:` prefix to broker-owned OAuth access tokens.
 
-The environment includes `FZ_HOST`, `FZ_BROKER`, host-only `NO_PROXY` and
-`no_proxy` exclusions, and `GIT_SSL_CAINFO` as well as runtime CA variables.
+The environment includes `FZ_HOST`, `FZ_BROKER`, and both `NO_PROXY`/`no_proxy`
+with the broker host plus `localhost`, `127.0.0.1`, `::1`, and `[::1]`.
+Existing exclusions from both cases are merged without duplicates. This
+keeps guest Cline hub requests on guest loopback instead of sending them to
+the host proxy. `GIT_SSL_CAINFO` and other runtime CA variables are included.
+After updating an old env file, source it and restart guest processes that
+inherited the old environment. These exclusions are not a security boundary.
 
 Substitution requires an exact fake match on a pinned host: a random
 key passes through untouched, and a fake sent toward any non-pinned

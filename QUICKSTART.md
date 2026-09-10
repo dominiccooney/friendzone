@@ -181,11 +181,30 @@ CA bundle vars, and the fake keys — into one file. Activate it:
 ```
 
 The file also exports `FZ_HOST` and `FZ_BROKER`, both proxy-variable cases,
-and `NO_PROXY`/`no_proxy` for the broker host only (preserving existing
-exclusions). `GIT_SSL_CAINFO` trusts the intercepted origin certificate;
+and `NO_PROXY`/`no_proxy` for the broker host and guest loopback:
+`localhost`, `127.0.0.1`, `::1`, and `[::1]`. Existing exclusions from both
+variables are merged without duplicates. Cline hub health checks and other
+guest-local HTTP requests must stay inside the guest, not be sent to the
+host proxy's loopback. `GIT_SSL_CAINFO` trusts the intercepted origin certificate;
 `GIT_PROXY_SSL_CAINFO` alone was not sufficient for an HTTP proxy.
 
-Add that line to the agent's shell profile so it persists. The
+If you used an older generated env file, update/rebuild the **guest** `fz`,
+rerun setup with the same broker/container arguments, and source the new file.
+No broker restart or CA reinstall is needed for this environment fix. Restart
+the guest Cline CLI/hub (or its service) with the new environment: changing a
+shell variable cannot update already-running processes. For an immediate
+temporary repair, after sourcing the old file in the guest shell:
+
+```sh
+export NO_PROXY="localhost,127.0.0.1,::1,[::1]${NO_PROXY:+,$NO_PROXY}${no_proxy:+,$no_proxy}"
+export no_proxy="$NO_PROXY"
+```
+
+This is a client-routing fix, not access control: a guest can override it.
+Keep the host-enforced network restrictions in place, and do not expose
+host-local services through the proxy expecting `NO_PROXY` to protect them.
+
+Add the environment-file source line to the agent's shell profile so it persists. The
 container identity defaults to the guest hostname; pass
 `--container reviewer` to `fz setup` to match a name you added in the
 UI. Then check everything:

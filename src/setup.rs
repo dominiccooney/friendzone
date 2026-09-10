@@ -165,13 +165,24 @@ fn guest_environment(
          export HTTPS_PROXY={proxy}\n\
          export http_proxy={proxy}\n\
          export https_proxy={proxy}\n\
-         # Bypass only the broker host; preserve the user's existing exclusions.\n\
-         export NO_PROXY=\"${{NO_PROXY:-${{no_proxy:-}}}}\"\n\
-         case ,$NO_PROXY, in\n\
-           *,\"$FZ_HOST\",*) ;;\n\
-           *) export NO_PROXY=\"$FZ_HOST${{NO_PROXY:+,$NO_PROXY}}\" ;;\n\
-         esac\n\
+         # Guest loopback (including the Cline hub) must stay in the guest.\n\
+         # Merge both cases literally: no globbing, duplicate entries or lost exclusions.\n\
+         _fz_no_proxy_rest=\"$FZ_HOST,localhost,127.0.0.1,::1,[::1],${{NO_PROXY:-}},${{no_proxy:-}},\"\n\
+         _fz_no_proxy_list=\n\
+         while [ -n \"$_fz_no_proxy_rest\" ]; do\n\
+           _fz_no_proxy_item=${{_fz_no_proxy_rest%%,*}}\n\
+           _fz_no_proxy_rest=${{_fz_no_proxy_rest#*,}}\n\
+           _fz_no_proxy_item=${{_fz_no_proxy_item#\"${{_fz_no_proxy_item%%[![:space:]]*}}\"}}\n\
+           _fz_no_proxy_item=${{_fz_no_proxy_item%\"${{_fz_no_proxy_item##*[![:space:]]}}\"}}\n\
+           [ -n \"$_fz_no_proxy_item\" ] || continue\n\
+           case ,$_fz_no_proxy_list, in\n\
+             *,\"$_fz_no_proxy_item\",*) ;;\n\
+             *) _fz_no_proxy_list=\"${{_fz_no_proxy_list:+$_fz_no_proxy_list,}}$_fz_no_proxy_item\" ;;\n\
+           esac\n\
+         done\n\
+         export NO_PROXY=\"$_fz_no_proxy_list\"\n\
          export no_proxy=\"$NO_PROXY\"\n\
+         unset _fz_no_proxy_rest _fz_no_proxy_list _fz_no_proxy_item\n\
          export NODE_EXTRA_CA_CERTS={cert}\n\
          export REQUESTS_CA_BUNDLE={cert}\n\
          export SSL_CERT_FILE={cert}\n\
@@ -441,13 +452,21 @@ mod tests {
             "",
         )
         .unwrap();
-        for initial in [
-            "unset NO_PROXY; export no_proxy=localhost",
-            "export NO_PROXY=localhost; unset no_proxy",
-            "unset NO_PROXY no_proxy",
+        for (initial, additional) in [
+            ("unset NO_PROXY; export no_proxy=localhost", ""),
+            ("export NO_PROXY=localhost; unset no_proxy", ""),
+            ("unset NO_PROXY no_proxy", ""),
+            (
+                "export NO_PROXY=upper.test; export no_proxy=lower.test",
+                ",upper.test,lower.test",
+            ),
+            (
+                "export NO_PROXY=' upper.test ,127.0.0.1,,[::1]'; export no_proxy='*.internal,upper.test'",
+                ",upper.test,*.internal",
+            ),
         ] {
             let script = format!(
-                "set -eu\n{initial}\n{env}\n{env}\nprintf '%s\\n' \"$FZ_HOST\" \"$NO_PROXY\" \"$no_proxy\" \"$GIT_SSL_CAINFO\" \"$HTTPS_PROXY\"\n"
+                "set -eu\n{initial}\n{env}\nfirst=$NO_PROXY\n{env}\n[ \"$first\" = \"$NO_PROXY\" ]\nprintf '%s\\n' \"$FZ_HOST\" \"$NO_PROXY\" \"$no_proxy\" \"$GIT_SSL_CAINFO\" \"$HTTPS_PROXY\"\n"
             );
             let output = Command::new(shell).args(["-c", &script]).output().unwrap();
             assert!(
@@ -460,16 +479,125 @@ mod tests {
             assert_eq!(lines[0], "172.31.208.1");
             assert_eq!(
                 lines[1],
-                if initial.contains("localhost") {
-                    "172.31.208.1,localhost"
-                } else {
-                    "172.31.208.1"
-                }
+                format!("172.31.208.1,localhost,127.0.0.1,::1,[::1]{additional}")
             );
             assert_eq!(lines[1], lines[2]);
             assert_eq!(lines[3], "/tmp/a b'c.pem");
             assert_eq!(lines[4], "http://scratch-kali:x@172.31.208.1:8080");
         }
+    }
+
+    #[tokio::test]
+    async fn loopback_health_stays_local_but_nonlocal_requests_still_use_proxy() {
+        use axum::{Router, routing::get};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        #[cfg(windows)]
+        let (shell, curl) = (
+            "C:/Program Files/Git/bin/bash.exe",
+            "C:/Windows/System32/curl.exe",
+        );
+        #[cfg(not(windows))]
+        let (shell, curl) = ("/bin/sh", "curl");
+        if !Path::new(shell).exists() {
+            eprintln!("shell integration unavailable: {shell}");
+            return;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub_port = listener.local_addr().unwrap().port();
+        let hub = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/health", get(|| async { "guest-hub" })),
+            )
+            .await
+            .unwrap();
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = hits.clone();
+        let proxy = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    async { (axum::http::StatusCode::FORBIDDEN, "proxy-denial") }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        // Use a non-loopback broker identity so the host exemption cannot
+        // accidentally make this regression test pass without loopback entries.
+        let env = guest_environment(
+            "http://192.0.2.1:8082",
+            8080,
+            "guest",
+            Path::new("/unused/public-ca.pem"),
+            "",
+        )
+        .unwrap();
+        let mut urls = vec![
+            format!("http://127.0.0.1:{hub_port}/health"),
+            format!("http://localhost:{hub_port}/health"),
+        ];
+        let ipv6_hub = if let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await {
+            urls.push(format!(
+                "http://[::1]:{}/health",
+                listener.local_addr().unwrap().port()
+            ));
+            Some(tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    Router::new().route("/health", get(|| async { "guest-hub" })),
+                )
+                .await
+                .unwrap();
+            }))
+        } else {
+            eprintln!("IPv6 loopback is unavailable; IPv4/localhost checks still run");
+            None
+        };
+        let mut script = format!(
+            "set -eu\nunset NO_PROXY no_proxy\n{env}\nexport HTTP_PROXY={} http_proxy={} HTTPS_PROXY={} https_proxy={}\n",
+            shell_quote(&proxy_url),
+            shell_quote(&proxy_url),
+            shell_quote(&proxy_url),
+            shell_quote(&proxy_url),
+        );
+        for url in &urls {
+            script.push_str(&format!("[ \"$({} --silent --show-error --fail --connect-timeout 2 --max-time 5 {})\" = guest-hub ]\n", shell_quote(curl), shell_quote(url)));
+        }
+        // Nonlocal DNS never needs to resolve: the mock proxy receives it.
+        script.push_str(&format!("[ \"$({} --silent --show-error --connect-timeout 2 --max-time 5 http://not-local.invalid/health)\" = proxy-denial ]\n", shell_quote(curl)));
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            tokio::process::Command::new(shell)
+                .args(["-c", &script])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        hub.abort();
+        proxy.abort();
+        if let Some(hub) = ipv6_hub {
+            hub.abort();
+        }
+        let output = output.expect("loopback probe timed out").unwrap();
+        assert!(
+            output.status.success(),
+            "local requests must bypass the proxy: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "only the nonlocal request should reach the proxy"
+        );
     }
 
     #[test]
