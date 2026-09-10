@@ -152,6 +152,119 @@ impl Broker {
 }
 
 #[tokio::test]
+async fn proxy_blocks_guest_loopback_but_allows_configured_bootstrap() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn send(proxy: &str, request: &str) -> String {
+        let mut socket = tokio::net::TcpStream::connect(proxy.strip_prefix("http://").unwrap())
+            .await
+            .unwrap();
+        socket.write_all(request.as_bytes()).await.unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    let dir = TempDir::new();
+    let broker = Broker::start(&dir).await;
+    assert!(
+        broker
+            .post("/api/containers", json!({"name":"guest"}))
+            .await
+            .status()
+            .is_success()
+    );
+    // Keep a real TCP listener alive: a 403 is insufficient evidence if a
+    // connection still reached it, or if no service was listening anyway.
+    let hub = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hub_port = hub.local_addr().unwrap().port();
+    for host in [
+        "127.0.0.1",
+        "127.1",
+        "2130706433",
+        "localhost",
+        "[::ffff:127.0.0.1]",
+    ] {
+        for method in ["GET", "POST", "CONNECT"] {
+            let target = if method == "CONNECT" {
+                format!("{host}:{hub_port}")
+            } else {
+                format!("http://{host}:{hub_port}/health")
+            };
+            let response = send(&broker.proxy, &format!("{method} {target} HTTP/1.1\r\nHost: {host}:{hub_port}\r\nProxy-Authorization: Basic Z3Vlc3Q6eA==\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")).await;
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "{method} {target}: {response}"
+            );
+            assert!(response.contains("host loopback"));
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), hub.accept())
+            .await
+            .is_err(),
+        "proxy connected to the blocked hub listener"
+    );
+
+    // Exercises actual CLI -> proxy_server -> EventHandler wiring with a
+    // nondefault bootstrap port, rather than just configuring a test handler.
+    let response = broker.proxy_request("guest").await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "ok");
+
+    let authority = broker.bootstrap.strip_prefix("http://").unwrap();
+    let mut tunnel = tokio::net::TcpStream::connect(broker.proxy.strip_prefix("http://").unwrap())
+        .await
+        .unwrap();
+    tunnel.write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: Basic Z3Vlc3Q6eA==\r\n\r\n").as_bytes()).await.unwrap();
+    let mut handshake = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !handshake.ends_with(b"\r\n\r\n") {
+            handshake.push(tunnel.read_u8().await.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    assert!(handshake.starts_with(b"HTTP/1.1 200"));
+    tunnel
+        .write_all(
+            format!("GET /health HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), tunnel.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("ok"), "{response}");
+    // Bootstrap is guest-safe, not a management bypass.
+    let response = send(&broker.proxy, &format!("GET {}/api/state HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: Basic Z3Vlc3Q6eA==\r\nConnection: close\r\n\r\n", broker.bootstrap)).await;
+    assert!(response.starts_with("HTTP/1.1 404"));
+    let view = broker.snapshot().await;
+    assert!(view["pending_requests"].as_array().unwrap().is_empty());
+    let blocked: Vec<_> = view["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["verdict"] == "blocked")
+        .collect();
+    assert_eq!(blocked.len(), 15);
+    assert!(
+        blocked
+            .iter()
+            .all(|r| r["status"] == 403 && r["detail"].as_str().unwrap().contains("host loopback"))
+    );
+    broker.stop().await;
+}
+
+#[tokio::test]
 async fn approvals_pins_kills_removals_and_http_save_errors_survive_restart() {
     let dir = TempDir::new();
     let broker = Broker::start(&dir).await;

@@ -1406,6 +1406,7 @@ mod tests {
                 state.clone(),
                 settings.clone(),
                 ui_addr.port(),
+                8082,
             ))
             .build()
             .unwrap();
@@ -1639,6 +1640,7 @@ mod tests {
                 state.clone(),
                 settings.clone(),
                 ui_addr.port(),
+                8082,
             ))
             .build()
             .unwrap();
@@ -1946,6 +1948,7 @@ mod tests {
                 state.clone(),
                 settings,
                 ui_addr.port(),
+                8082,
             ))
             .build()
             .unwrap();

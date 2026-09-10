@@ -32,6 +32,18 @@ network access or an alternate relay to the management API. Outside the VM,
 allow only the proxy and bootstrap/MCP ports on the broker's guest-facing IP.
 The separate bootstrap port must remain reachable for setup and recovery.
 
+The proxy also rejects HTTP requests and CONNECT tunnels to loopback
+(`127.0.0.0/8`, `localhost`/`.localhost`, `::1`, and IPv4-in-IPv6 loopback),
+except on the configured `--bootstrap-addr` port. For example, accidentally
+proxying a guest's `http://127.0.0.1:25463/health` now returns **403**, never
+contacts the host Cline hub, and logs the reason without creating a review.
+The exception does not bypass guest approval, IP pinning, Kill, or the
+management-port block. It is a port exception, not a redirect: bootstrap
+must actually listen on the requested address. Keep `NO_PROXY`/`no_proxy`
+set for guest loopback and restart old guest processes to stop those requests
+reaching the proxy at all. This is not a DNS-rebinding or general LAN guard;
+see the network isolation guide for the remaining limitations.
+
 ## Containers
 
 Containers are dynamic; the launch command never names them. A container

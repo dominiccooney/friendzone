@@ -26,8 +26,13 @@ Local demo without a VM? Use `127.0.0.1` everywhere `HOST_IP` appears.
 | bootstrap | `HOST_IP:8082`    | containers (`fz` binary, CA, fakes, MCP)      |
 
 The broker rejects non-loopback UI binds and proxy traffic to its management
-port. Host/switch policy is still required. Hyper-V's Default Switch/NAT is
-convenient for clean-image setup but is not isolation; the linked guide uses
+port. Proxied loopback destinations (including `127.0.0.1`, `localhost`, and
+`::1`) are also denied except on the configured bootstrap port. A misplaced
+guest hub health probe returns 403, not the host hub's response. Keep
+`NO_PROXY`/`no_proxy` and restart stale guest clients to stop these probes
+reaching the proxy in the first place. Host/switch policy is still required.
+Hyper-V's Default Switch/NAT is convenient for clean-image setup but is not
+isolation; the linked guide uses
 a dedicated internal switch, static addresses, and explicit port ACLs.
 
 ## 2. Browser: open the UI and configure once

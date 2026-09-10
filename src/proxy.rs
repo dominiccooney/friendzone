@@ -42,16 +42,25 @@ pub struct EventHandler {
     /// Block this destination port globally, not by hostname: aliases and
     /// DNS rebinding must not let guests reach the host's management API.
     management_port: u16,
+    /// Listener policy is fixed at broker startup; the bootstrap exception
+    /// and actual listener use the same configured port, including in clones.
+    bootstrap_port: u16,
 }
 
 impl EventHandler {
-    pub fn new(state: AppState, settings: crate::settings::Settings, management_port: u16) -> Self {
+    pub fn new(
+        state: AppState,
+        settings: crate::settings::Settings,
+        management_port: u16,
+        bootstrap_port: u16,
+    ) -> Self {
         Self {
             state,
             settings,
             pending: None,
             tunnel_identity: None,
             management_port,
+            bootstrap_port,
         }
     }
 
@@ -109,16 +118,9 @@ impl EventHandler {
                 .into();
         }
         let killed = self.state.is_killed(&container);
-        let destination_port = req
-            .uri()
-            .port_u16()
-            .or_else(|| match req.uri().scheme_str() {
-                Some("http") => Some(80),
-                Some("https") => Some(443),
-                _ => None,
-            });
-        if destination_port == Some(self.management_port) {
-            let reason = "friendzone: proxy access to the management UI port is forbidden";
+        if let Some(reason) =
+            destination_denial(req.uri(), self.management_port, self.bootstrap_port)
+        {
             let id = self.state.record(
                 container,
                 req.method().to_string(),
@@ -364,6 +366,59 @@ impl EventHandler {
     }
 }
 
+/// Applies to absolute HTTP(S) URLs, CONNECT authorities, and requests
+/// decrypted inside a tunnel, before any upstream connection or escrow work.
+/// This checks literal/normalized loopback names, not resolved DNS addresses.
+fn destination_denial(
+    uri: &hudsucker::hyper::Uri,
+    management_port: u16,
+    bootstrap_port: u16,
+) -> Option<&'static str> {
+    let destination_port = uri.port_u16().or_else(|| match uri.scheme_str() {
+        Some("http") => Some(80),
+        Some("https") => Some(443),
+        _ => None,
+    });
+    // The management denial always wins, even with conflicting configuration.
+    if destination_port == Some(management_port) {
+        return Some("friendzone: proxy access to the management UI port is forbidden");
+    }
+    if uri.host().is_some_and(is_loopback_host)
+        && (bootstrap_port == 0 || destination_port != Some(bootstrap_port))
+    {
+        return Some(
+            "friendzone: proxy access to host loopback is forbidden except on the configured bootstrap port; configure NO_PROXY/no_proxy for localhost,127.0.0.1,::1,[::1] and restart the guest client",
+        );
+    }
+    None
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    // Reuse the existing URL parser for numeric aliases (127.1, octal/hex,
+    // decimal IPv4). Do not resolve DNS here: a preflight DNS lookup without
+    // pinning the connector's chosen address would not stop DNS rebinding.
+    let Ok(url) = reqwest::Url::parse(&format!("http://{host}/")) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    match host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback(),
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback() || ip.to_ipv4().is_some_and(|v4| v4.is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
 impl HttpHandler for EventHandler {
     async fn handle_request(&mut self, ctx: &HttpContext, req: Request<Body>) -> RequestOrResponse {
         self.handle_from_peer(ctx.client_addr, req).await
@@ -476,7 +531,7 @@ mod tests {
             *req.body_mut() = Body::from(query);
             req
         };
-        let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081);
+        let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081, 8082);
         assert_eq!(
             status(handler.handle_from_peer(peer, read(None)).await),
             StatusCode::PROXY_AUTHENTICATION_REQUIRED
@@ -591,7 +646,7 @@ mod tests {
             state.add_container("guest").unwrap();
             state.set_killed("guest".into(), false).unwrap();
             state.set_pinned_ip("guest", None).unwrap();
-            let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081);
+            let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081, 8082);
             let task = tokio::spawn(async move {
                 handler
                     .handle_from_peer(
@@ -650,7 +705,7 @@ mod tests {
         let state = AppState::default();
         state.add_container("guest").unwrap();
         let settings = crate::settings::Settings::load(&dir).unwrap();
-        let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081);
+        let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081, 8082);
         for (body, encoding) in [
             (vec![b'x'; crate::review::MAX_BODY + 1], None),
             (vec![255], None),
@@ -700,13 +755,179 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn loopback_destination_forms_and_bootstrap_exception() {
+        let check =
+            |url: &str, bootstrap| destination_denial(&url.parse().unwrap(), 8081, bootstrap);
+        for host in [
+            "127.0.0.1",
+            "127.0.0.2",
+            "127.255.255.254",
+            "127.1",
+            "2130706433",
+            "0x7f000001",
+            "0177.0.0.1",
+            "127.0.0.1.",
+            "localhost",
+            "LOCALHOST",
+            "localhost.",
+            "app.localhost",
+            "[::1]",
+            "[0:0:0:0:0:0:0:1]",
+            "[::ffff:127.0.0.1]",
+            "[::ffff:7f00:1]",
+            "[::127.0.0.1]",
+        ] {
+            for url in [
+                format!("http://{host}:25463/health"),
+                format!("{host}:25463"),
+            ] {
+                assert!(
+                    check(&url, 9082).unwrap().contains("host loopback"),
+                    "{url}"
+                );
+            }
+            for url in [format!("http://{host}:9082/health"), format!("{host}:9082")] {
+                assert!(check(&url, 9082).is_none(), "bootstrap: {url}");
+            }
+        }
+        // Default HTTP/HTTPS ports must participate in the same decision.
+        for (url, port) in [
+            ("http://127.0.0.1/health", 80),
+            ("https://[::1]/health", 443),
+        ] {
+            assert!(check(url, 9082).is_some());
+            assert!(check(url, port).is_none());
+        }
+        assert!(
+            check("http://127.0.0.1:8082/health", 9082).is_some(),
+            "no hardcoded 8082 exception"
+        );
+        assert!(
+            check("http://127.0.0.1:0/health", 0).is_some(),
+            "port zero cannot grant access"
+        );
+        assert!(
+            check("http://127.0.0.1:8081/health", 8081)
+                .unwrap()
+                .contains("management UI")
+        );
+        for url in [
+            "http://192.0.2.1:25463/health",
+            "https://example.com/",
+            "example.com:443",
+            "http://localhost.example.com/",
+            "http://notlocalhost/",
+            "http://[2001:db8::1]/",
+        ] {
+            assert!(
+                check(url, 9082).is_none(),
+                "not a loopback destination: {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_guard_precedes_review_and_applies_inside_tunnels() {
+        let dir = std::env::temp_dir().join(format!("fz-loopback-{}", uuid::Uuid::new_v4()));
+        let state = AppState::default();
+        state.add_container("guest").unwrap();
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        let mut handler = EventHandler::new(state.clone(), settings, 8081, 9082);
+        let peer = "10.0.0.2:12345".parse().unwrap();
+        for (method, url) in [
+            ("GET", "http://127.0.0.1:25463/health"),
+            ("POST", "http://localhost:25463/graphql"),
+            ("DELETE", "https://[::1]/resource"),
+            ("CONNECT", "127.0.0.1:25463"),
+        ] {
+            let mut req = request(method, url, Some("guest"));
+            req.headers_mut()
+                .insert("host", "127.0.0.1:9082".parse().unwrap());
+            assert_eq!(
+                status(handler.handle_from_peer(peer, req).await),
+                StatusCode::FORBIDDEN
+            );
+            let view = state.view();
+            assert_eq!(view.requests[0].url, url);
+            assert_eq!(view.requests[0].status, Some(403));
+            assert!(
+                view.requests[0]
+                    .detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("NO_PROXY")
+            );
+            assert!(matches!(view.requests[0].verdict, Verdict::Blocked));
+            assert!(view.pending_requests.is_empty());
+            assert!(handler.pending.is_none());
+        }
+        assert!(matches!(
+            handler
+                .handle_from_peer(peer, request("CONNECT", "127.0.0.1:9082", Some("guest")))
+                .await,
+            RequestOrResponse::Request(_)
+        ));
+        let mut intercepted = handler.clone();
+        assert_eq!(
+            status(
+                intercepted
+                    .handle_from_peer(peer, request("GET", "http://127.0.0.1:25463/health", None))
+                    .await
+            ),
+            StatusCode::FORBIDDEN
+        );
+        assert!(matches!(
+            intercepted
+                .handle_from_peer(peer, request("GET", "http://127.0.0.1:9082/health", None))
+                .await,
+            RequestOrResponse::Request(_)
+        ));
+        // The exception bypasses only the loopback destination rule, not
+        // container authorization, IP pins, or the reversible kill switch.
+        state.set_killed("guest".into(), true).unwrap();
+        assert_eq!(
+            status(
+                intercepted
+                    .handle_from_peer(peer, request("GET", "http://127.0.0.1:9082/health", None))
+                    .await
+            ),
+            StatusCode::FORBIDDEN
+        );
+        state.set_killed("guest".into(), false).unwrap();
+        state
+            .set_pinned_ip("guest", Some("10.0.0.3".parse().unwrap()))
+            .unwrap();
+        assert_eq!(
+            status(
+                intercepted
+                    .handle_from_peer(peer, request("GET", "http://127.0.0.1:9082/health", None))
+                    .await
+            ),
+            StatusCode::FORBIDDEN
+        );
+        let mut fresh = EventHandler::new(state.clone(), handler.settings.clone(), 8081, 9082);
+        assert_eq!(
+            status(
+                fresh
+                    .handle_from_peer(
+                        peer,
+                        request("GET", "http://127.0.0.1:9082/health", Some("unknown"))
+                    )
+                    .await
+            ),
+            StatusCode::FORBIDDEN
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn management_port_is_denied_before_http_forwarding_or_connect() {
         let dir = std::env::temp_dir().join(format!("fz-ui-gate-{}", uuid::Uuid::new_v4()));
         let state = AppState::default();
         state.add_container("guest").unwrap();
         let settings = crate::settings::Settings::load(&dir).unwrap();
-        let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081);
+        let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081, 8082);
         let peer = "10.0.0.2:12345".parse().unwrap();
         for host in [
             "127.0.0.1",
@@ -743,7 +964,7 @@ mod tests {
             (80, "http://localhost/api/state"),
             (443, "https://localhost/api/state"),
         ] {
-            let mut handler = EventHandler::new(state.clone(), settings.clone(), port);
+            let mut handler = EventHandler::new(state.clone(), settings.clone(), port, 8082);
             assert_eq!(
                 status(
                     handler
@@ -806,6 +1027,7 @@ mod tests {
                 state,
                 crate::settings::Settings::load(&dir).unwrap(),
                 ui_addr.port(),
+                8082,
             ))
             .build()
             .unwrap();
@@ -870,7 +1092,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fz-proxy-{}", uuid::Uuid::new_v4()));
         let state = AppState::default();
         let settings = crate::settings::Settings::load(&dir).unwrap();
-        let mut handler = EventHandler::new(state.clone(), settings, 8081);
+        let mut handler = EventHandler::new(state.clone(), settings, 8081, 8082);
         let peer = "127.0.0.1:12345".parse().unwrap();
         let challenge = handler
             .handle_from_peer(peer, request("CONNECT", "github.com:443", None))
@@ -947,7 +1169,7 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         state.set_killed("guest".into(), false).unwrap();
-        let mut fresh = EventHandler::new(state.clone(), handler.settings.clone(), 8081);
+        let mut fresh = EventHandler::new(state.clone(), handler.settings.clone(), 8081, 8082);
         assert_eq!(
             status(
                 fresh
@@ -992,6 +1214,7 @@ mod tests {
                 state.clone(),
                 crate::settings::Settings::load(&dir).unwrap(),
                 8081,
+                8082,
             ))
             .build()
             .unwrap();

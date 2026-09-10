@@ -44,7 +44,7 @@ guest DNS. ARP needed to reach the IPv4 host on-link is not Internet egress.
 If your platform requires DHCP or IPv6 neighbor discovery, that is additional
 explicit infrastructure policy; the static IPv4 example below needs no DHCP.
 
-### Management protection in this build
+### Management and loopback protection in this build
 
 `fz broker` now rejects non-loopback `--ui-addr` and requires its fixed port
 to differ from the proxy/bootstrap ports. The proxy rejects HTTP requests
@@ -56,13 +56,33 @@ Older builds could proxy an approved guest's request to
 `http://127.0.0.1:8081/api/containers`: loopback binding alone was insufficient.
 Upgrade before treating the UI as isolated, and test both paths below.
 
+The proxy also rejects requests to loopback destinations except on the port
+configured by `--bootstrap-addr` (8082 by default). The same rule covers HTTP,
+HTTPS CONNECT, and decrypted requests: `127.0.0.0/8`, `localhost` and names
+ending in `.localhost`, `::1`, and IPv4-mapped/compatible IPv6 loopback.
+Numeric aliases such as `127.1`, `2130706433`, and `0x7f000001` are normalized
+for this check. A stray guest Cline hub probe to `127.0.0.1:25463/health`
+returns **403** and is logged as blocked, with no upstream connection and no
+approvable Inbox item. Client `NO_PROXY` settings are not needed to enforce it.
+
+The bootstrap exception follows the configured port, not a hardcoded 8082;
+it never overrides guest approval/IP/Kill gates or management-port denial.
+It does not redirect the destination or make a guest-facing-only bootstrap
+listener reachable at loopback. Bind the bootstrap listener appropriately
+or use its guest-facing IP. When configured with port zero, no loopback
+exception is granted. Listener configuration changes take effect on restart.
+Keep guest `NO_PROXY`/`no_proxy` exclusions and restart stale guest processes
+as well: correct clients should contact their own hub directly, not get 403s.
+
 Do not publish the UI via portproxy, SSH forwarding accessible to the guest,
 a reverse proxy, WSL localhost forwarding, or another port: a relay would
 defeat a destination-port guard. The broker is **not a general SSRF-safe
-public-only proxy**: this change protects its own management port, not every
-local/LAN service reachable from the broker. Host service isolation, untrusted
-DNS handling, and proxy destination restrictions need a broader security
-review before using it as a hardened sandbox. A network allowlist also does
+public-only proxy**: these guards protect its management port and recognized
+loopback destinations, not every local/LAN service reachable from the broker.
+In particular, arbitrary DNS names resolving/rebinding to loopback, host LAN
+addresses, and relays are not covered by the loopback-name check. Host service
+isolation, DNS/connector address pinning, and proxy destination restrictions
+need a broader security review before using it as a hardened sandbox. A network allowlist also does
 not prevent malicious traffic over otherwise permitted HTTPS. Current proxy
 policies are deliberately incomplete; see the README's scope limitations.
 
@@ -258,6 +278,12 @@ curl --noproxy '' --proxy "$FZ_PROXY" --connect-timeout 3 --max-time 5 \
   -i http://127.0.0.1:8081/api/state
 curl --noproxy '' --proxy "$FZ_PROXY" --connect-timeout 3 --max-time 5 \
   --proxytunnel -i http://127.0.0.1:8081/api/state
+
+# Must return 403 (even if nothing listens): guest loopback must not hit a host hub.
+curl --noproxy '' --proxy "$FZ_PROXY" --connect-timeout 3 --max-time 5 \
+  -i http://127.0.0.1:25463/health
+curl --noproxy '' --proxy "$FZ_PROXY" --connect-timeout 3 --max-time 5 \
+  --proxytunnel -i http://127.0.0.1:25463/health
 
 # Bootstrap listener must not serve management routes (expect 404).
 curl --noproxy '*' --connect-timeout 3 --max-time 5 -i "http://$FZ_HOST:8082/api/state"

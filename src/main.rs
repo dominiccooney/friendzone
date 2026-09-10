@@ -165,7 +165,7 @@ async fn run_broker(
 
     tokio::select! {
         _ = refresher => unreachable!("refresher loop never returns"),
-        result = proxy_server::serve(proxy_addr, state.clone(), issuer, settings.clone(), ui_addr.port()) => result,
+        result = proxy_server::serve(proxy_addr, state.clone(), issuer, settings.clone(), ui_addr.port(), bootstrap_addr.port()) => result,
         result = web::serve_ui(ui_addr, state, settings.clone(), registry, bootstrap_addr) => result,
         result = web::serve_bootstrap(bootstrap_addr, files.cert_pem, mcp_state, settings, proxy_addr.port()) => result,
         signal = tokio::signal::ctrl_c() => signal.context("wait for Ctrl+C"),
