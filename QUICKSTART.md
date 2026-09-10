@@ -143,7 +143,19 @@ desktop alerts. Click an alert to focus Inbox. This works with the UI open
 in a background tab on localhost, not after closing the browser. Denied or
 unsupported notification permission does not prevent manual review.
 
-GraphQL queries and mutations both require manual review in this version.
+GraphQL queries and general mutations require manual review. For an eligible
+single `addComment` using Friendzone's fake GitHub Bearer token:
+
+1. Open the request and click **Resolve GitHub target**.
+2. Inspect the verified repository, issue/PR number, title and credential.
+3. Click **Allow future comments here** and confirm the guest/target scope.
+4. Approve or deny the current waiting request separately.
+
+Later supported comments on that target can have different text and need no
+new approval; the broker rechecks GitHub and reconstructs a narrow mutation.
+Other targets, bundled mutations or unsupported fields/headers still queue.
+Revoke from **Saved comment permissions** in Inbox. Permissions survive
+restart and are removed with the guest; token changes need a new grant.
 The review panel now parses and formats GraphQL, showing the selected
 operation, actual fields (not just aliases), resolved arguments, variables,
 and known target paths. `addComment` shows the comment separately from its

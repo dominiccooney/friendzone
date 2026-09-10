@@ -131,6 +131,18 @@ fn ui_router(state: UiState) -> Router {
         .route("/api/events", get(state_events))
         .route("/api/requests/{id}", get(review_request))
         .route("/api/requests/{id}/decision", post(decide_request))
+        .route(
+            "/api/requests/{id}/github-target",
+            post(resolve_github_target),
+        )
+        .route(
+            "/api/requests/{id}/comment-permission",
+            post(grant_comment_permission),
+        )
+        .route(
+            "/api/containers/{container}/comment-permissions/{id}",
+            axum::routing::delete(revoke_comment_permission),
+        )
         .route("/api/containers", post(add_container))
         .route(
             "/api/containers/{id}",
@@ -835,7 +847,25 @@ async fn js() -> impl IntoResponse {
 }
 
 async fn api_state(State(state): State<UiState>) -> Json<StateView> {
-    Json(state.app.view())
+    Json(permission_state_view(&state.app, &state.settings))
+}
+
+fn permission_state_view(app: &AppState, settings: &crate::settings::Settings) -> StateView {
+    let mut view = app.view();
+    for permission in &mut view.comment_permissions {
+        permission.credential_active = Some(
+            settings
+                .entries()
+                .iter()
+                .filter_map(|entry| crate::github::Credential::from_entry(settings, entry))
+                .any(|credential| {
+                    app.comment_permissions(&permission.container, &credential.binding)
+                        .iter()
+                        .any(|grant| grant.id == permission.id)
+                }),
+        );
+    }
+    view
 }
 
 fn local_review_request(state: &UiState, headers: &axum::http::HeaderMap) -> bool {
@@ -888,6 +918,86 @@ struct ReviewDecision {
     decision: crate::review::Decision,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveTarget {
+    fingerprint: String,
+}
+fn host_decision(state: &UiState, headers: &axum::http::HeaderMap) -> bool {
+    local_review_request(state, headers)
+        && headers.get("x-friendzone-review").is_some_and(|h| h == "1")
+}
+async fn resolve_github_target(
+    State(state): State<UiState>,
+    Path(id): Path<uuid::Uuid>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<ResolveTarget>,
+) -> impl IntoResponse {
+    if !host_decision(&state, &headers) {
+        return (StatusCode::FORBIDDEN, "use host UI to resolve targets").into_response();
+    }
+    let result=async {
+        let detail=state.app.reviews.detail(id).context("request no longer waiting")?;
+        if detail.summary.fingerprint!=request.fingerprint {anyhow::bail!("fingerprint mismatch");}
+        let context=detail.comment_context.context("request is not eligible for a narrow comment permission (shape or escrow credential unsupported)")?;
+        let revision=state.app.comment_revision(&detail.summary.container).context("container removed")?;
+        let credential=crate::github::Credential::current(&state.settings,&context.binding).context("credential changed; make a new request")?;
+        let target=state.app.github.resolve(&context.subject_id,&credential).await?;
+        if crate::github::Credential::current(&state.settings,&context.binding).is_none(){anyhow::bail!("credential changed during lookup");}
+        state.app.reviews.set_resolved(id,&request.fingerprint,crate::github::Resolved{target,credential:context.binding.entry},revision)
+    }.await;
+    match result {
+        Ok(detail) => Json(detail).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveCommentPermission {
+    fingerprint: String,
+    resolution_id: uuid::Uuid,
+}
+async fn grant_comment_permission(
+    State(state): State<UiState>,
+    Path(id): Path<uuid::Uuid>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<SaveCommentPermission>,
+) -> impl IntoResponse {
+    if !host_decision(&state, &headers) {
+        return (StatusCode::FORBIDDEN, "use host UI to grant permissions").into_response();
+    }
+    let result=async {
+        let detail=state.app.reviews.detail(id).context("request no longer waiting")?;
+        if detail.summary.fingerprint!=request.fingerprint || detail.resolution_id!=Some(request.resolution_id) {anyhow::bail!("review/target changed; resolve again");}
+        let context=detail.comment_context.context("no supported comment command")?;
+        let resolved=detail.resolved_target.context("resolve and inspect the GitHub target first")?;
+        let credential=crate::github::Credential::current(&state.settings,&context.binding).context("credential changed; resolve a new request")?;
+        let target=state.app.github.resolve(&context.subject_id,&credential).await?;
+        if !resolved.target.same_identity(&target) || crate::github::Credential::current(&state.settings,&context.binding).is_none(){anyhow::bail!("target or credential changed; resolve again");}
+        let current=state.app.reviews.detail(id).context("request no longer waiting")?;
+        if current.resolution_id!=Some(request.resolution_id) || current.summary.expires_at<=chrono::Utc::now(){anyhow::bail!("target review expired or changed");}
+        let grant=state.app.grant_reviewed_comment(id,&request.fingerprint,request.resolution_id,target)?;
+        Ok::<_,anyhow::Error>(serde_json::json!({"id":grant,"message":"Permission saved for future requests. This pending request still needs Approve once or Deny."}))
+    }.await;
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
+}
+async fn revoke_comment_permission(
+    State(state): State<UiState>,
+    Path((container, id)): Path<(String, uuid::Uuid)>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if !host_decision(&state, &headers) {
+        return (StatusCode::FORBIDDEN, "use host UI to revoke permissions").into_response();
+    }
+    match state.app.revoke_comment_permission(&container, id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
+}
+
 async fn decide_request(
     State(state): State<UiState>,
     Path(id): Path<uuid::Uuid>,
@@ -931,9 +1041,10 @@ async fn api_log(
 async fn state_events(State(state): State<UiState>) -> impl IntoResponse {
     let mut changes = state.app.subscribe();
     let app = state.app.clone();
+    let settings = state.settings.clone();
     let stream = async_stream(move |emit| async move {
         loop {
-            let view = app.view();
+            let view = permission_state_view(&app, &settings);
             let data = serde_json::to_string(&view).expect("serialize state view");
             if emit.send(data).await.is_err() {
                 return; // client went away
@@ -1214,6 +1325,305 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn verified_comment_permission_flows_through_host_api_and_real_mitm_proxy() {
+        use hudsucker::{Proxy, certificate_authority::RcgenAuthority, rustls::crypto::aws_lc_rs};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir =
+            std::env::temp_dir().join(format!("fz-comment-integration-{}", uuid::Uuid::new_v4()));
+        let files = crate::ca::AuthorityFiles::load_or_create(&dir).unwrap();
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "github".into(),
+                hosts: vec!["api.github.com".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fake-github".into(),
+                real_env: None,
+                guest_env: None,
+            })
+            .unwrap();
+        settings.set_secret("github", "host-secret").unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let hits_seen = hits.clone();
+        let lookups_seen = lookups.clone();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream,Router::new().route("/graphql",post(move |headers:axum::http::HeaderMap,Json(json):Json<serde_json::Value>|{
+            let hits=hits_seen.clone();let lookups=lookups_seen.clone(); async move {
+                assert_eq!(headers["authorization"],"Bearer host-secret");
+                if json["query"].as_str().unwrap().starts_with("query FriendzoneTarget") {
+                    crate::github::tests::assert_lookup(&json);lookups.fetch_add(1,Ordering::SeqCst);
+                    let mut response=crate::github::tests::response();
+                    if json["variables"]["id"]=="wrong-target" {response["data"]["node"]["id"]="wrong-target".into();response["data"]["node"]["number"]=483.into();response["data"]["node"]["url"]="https://github.com/cline/cline/issues/483".into();}
+                    Json(response)
+                } else {
+                    assert_eq!(json["operationName"],"FriendzoneComment");assert_eq!(json["variables"]["input"]["subjectId"],"canonical");
+                    assert_eq!(json["variables"]["input"]["body"],"second comment\nmutation { deleteIssue } is just text");
+                    assert_eq!(headers["user-agent"],"Friendzone comment permission");assert!(!headers.contains_key("proxy-authorization"));
+                    hits.fetch_add(1,Ordering::SeqCst);Json(serde_json::json!({"data":{"alias":{"clientMutationId":null}}}))
+                }
+            }
+        }))).await.unwrap()
+        });
+        let mut state = AppState::load(&dir).unwrap();
+        state.github = crate::github::Client::for_test(&format!("http://{upstream_addr}/graphql"));
+        state.add_container("guest").unwrap();
+        state.add_container("other").unwrap();
+        let registry = crate::mcp::ForwardRegistry::load(&dir, settings.clone()).unwrap();
+        let ui_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ui_addr = ui_listener.local_addr().unwrap();
+        let ui = ui_router(UiState {
+            app: state.clone(),
+            settings: settings.clone(),
+            registry,
+            oauth: Default::default(),
+            cline: Default::default(),
+            ui_addr,
+            bootstrap_addr: "127.0.0.1:8082".parse().unwrap(),
+        });
+        let ui_task = tokio::spawn(async move { axum::serve(ui_listener, ui).await.unwrap() });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connector = tower::service_fn(move |uri: hudsucker::hyper::Uri| {
+            Box::pin(async move {
+                assert_eq!(uri.host(), Some("api.github.com"));
+                tokio::net::TcpStream::connect(upstream_addr)
+                    .await
+                    .map(hudsucker::hyper_util::rt::TokioIo::new)
+            })
+        });
+        let proxy = Proxy::builder()
+            .with_listener(listener)
+            .with_ca(RcgenAuthority::new(
+                files.issuer().unwrap(),
+                10,
+                aws_lc_rs::default_provider(),
+            ))
+            .with_http_connector(connector)
+            .with_http_handler(crate::proxy::EventHandler::new(
+                state.clone(),
+                settings.clone(),
+                ui_addr.port(),
+            ))
+            .build()
+            .unwrap();
+        let proxy_task = tokio::spawn(proxy.start());
+        let guest = |name: &str| {
+            reqwest::Client::builder()
+                .use_rustls_tls()
+                .add_root_certificate(
+                    reqwest::Certificate::from_pem(files.cert_pem.as_bytes()).unwrap(),
+                )
+                .proxy(
+                    reqwest::Proxy::all(format!("http://{address}"))
+                        .unwrap()
+                        .basic_auth(name, "x"),
+                )
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap()
+        };
+        let client = guest("guest");
+        let other = guest("other");
+        let host = reqwest::Client::builder().no_proxy().build().unwrap();
+        let body = |subject: &str, text: &str| serde_json::json!({"query":"mutation GuestName($target:ID!,$body:String!){alias:addComment(input:{subjectId:$target,body:$body}){clientMutationId}}","variables":{"target":subject,"body":text}});
+        let send = |client: reqwest::Client, body: serde_json::Value| {
+            tokio::spawn(async move {
+                client
+                    .post(crate::github::ENDPOINT)
+                    .header("authorization", "Bearer fake-github")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+            })
+        };
+        async fn pending(state: &AppState) -> crate::review::Summary {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if let Some(summary) = state.reviews.summaries().into_iter().next() {
+                        break summary;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+        let first = send(client.clone(), body("legacy-alias", "first comment"));
+        let summary = pending(&state).await;
+        let url = format!("http://{ui_addr}/api/requests/{}", summary.id);
+        let detail: serde_json::Value = host.get(&url).send().await.unwrap().json().await.unwrap();
+        assert_eq!(detail["comment_permission_supported"], true);
+        let resolve = serde_json::json!({"fingerprint":summary.fingerprint});
+        assert_eq!(
+            host.post(format!("{url}/github-target"))
+                .json(&resolve)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(lookups.load(Ordering::SeqCst), 0);
+        let resolved: serde_json::Value = host
+            .post(format!("{url}/github-target"))
+            .header("x-friendzone-review", "1")
+            .json(&resolve)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved["resolved_target"]["target"]["repository"],
+            "cline/cline"
+        );
+        assert_eq!(resolved["resolved_target"]["target"]["number"], 482);
+        assert!(!resolved.to_string().contains("host-secret"));
+        assert!(resolved.get("comment_context").is_none());
+        let grant_body = serde_json::json!({"fingerprint":summary.fingerprint,"resolution_id":resolved["resolution_id"]});
+        assert_eq!(
+            host.post(format!("{url}/comment-permission"))
+                .header("x-friendzone-review", "1")
+                .header("origin", "https://evil.test")
+                .json(&grant_body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let response = host
+            .post(format!("{url}/comment-permission"))
+            .header("x-friendzone-review", "1")
+            .json(&grant_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let id = response.json::<serde_json::Value>().await.unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(!first.is_finished());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "grant must not release waiting request"
+        );
+        state
+            .reviews
+            .decide(
+                summary.id,
+                &summary.fingerprint,
+                crate::review::Decision::Deny,
+            )
+            .unwrap();
+        assert_eq!(first.await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            AppState::load(&dir)
+                .unwrap()
+                .view()
+                .comment_permissions
+                .len(),
+            1
+        );
+        let response = send(
+            client.clone(),
+            body(
+                "legacy-alias",
+                "second comment\nmutation { deleteIssue } is just text",
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(state.reviews.summaries().is_empty());
+        assert!(state.view().requests.iter().any(|r| {
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("broker-reconstructed addComment"))
+        }));
+        for (client, body) in [
+            (client.clone(), body("wrong-target", "no")),
+            (other, body("canonical", "no")),
+            (
+                client.clone(),
+                serde_json::json!({"query":"mutation{addComment(input:{subjectId:\"canonical\",body:\"x\"}){clientMutationId}closeIssue(input:{issueId:\"canonical\"}){clientMutationId}}"}),
+            ),
+        ] {
+            let task = send(client, body);
+            let summary = pending(&state).await;
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            state
+                .reviews
+                .decide(
+                    summary.id,
+                    &summary.fingerprint,
+                    crate::review::Decision::Deny,
+                )
+                .unwrap();
+            assert_eq!(task.await.unwrap().status(), StatusCode::FORBIDDEN);
+        }
+        settings.set_secret("github", "rotated").unwrap();
+        let task = send(client.clone(), body("canonical", "no"));
+        let summary = pending(&state).await;
+        state
+            .reviews
+            .decide(
+                summary.id,
+                &summary.fingerprint,
+                crate::review::Decision::Deny,
+            )
+            .unwrap();
+        assert_eq!(task.await.unwrap().status(), StatusCode::FORBIDDEN);
+        settings.set_secret("github", "host-secret").unwrap();
+        assert_eq!(
+            host.delete(format!(
+                "http://{ui_addr}/api/containers/guest/comment-permissions/{id}"
+            ))
+            .header("x-friendzone-review", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let task = send(client, body("canonical", "no"));
+        let summary = pending(&state).await;
+        state
+            .reviews
+            .decide(
+                summary.id,
+                &summary.fingerprint,
+                crate::review::Decision::Deny,
+            )
+            .unwrap();
+        assert_eq!(task.await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(
+            AppState::load(&dir)
+                .unwrap()
+                .view()
+                .comment_permissions
+                .is_empty()
+        );
+        ui_task.abort();
+        proxy_task.abort();
+        upstream_task.abort();
+        let _ = ui_task.await;
+        let _ = proxy_task.await;
+        let _ = upstream_task.await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn real_mitm_graphql_review_api_releases_exact_request_once_to_local_upstream() {
@@ -2071,10 +2481,13 @@ mod tests {
     async fn bootstrap_does_not_expose_management_api() {
         for uri in [
             "/api/state",
+            "/api/requests/00000000-0000-0000-0000-000000000001/github-target",
+            "/api/requests/00000000-0000-0000-0000-000000000001/comment-permission",
+            "/api/containers/guest/comment-permissions/00000000-0000-0000-0000-000000000001",
             "/api/requests/00000000-0000-0000-0000-000000000001",
             "/api/requests/00000000-0000-0000-0000-000000000001/decision",
         ] {
-            for method in ["GET", "POST"] {
+            for method in ["GET", "POST", "DELETE"] {
                 let response = bootstrap_app()
                     .oneshot(
                         Request::builder()

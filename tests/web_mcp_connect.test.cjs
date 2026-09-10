@@ -39,6 +39,7 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
   }));
   const views = ["inbox", "log", "settings"].map(view => ({id:`${view}-view`, classList:classList()}));
   let copyButtons = [];
+  let revokeButtons = [];
   const sandbox = {
     document: {
       querySelector(selector) {
@@ -48,6 +49,10 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
       querySelectorAll(selector) {
         if (selector === ".nav") return nav;
         if (selector === ".view") return views;
+        if (selector === "[data-comment-revoke]") {
+          revokeButtons=[...elements.get("#comment-permissions").innerHTML.matchAll(/data-comment-revoke="([^"]*)" data-container="([^"]*)"/g)].map(match=>({dataset:{commentRevoke:match[1],container:match[2]}}));
+          return revokeButtons;
+        }
         if (selector !== "[data-mcp-copy-url]") return [];
         // Model row-level controls from the real rendered markup so tests
         // exercise both button wiring and choosing the guest (not upstream) URL.
@@ -97,7 +102,7 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
       }}}},
     }),
   });
-  return {run, element, sandbox, calls, seed, reply, timers, nav, views, storage, notifications, get permissionRequests(){return permissionRequests;}, copyButtons:()=>copyButtons};
+  return {run, element, sandbox, calls, seed, reply, timers, nav, views, storage, notifications, get permissionRequests(){return permissionRequests;}, copyButtons:()=>copyButtons, revokeButtons:()=>revokeButtons};
 }
 
 const pendingRequest = {id:"request-id",container:"guest<script>",method:"POST",url:"https://api.github.com/graphql?x=<script>",body_bytes:42,expires_at:"2099-01-01T00:00:00Z",fingerprint:"exact-hash",reason:"Review complete GraphQL payload",headers:[["authorization","[redacted]"]],body:'{"query":"<script>alert(1)</script>","variables":{"id":42}}'};
@@ -163,6 +168,43 @@ test("review renders guest payload literally and only submits the loaded fingerp
   f.run('snapshot.pending_requests=[]; renderPendingRequests()');
   assert.equal(f.sandbox.document.querySelector("#request-approve").disabled,true);
   const count=f.calls.length; await f.run('decideRequest("approve")'); assert.equal(f.calls.length,count);
+});
+
+const verifiedTarget={node_id:"canonical",repository_id:"repo-id",repository:"cline/cline",kind:"Issue",number:482,title:"<img src=x> A real issue",url:"https://github.com/cline/cline/issues/482"};
+test("resolve then grant requires confirmation, binds the displayed resolution, and never approves the pending write", async () => {
+  const f=fixture(), element=id=>f.sandbox.document.querySelector("#"+id);
+  f.run(`activeReview=${JSON.stringify({...pendingRequest,comment_permission_supported:true})}; renderCommentPermissionPanel(activeReview)`);
+  assert.equal(element("save-comment-permission").disabled,true);
+  const resolve=element("resolve-comment-target").onclick();const call=f.calls.at(-1);
+  assert.equal(call.url,"/api/requests/request-id/github-target");assert.deepEqual(JSON.parse(call.options.body),{fingerprint:"exact-hash"});
+  call.resolve({ok:true,json:async()=>({...pendingRequest,comment_permission_supported:true,resolution_id:"resolution",resolved_target:{target:verifiedTarget,credential:"github"}})});await resolve;
+  assert.match(element("resolved-comment-target").textContent,/cline\/cline #482/);assert.equal(element("resolved-comment-target").innerHTML,"");
+  let message; f.sandbox.confirm=text=>{message=text;return true;};
+  const save=element("save-comment-permission").onclick();const grant=f.calls.at(-1);
+  assert.match(message,/arbitrary text.*cline\/cline #482/);assert.match(message,/does NOT approve/);
+  assert.equal(grant.url,"/api/requests/request-id/comment-permission");assert.deepEqual(JSON.parse(grant.options.body),{fingerprint:"exact-hash",resolution_id:"resolution"});
+  grant.resolve({ok:true});await new Promise(setImmediate);
+  f.calls.at(-1).resolve({json:async()=>({containers:[],requests:[],pending_requests:[pendingRequest],comment_permissions:[{id:"grant",container:"guest",target:verifiedTarget,credential:"github"}]})});
+  // Avoid irrelevant container rendering in this unit fixture; the real
+  // browser test covers the full snapshot render.
+  f.run('renderContainers=()=>renderPendingRequests()');await save;
+  assert.ok(!f.calls.some(c=>c.url.endsWith("/decision")));
+  assert.match(element("comment-permission-status").textContent,/still needs Approve once or Deny/);
+  assert.match(element("comment-permissions").innerHTML,/&lt;img/);
+  const revoke=f.revokeButtons()[0].onclick();const revokeCall=f.calls.at(-1);
+  assert.equal(revokeCall.options.method,"DELETE");assert.equal(revokeCall.options.headers["x-friendzone-review"],"1");
+  revokeCall.resolve({ok:false,text:async()=>"disk full"});await revoke;
+  assert.match(element("comment-permissions-status").textContent,/Could not confirm revocation.*disk full/);
+});
+
+test("stale target lookups cannot restore a closed review or a permission button", async () => {
+  const f=fixture(), element=id=>f.sandbox.document.querySelector("#"+id);
+  f.run(`activeReview=${JSON.stringify({...pendingRequest,comment_permission_supported:true})}; renderCommentPermissionPanel(activeReview)`);
+  const resolve=element("resolve-comment-target").onclick();const call=f.calls.at(-1);
+  element("request-close").onclick();
+  call.resolve({ok:true,json:async()=>({...pendingRequest,comment_permission_supported:true,resolution_id:"stale",resolved_target:{target:verifiedTarget,credential:"github"}})});await resolve;
+  assert.equal(f.run("activeReview"),null);assert.equal(element("save-comment-permission").disabled,true);
+  assert.equal(element("comment-permission-panel").hidden,true);
 });
 
 test("stale asynchronous detail response cannot change the request being reviewed", async () => {

@@ -7,6 +7,7 @@ const mcpOAuthPolls = new Map();
 let reviewingMcp = null;
 let activeMcpOAuth = null;
 let activeReview = null, reviewGeneration = 0, pendingSignature = "";
+let commentPermissionGeneration = 0, commentPermissionSignature = "";
 let notificationTimer = null, newNotificationIds = new Set();
 let notificationsEnabled = readStoredValue("fz-notifications") === "enabled";
 let notifiedIds;
@@ -146,6 +147,7 @@ function notifyPendingRequests(pending) {
 }
 
 function renderPendingRequests() {
+  renderCommentPermissions();
   const pending = snapshot.pending_requests || [];
   $("#inbox-count").textContent = pending.length + snapshot.containers.filter(container=>!container.approved).length;
   const signature = JSON.stringify(pending);
@@ -157,6 +159,7 @@ function renderPendingRequests() {
   if (activeReview && !pending.some(request=>request.id===activeReview.id)) {
     activeReview = null; ++reviewGeneration;
     $("#request-approve").disabled = true; $("#request-deny").disabled = true;
+    ++commentPermissionGeneration; renderCommentPermissionPanel(null);
     $("#request-review-status").textContent = "This request is no longer waiting (decided, cancelled or expired). Check the log for its outcome.";
   }
   updateNotificationStatus(); notifyPendingRequests(pending);
@@ -164,6 +167,7 @@ function renderPendingRequests() {
 
 async function openRequestReview(id) {
   const generation = ++reviewGeneration; activeReview = null;
+  ++commentPermissionGeneration; renderCommentPermissionPanel(null);
   $("#request-review").hidden = true; $("#request-approve").disabled = true; $("#request-deny").disabled = true;
   $("#request-review-status").textContent = "Loading exact request…";
   try {
@@ -178,11 +182,73 @@ async function openRequestReview(id) {
     $("#request-review-headers").textContent = detail.headers.map(([name,value])=>`${name}: ${value}`).join("\n");
     $("#request-review-body").textContent = detail.body || "(empty body)";
     renderGraphqlReview(detail.graphql);
+    renderCommentPermissionPanel(detail);
     $("#request-review").hidden = false;
     $("#request-approve").disabled = false; $("#request-deny").disabled = false;
     $("#request-review-status").textContent = "Review all fields before approving. Approval is for this request only; upstream success is not guaranteed.";
     $("#request-review").scrollIntoView({behavior:"smooth",block:"start"});
   } catch (error) { if (generation === reviewGeneration) $("#request-review-status").textContent = String(error); }
+}
+
+function renderCommentPermissionPanel(detail) {
+  $("#comment-permission-panel").hidden = !detail?.graphql;
+  $("#resolve-comment-target").disabled = !detail?.comment_permission_supported;
+  $("#save-comment-permission").disabled = !detail?.resolution_id || !detail?.resolved_target;
+  $("#comment-permission-status").textContent = detail?.graphql && !detail.comment_permission_supported
+    ? "This request cannot use a saved comment permission: it needs one supported addComment mutation, an exact Friendzone fake GitHub Bearer credential, and no extra semantic headers. Queries, fragments/directives, extra mutations/inputs or unsupported response fields still need manual review." : "";
+  const resolved = detail?.resolved_target;
+  $("#resolved-comment-target").textContent = resolved
+    ? `Verified with GitHub credential '${resolved.credential}':\n${resolved.target.kind}: ${resolved.target.repository} #${resolved.target.number}\n${resolved.target.title}\n${resolved.target.url}\nNode ID: ${resolved.target.node_id}\nRepository ID: ${resolved.target.repository_id}` : "";
+}
+
+$("#resolve-comment-target").onclick = async () => {
+  if (!activeReview?.comment_permission_supported) return;
+  const reviewed = activeReview, generation = ++commentPermissionGeneration;
+  $("#resolve-comment-target").disabled = true; $("#save-comment-permission").disabled = true;
+  $("#comment-permission-status").textContent = "Looking up this issue/PR with a fixed GitHub read…";
+  try {
+    const response = await fetch(`/api/requests/${encodeURIComponent(reviewed.id)}/github-target`,{method:"POST",headers:{"content-type":"application/json","x-friendzone-review":"1"},body:JSON.stringify({fingerprint:reviewed.fingerprint})});
+    if (!response.ok) throw new Error(await response.text());
+    const detail = await response.json();
+    if (generation !== commentPermissionGeneration || activeReview?.id !== reviewed.id) return;
+    activeReview = detail; renderCommentPermissionPanel(detail);
+    $("#comment-permission-status").textContent = "Inspect the repository, number and title above. Resolving has not granted anything.";
+  } catch (error) {
+    if (generation !== commentPermissionGeneration) return;
+    $("#resolve-comment-target").disabled = false;
+    $("#comment-permission-status").textContent = `Target not verified: ${error}. You can still review the raw request manually.`;
+  }
+};
+
+$("#save-comment-permission").onclick = async () => {
+  const reviewed = activeReview;
+  if (!reviewed?.resolution_id || !reviewed.resolved_target) return;
+  const target = reviewed.resolved_target.target;
+  if (!confirm(`Allow ${reviewed.container} to post future comments with arbitrary text on ${target.repository} #${target.number} (${target.kind}) using ${reviewed.resolved_target.credential}? This persists until revoked; it does NOT approve the current request.`)) return;
+  const generation = ++commentPermissionGeneration;
+  $("#save-comment-permission").disabled = true;
+  try {
+    const response = await fetch(`/api/requests/${encodeURIComponent(reviewed.id)}/comment-permission`,{method:"POST",headers:{"content-type":"application/json","x-friendzone-review":"1"},body:JSON.stringify({fingerprint:reviewed.fingerprint,resolution_id:reviewed.resolution_id})});
+    if (!response.ok) throw new Error(await response.text());
+    if (generation === commentPermissionGeneration) $("#comment-permission-status").textContent = "Permission saved for future comments. This request still needs Approve once or Deny below.";
+    await refresh();
+  } catch (error) { if (generation === commentPermissionGeneration) $("#comment-permission-status").textContent = `Could not confirm the grant: ${error}. Check saved permissions before retrying.`; }
+};
+
+function renderCommentPermissions() {
+  const permissions = snapshot.comment_permissions || [], signature = JSON.stringify(permissions);
+  if (signature === commentPermissionSignature) return;
+  commentPermissionSignature = signature;
+  $("#comment-permissions").innerHTML = permissions.map(grant=>`<div class="comment-permission"><strong>${esc(grant.container)}</strong> has a saved comment permission for <strong>${esc(grant.target.repository)} #${esc(grant.target.number)}</strong> (${esc(grant.target.kind)})<p>${esc(grant.target.title)}</p><p>${esc(grant.target.url)} · credential: ${esc(grant.credential)}</p><p>${grant.credential_active===false?"Inactive: credential changed or unavailable. Resolve and grant a new request.":"Each request must still pass current credential, target and guest authorization checks."}</p><button data-comment-revoke="${esc(grant.id)}" data-container="${esc(grant.container)}" type="button">Revoke</button></div>`).join("") || "<p>No saved comment permissions.</p>";
+  document.querySelectorAll("[data-comment-revoke]").forEach(button=>button.onclick=async()=>{
+    button.disabled = true;
+    try {
+      const response = await fetch(`/api/containers/${encodeURIComponent(button.dataset.container)}/comment-permissions/${encodeURIComponent(button.dataset.commentRevoke)}`,{method:"DELETE",headers:{"x-friendzone-review":"1"}});
+      if (!response.ok) throw new Error(await response.text());
+      $("#comment-permissions-status").textContent = "Revoked for subsequent admission. Already-sent comments cannot be undone.";
+      await refresh();
+    } catch (error) { button.disabled=false; $("#comment-permissions-status").textContent=`Could not confirm revocation: ${error}. Refresh to check permissions.`; }
+  });
 }
 
 function renderGraphqlReview(graphql) {
@@ -218,7 +284,7 @@ async function decideRequest(decision) {
   try {
     const response = await fetch(`/api/requests/${encodeURIComponent(reviewed.id)}/decision`, {method:"POST",headers:{"content-type":"application/json","x-friendzone-review":"1"},body:JSON.stringify({fingerprint:reviewed.fingerprint,decision})});
     if (!response.ok) throw new Error(await response.text());
-    activeReview = null; ++reviewGeneration;
+    activeReview = null; ++reviewGeneration; ++commentPermissionGeneration; renderCommentPermissionPanel(null);
     $("#request-review-status").textContent = decision === "approve" ? "Approved once. Check the request log for upstream status; do not blindly retry." : "Denied. The request was not forwarded.";
     await refresh();
   } catch (error) {
@@ -227,7 +293,7 @@ async function decideRequest(decision) {
 }
 $("#request-approve").onclick = () => decideRequest("approve");
 $("#request-deny").onclick = () => decideRequest("deny");
-$("#request-close").onclick = () => { activeReview = null; ++reviewGeneration; $("#request-review").hidden = true; };
+$("#request-close").onclick = () => { activeReview = null; ++reviewGeneration; ++commentPermissionGeneration; renderCommentPermissionPanel(null); $("#request-review").hidden = true; };
 updateNotificationStatus();
 
 async function loadLog(older = false) {

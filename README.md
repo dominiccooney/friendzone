@@ -157,11 +157,22 @@ selected query/mutation/subscription, actual fields behind aliases, expanded
 fragments, resolved arguments, variable defaults, formatted document and
 supplied variables. Comment text is shown literally, separately from its
 target. The exact original body remains visible and is forwarded unchanged.
-**Both queries and mutations still require review**; parsing is not a grant
+**Queries and general mutations still require review**; parsing is not a grant
 or full GitHub schema validation. Malformed, ambiguous or unsupported input
 shows a diagnostic and raw body instead of a partial structured summary.
 See [GRAPHQL-REVIEW.md](GRAPHQL-REVIEW.md) for supported syntax and the
-operation/target model intended for future issue/PR-scoped rules.
+operation/target model and the supported issue/PR-scoped comment permission.
+
+For an eligible `addComment`, click **Resolve GitHub target**, inspect the
+real repository/number/title, then **Allow future comments here**. This
+saves a permission for **one guest + one target + one escrow credential**.
+Future supported comments with different text are verified against GitHub
+and reconstructed by the broker, without repeated approval. Other
+operations or unsupported request shapes still go to Inbox. The current
+waiting request still needs **Approve once** or **Deny** separately.
+Use **Saved comment permissions → Revoke** to remove the permission.
+Grants survive restart; guest removal removes them and token changes make
+them inactive. See [the exact contract](GRAPHQL-REVIEW.md#verified-per-guest-comment-permissions).
 Broker credentials never appear in the review; credential headers are
 redacted. URLs and request bodies may themselves contain sensitive guest
 data, so don't share screenshots casually. Payloads are untrusted text,
@@ -174,7 +185,7 @@ remain blocked because this UI cannot faithfully review them. Kill,
 removal, approval/pin changes, expiry, or cancellation of the waiting HTTP
 handler discard the pending request; restart never replays it. A permission
 change after the final admission check cannot undo already-admitted work.
-No approve-for-session/always rules or MCP write approval are added here.
+No general approve-for-session/always rules or MCP write approval are added here.
 Other origins remain logged and unpoliced.
 
 **Retry caution:** clients may time out before 120 seconds, and the HTTP

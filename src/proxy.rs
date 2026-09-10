@@ -273,6 +273,55 @@ impl EventHandler {
             .map_err(|e| error(e.to_string()))?;
         // Keep the review ID searchable/correlatable with its single audit row.
         detail.summary.id = event;
+        if let Some(credential) = crate::github::comment_credential(&self.settings, &req)
+            && let Some(crate::graphql::Review::Parsed { analysis }) = &detail.graphql
+            && let Some(plan) = &analysis.comment
+        {
+            detail.comment_permission_supported = true;
+            detail.comment_context = Some(crate::github::CommentContext {
+                binding: credential.binding.clone(),
+                subject_id: plan.subject_id.clone(),
+                epoch,
+                revision: self
+                    .state
+                    .comment_revision(container)
+                    .ok_or_else(|| error("container was removed".into()))?,
+            });
+            let grants = self
+                .state
+                .comment_permissions(container, &credential.binding);
+            if !grants.is_empty()
+                && let Ok(target) = self
+                    .state
+                    .github
+                    .resolve(&plan.subject_id, &credential)
+                    .await
+                && let Some(grant) = grants.iter().find(|g| g.target.same_identity(&target))
+                && crate::github::Credential::current(&self.settings, &credential.binding).is_some()
+            {
+                // Canonical command + clean headers, not guest GraphQL. Freeze
+                // the credential used to verify the target for this admission;
+                // subsequent rotation affects subsequent commands.
+                let mut canonical_plan = plan.clone();
+                canonical_plan.subject_id = target.node_id.clone();
+                let reconstructed = Request::builder()
+                    .method("POST")
+                    .uri(crate::github::ENDPOINT)
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json")
+                    .header("user-agent", "Friendzone comment permission")
+                    .header("authorization", &credential.header_value)
+                    .body(Body::from(canonical_plan.request_body()))
+                    .expect("validated comment request");
+                if self
+                    .state
+                    .admit_comment(event, container, peer, epoch, grant, &target)
+                {
+                    guard.finished = true;
+                    return Ok(reconstructed);
+                }
+            }
+        }
         for entry in self.settings.entries() {
             for (name, value) in &mut detail.headers {
                 if name.eq_ignore_ascii_case(&entry.header) {

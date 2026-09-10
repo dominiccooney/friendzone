@@ -23,16 +23,31 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
   const pending = {id:"request-id",container:"scratch-kali",method:"POST",url:"https://api.github.com/graphql?long="+"x".repeat(180),
     body_bytes:64,fingerprint:"immutable-hash",created_at:"2026-09-09T00:00:00Z",expires_at:"2099-01-01T00:00:00Z",reason:"GraphQL request needs review"};
   state.pending_requests=[pending];
+  state.comment_permissions=[];
   const detail={...pending,headers:[["content-type","application/json"],["authorization","[redacted]"]],body:'{"query":"<img src=x onerror=window.pwned=true>","variables":{"value":"' + "payload".repeat(200) + '"}}'};
   detail.graphql={status:"parsed",analysis:{version:1,operation_type:"mutation",operation_name:"Comment",operation_count:1,
     formatted_document:'mutation Comment($input: AddCommentInput!) {\n  harmless: addComment(input: $input) {\n    clientMutationId\n  }\n}',supplied_variables:'{\n  "input": {"subjectId":"opaque","body":"<img src=x onerror=window.pwned=true>"}\n}',
     effective_variables:[],warnings:["Parsed syntax only; target is not verified."],fields:[{field:"addComment",response_name:"harmless",path:["harmless"],parent:null,arguments:{},arguments_text:"input: "+"long-argument-".repeat(250),conditions:[],action:"Post comment",comment_body:"<img src=x onerror=window.pwned=true>",target:{kind:"node_id",input_path:"input.subjectId",id:"opaque-"+"node".repeat(80),expected_type:"Issue or PullRequest"}}]}};
   const decisions=[];
+  const permissionActions=[];
+  const resolvedTarget={target:{node_id:"canonical",repository_id:"repo-id",repository:"cline/cline",kind:"Issue",number:482,title:"<img src=x onerror=window.pwned=true> A real issue",url:"https://github.com/cline/cline/issues/482"},credential:"github"};
+  detail.comment_permission_supported=true;
   const server = http.createServer((request, response) => {
     const route = request.url.split("?")[0];
     if (route === "/api/events") {
       response.writeHead(200, { "content-type": "text/event-stream" });
       response.write("data: " + JSON.stringify(state) + "\n\n"); return;
+    }
+    if (route === "/api/requests/request-id/github-target" || route === "/api/requests/request-id/comment-permission") {
+      let body="";request.on("data",chunk=>body+=chunk);request.on("end",()=>{
+        permissionActions.push({route,headers:request.headers,body:JSON.parse(body)});
+        response.writeHead(200,{"content-type":"application/json"});
+        if(route.endsWith("github-target")) {detail.resolved_target=resolvedTarget;detail.resolution_id="resolution";response.end(JSON.stringify(detail));}
+        else {state.comment_permissions=[{id:"grant",container:"scratch-kali",credential:"github",target:resolvedTarget.target}];response.end(JSON.stringify({id:"grant"}));}
+      });return;
+    }
+    if (route === "/api/containers/scratch-kali/comment-permissions/grant" && request.method === "DELETE") {
+      permissionActions.push({route});state.comment_permissions=[];response.writeHead(204);response.end();return;
     }
     if (route === "/api/requests/request-id/decision") {
       let body=""; request.on("data",chunk=>body+=chunk); request.on("end",()=>{
@@ -148,6 +163,19 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     assert.match(await evaluate("document.querySelector('#request-graphql-fields').textContent"),/NOT an issue\/PR number/);
     assert.equal(await evaluate("!!window.pwned"),false);
     assert.equal(await evaluate("document.querySelector('#inbox-count').textContent"),"1");
+    await evaluate("document.querySelector('#resolve-comment-target').click()");
+    for(let i=0;i<100 && !await evaluate("!!activeReview?.resolution_id");i++) await delay(25);
+    assert.match(await evaluate("document.querySelector('#resolved-comment-target').textContent"),/cline\/cline #482/);
+    assert.equal(await evaluate("document.querySelector('#resolved-comment-target').children.length"),0);
+    await evaluate("window.confirm=()=>true; document.querySelector('#save-comment-permission').click()");
+    for(let i=0;i<100 && !await evaluate("!!document.querySelector('[data-comment-revoke]')");i++) await delay(25);
+    assert.equal(decisions.length,0,"saving permission must not approve the pending request");
+    assert.equal(permissionActions[1].headers["x-friendzone-review"],"1");
+    assert.deepEqual(permissionActions[1].body,{fingerprint:"immutable-hash",resolution_id:"resolution"});
+    assert.equal(await evaluate("document.querySelector('#inbox-count').textContent"),"1");
+    await evaluate("document.querySelector('[data-comment-revoke]').click()");
+    for(let i=0;i<100 && await evaluate("!!document.querySelector('[data-comment-revoke]')");i++) await delay(25);
+    assert.equal(permissionActions.length,3);
     for(const width of [1058,480]) {
       await send("Emulation.setDeviceMetricsOverride",{width,height:1000,deviceScaleFactor:1,mobile:false});
       const layout=await evaluate(`(() => {const body=document.querySelector('#request-review-body'), button=document.querySelector('#request-approve');return {page:document.documentElement.scrollWidth,body:body.clientWidth,scroll:body.scrollWidth,button:button.getBoundingClientRect().right,disabled:button.disabled};})()`);

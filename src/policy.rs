@@ -2,7 +2,8 @@
 //!
 //! Read vs write is semantic, not the HTTP method: git-upload-pack and
 //! GraphQL queries are reads despite being POSTs. The review parser is
-//! advisory, not an authorization resolver: ALL GraphQL POSTs still queue.
+//! advisory: GraphQL POSTs enter the review path, where only an explicitly
+//! saved, verified comment permission can admit a reconstructed command.
 //! Unknown origins remain unpoliced while policy grows.
 
 use hudsucker::{Body, hyper::Request};

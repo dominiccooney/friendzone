@@ -13,7 +13,8 @@ The browser renders the broker's structured snapshot; it does not parse
 GraphQL independently. Approval still fingerprints and forwards the
 **original method, URL, headers and body**, through the existing
 authorization/escrow path. Formatting does not change what executes.
-Queries and mutations both still require one-shot review. Parse failures
+Queries and general mutations still require one-shot review. The explicit
+comment permission below is the only automatic exception. Parse failures
 remain reviewable as raw text under the existing manual policy; they must
 never qualify for a future automatic grant.
 
@@ -104,7 +105,80 @@ See GitHub's [issues](https://docs.github.com/en/graphql/reference/issues),
 [pulls](https://docs.github.com/en/graphql/reference/pulls) and
 [repos](https://docs.github.com/en/graphql/reference/repos) schema references.
 
-## Next step: verified issue/PR pinning (not implemented)
+## Verified per-guest comment permissions
+
+For an eligible pending `addComment` request, the review pane offers:
+
+1. **Resolve GitHub target**: a broker-owned query to `https://api.github.com/graphql`
+   reads the node type, canonical node ID, repository ID/name, issue/PR number,
+   title and URL using the request's configured escrow credential. Inspect
+   those values; title text is untrusted content even though it came from GitHub.
+2. **Allow future comments here**: explicitly grants this guest permission to
+   comment on that verified target with varying comment text. The target is
+   checked again when saving. No capability is granted merely by resolving.
+3. **Approve once** or **Deny** the existing request separately. Saving a
+   permission does not release already-waiting requests or replay anything.
+
+**Saved comment permissions** in Inbox lists these grants with Revoke.
+They are saved atomically alongside guest policy in `containers.json` (at
+most 32 per guest). Removing a guest removes its grants. Kill/IP/approval
+changes remain enforced. Grant/revoke events appear in the memory-only log
+but do not change last-observed guest traffic.
+
+### Automatic path is a closed command, not arbitrary GraphQL forwarding
+
+The strict extractor accepts one mutation, one root `addComment`, input
+`subjectId` and `body` strings plus optional string/null `clientMutationId`.
+Variables/defaults and aliases work. Extra operations, extra input fields,
+unused variables, fragments, directives, or unsupported result selections
+fall back to Inbox. Result selections are restricted to `clientMutationId`,
+`subject { id }`, `commentEdge { node { id url body } }`, and `__typename`;
+aliases are preserved. This is intentionally narrower than GitHub's schema.
+
+Transport must be POST to exactly `https://api.github.com/graphql`, with a
+supported JSON/GraphQL content type and exactly one recognized fake Bearer
+credential from escrow. No passthrough real tokens or custom semantic
+headers/cookies are accepted under a grant. Extra headers can therefore
+make a CLI request fall back to manual review. A fixed allowlist permits
+ordinary Host, User-Agent, Accept, Accept-Encoding, Connection and HTTP
+body framing headers; automatic forwarding rebuilds clean headers.
+
+Every candidate automatic comment does a **fresh fixed target read** (no
+redirects, eight-second timeout, bounded response, four concurrent reads).
+The canonical node ID, repository ID/name, type, number and URL must match
+the saved target. Legacy node IDs can resolve to the canonical ID; a moved
+issue or renamed repository fails the saved match and needs a new grant.
+Lookup errors/rate limits/busy state fail back to manual review, not allow.
+
+On admission the broker builds its own `FriendzoneComment` mutation using
+the validated values and canonical node ID. **It does not forward the guest's
+GraphQL text under an automatic grant.** The selected permitted response
+shape is retained. Manual **Approve once** still forwards the original bytes.
+The request log distinguishes automatic reconstruction from manual approval.
+
+Grants bind to the escrow entry/fake/header/prefix and a digest of its real
+credential, kept out of UI/SSE output. Changing that binding makes the grant
+inactive; resolve a new request to grant the new credential. Restoring the
+exact old binding makes an unrevoked grant eligible again; use Revoke for
+permanent removal. The UI labels inactive credentials on state refresh.
+Concurrent grants/revocations use a revision check: an old review cannot
+restore a revoked permission without a fresh resolve/confirmation.
+
+Guest policy and grant existence are rechecked atomically at admission.
+The credential used for target verification is frozen for that admitted
+command. Later revocation/rotation cannot undo admitted upstream work.
+GitHub state can change between the read and mutation; the mutation uses
+the verified canonical node ID, not a possibly reused issue number.
+
+No user-configurable lookup URL/query, guest-grant API, general query
+auto-allowing, REST comment pinning, MCP write policy, separate parser
+process, or full schema validator is added. All preexisting network
+containment limitations still apply. A comment permission permits arbitrary
+comment content (including links/mentions); it is not content moderation or
+an anti-spam quota. Client retries may post duplicate comments: inspect
+upstream state after a lost response before retrying.
+
+## Future broader capability rules
 
 For “this agent may comment on cline/cline#482, with arbitrary comment text”:
 
@@ -127,5 +201,6 @@ For “this agent may comment on cline/cline#482, with arbitrary comment text”
    approval/IP/kill checks, with auditable revocation. Address node-ID
    canonicalization, repository changes and credential changes explicitly.
 
-No persistent capability, node lookup/cache, auto-allow-query rule, broader
-GraphQL transport allowance or MCP write policy is introduced by this UI work.
+The current permission implements only the narrow comment case above. A
+broader rule system must not promote the advisory target summaries directly
+into grants or treat a shared primary target as equivalent behavior.

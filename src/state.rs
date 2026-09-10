@@ -62,6 +62,16 @@ pub struct StateView {
     pub containers: Vec<ContainerView>,
     pub requests: Vec<RequestEvent>,
     pub pending_requests: Vec<crate::review::Summary>,
+    pub comment_permissions: Vec<CommentPermissionView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CommentPermissionView {
+    pub id: Uuid,
+    pub container: String,
+    pub target: crate::github::Target,
+    pub credential: String,
+    pub credential_active: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +88,8 @@ struct ContainerRecord {
     /// Changes to authorization invalidate one-shot reviews, even if a kill
     /// is subsequently resumed or a removed guest is re-added under its name.
     policy_epoch: Uuid,
+    comment_permissions: Vec<crate::github::Grant>,
+    comment_revision: Uuid,
 }
 
 impl Default for ContainerRecord {
@@ -89,6 +101,8 @@ impl Default for ContainerRecord {
             last_ip: None,
             managed: false,
             policy_epoch: Uuid::new_v4(),
+            comment_permissions: Vec::new(),
+            comment_revision: Uuid::new_v4(),
         }
     }
 }
@@ -110,6 +124,9 @@ struct SavedContainer {
     // must not silently convert a restricted entry into a wildcard grant.
     #[serde(deserialize_with = "required_pin")]
     pinned_ip: Option<IpAddr>,
+    /// Legacy policies contain no automatic comment grants.
+    #[serde(default)]
+    comment_permissions: Vec<crate::github::Grant>,
 }
 
 fn required_pin<'de, D: serde::Deserializer<'de>>(
@@ -172,6 +189,7 @@ pub struct AppState {
     /// fetch a fresh view. watch coalesces bursts automatically.
     changes: tokio::sync::watch::Sender<u64>,
     pub reviews: crate::review::Queue,
+    pub github: crate::github::Client,
 }
 
 impl Default for AppState {
@@ -181,6 +199,7 @@ impl Default for AppState {
             data: Arc::new(RwLock::new(StateData::default())),
             policy_path: None,
             reviews: crate::review::Queue::new(changes.clone()),
+            github: crate::github::Client::default(),
             changes,
         }
     }
@@ -220,12 +239,23 @@ impl AppState {
             if entry.killed {
                 data.killed.insert(entry.name.clone());
             }
+            if entry.comment_permissions.len() > 32 {
+                anyhow::bail!("too many saved comment permissions");
+            }
+            let mut ids = HashSet::new();
+            for grant in &entry.comment_permissions {
+                grant.validate()?;
+                if !ids.insert(grant.id) {
+                    anyhow::bail!("duplicate comment permission ID");
+                }
+            }
             data.containers.insert(
                 entry.name,
                 ContainerRecord {
                     approved: entry.approved,
                     pinned_ip: entry.pinned_ip,
                     managed: true,
+                    comment_permissions: entry.comment_permissions,
                     ..Default::default()
                 },
             );
@@ -235,6 +265,7 @@ impl AppState {
             data: Arc::new(RwLock::new(data)),
             policy_path: Some(Arc::new(path)),
             reviews: crate::review::Queue::new(changes.clone()),
+            github: crate::github::Client::default(),
             changes,
         })
     }
@@ -259,6 +290,7 @@ impl AppState {
                     approved: record.approved,
                     killed: killed.contains(name),
                     pinned_ip: record.pinned_ip,
+                    comment_permissions: record.comment_permissions.clone(),
                 })
                 .collect();
             entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -301,8 +333,20 @@ impl AppState {
     }
 
     pub fn record(&self, container: String, method: String, url: String, verdict: Verdict) -> Uuid {
+        self.record_activity(container, method, url, verdict, true)
+    }
+    fn record_activity(
+        &self,
+        container: String,
+        method: String,
+        url: String,
+        verdict: Verdict,
+        guest_traffic: bool,
+    ) -> Uuid {
         let mut state = self.data.write().expect("state lock poisoned");
-        state.touch_container(&container, None);
+        if guest_traffic {
+            state.touch_container(&container, None);
+        }
         let id = Uuid::new_v4();
         state.next_sequence += 1;
         let sequence = state.next_sequence;
@@ -380,6 +424,166 @@ impl AppState {
             && !state.killed.contains(container)
             && record.pinned_ip.is_none_or(|pin| pin == peer))
         .then_some(record.policy_epoch)
+    }
+
+    pub fn add_comment_permission(
+        &self,
+        container: &str,
+        context: &crate::github::CommentContext,
+        target: crate::github::Target,
+    ) -> Result<Uuid> {
+        target.validate()?;
+        let id = Uuid::new_v4();
+        self.update_policy(|containers, killed| {
+            let record = containers
+                .get_mut(container)
+                .context("container was removed")?;
+            if !record.approved
+                || killed.contains(container)
+                || record.policy_epoch != context.epoch
+                || record.comment_revision != context.revision
+            {
+                anyhow::bail!("container authorization changed; resolve a new request");
+            }
+            if record.comment_permissions.len() >= 32 {
+                anyhow::bail!(
+                    "container has 32 comment permissions; revoke unused permissions first"
+                );
+            }
+            record.comment_permissions.retain(|grant| {
+                !(grant.target.node_id == target.node_id && grant.binding == context.binding)
+            });
+            record.comment_permissions.push(crate::github::Grant {
+                id,
+                target,
+                binding: context.binding.clone(),
+                created_at: Utc::now(),
+            });
+            record.comment_revision = Uuid::new_v4();
+            record.managed = true;
+            Ok(())
+        })?;
+        self.record_activity(
+            container.into(),
+            "GRANT".into(),
+            format!("friendzone:comment-permission/{id}"),
+            Verdict::Allowed,
+            false,
+        );
+        Ok(id)
+    }
+
+    pub fn grant_reviewed_comment(
+        &self,
+        request_id: Uuid,
+        fingerprint: &str,
+        resolution_id: Uuid,
+        target: crate::github::Target,
+    ) -> Result<Uuid> {
+        // Acquire the current review snapshot just before durable policy
+        // publication; the revision/epoch transaction prevents stale grants
+        // from reviving a revoked permission or a removed/re-added guest.
+        let detail = self
+            .reviews
+            .detail(request_id)
+            .context("request no longer waiting")?;
+        if detail.summary.fingerprint != fingerprint
+            || detail.resolution_id != Some(resolution_id)
+            || !detail
+                .resolved_target
+                .as_ref()
+                .is_some_and(|r| r.target.same_identity(&target))
+        {
+            anyhow::bail!("review or resolved target changed");
+        }
+        self.add_comment_permission(
+            &detail.summary.container,
+            detail
+                .comment_context
+                .as_ref()
+                .context("request has no comment command")?,
+            target,
+        )
+    }
+    pub fn revoke_comment_permission(&self, container: &str, id: Uuid) -> Result<()> {
+        self.update_policy(|containers, _| {
+            let record = containers.get_mut(container).context("unknown container")?;
+            if !record.comment_permissions.iter().any(|g| g.id == id) {
+                anyhow::bail!("permission already removed");
+            }
+            record.comment_permissions.retain(|g| g.id != id);
+            record.comment_revision = Uuid::new_v4();
+            Ok(())
+        })?;
+        self.record_activity(
+            container.into(),
+            "REVOKE".into(),
+            format!("friendzone:comment-permission/{id}"),
+            Verdict::Allowed,
+            false,
+        );
+        Ok(())
+    }
+    pub fn comment_permissions(
+        &self,
+        container: &str,
+        binding: &crate::github::Binding,
+    ) -> Vec<crate::github::Grant> {
+        self.data
+            .read()
+            .expect("state lock")
+            .containers
+            .get(container)
+            .map(|r| {
+                r.comment_permissions
+                    .iter()
+                    .filter(|g| g.binding == *binding)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    pub fn comment_revision(&self, container: &str) -> Option<Uuid> {
+        self.data
+            .read()
+            .expect("state lock")
+            .containers
+            .get(container)
+            .map(|r| r.comment_revision)
+    }
+    /// Atomic admission with revoke/kill/pin/removal. A later change cannot
+    /// retract an upstream mutation already admitted under this boundary.
+    pub fn admit_comment(
+        &self,
+        event: Uuid,
+        container: &str,
+        peer: IpAddr,
+        epoch: Uuid,
+        grant: &crate::github::Grant,
+        target: &crate::github::Target,
+    ) -> bool {
+        let mut state = self.data.write().expect("state lock");
+        if state.killed.contains(container)
+            || state.containers.get(container).is_none_or(|r| {
+                !r.approved
+                    || r.policy_epoch != epoch
+                    || r.pinned_ip.is_some_and(|ip| ip != peer)
+                    || !r.comment_permissions.iter().any(|g| g == grant)
+            })
+            || !grant.target.same_identity(target)
+        {
+            return false;
+        }
+        if let Some(row) = state.requests.iter_mut().rev().find(|row| row.id == event) {
+            row.verdict = Verdict::Allowed;
+            row.detail = Some(format!(
+                "comment permission {}: {} #{}; broker-reconstructed addComment",
+                grant.id, target.repository, target.number
+            ));
+        }
+        drop(state);
+        self.notify();
+        true
     }
 
     pub fn enqueue_review(
@@ -569,6 +773,19 @@ impl AppState {
         });
         StateView {
             containers,
+            comment_permissions: state
+                .containers
+                .iter()
+                .flat_map(|(name, r)| {
+                    r.comment_permissions.iter().map(|g| CommentPermissionView {
+                        id: g.id,
+                        container: name.clone(),
+                        target: g.target.clone(),
+                        credential: g.binding.entry.clone(),
+                        credential_active: None,
+                    })
+                })
+                .collect(),
             pending_requests: self.reviews.summaries(),
             requests: state.requests.iter().rev().take(200).cloned().collect(),
         }
@@ -578,6 +795,103 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comment_permissions_are_durable_revocable_and_transactional_with_guest_policy() {
+        let dir = TestDir::new();
+        let state = AppState::load(&dir.0).unwrap();
+        let peer = "127.0.0.1".parse().unwrap();
+        state.authorize("guest", peer);
+        state.approve_container("guest", true).unwrap();
+        let binding = crate::github::Binding {
+            entry: "github".into(),
+            digest: "a".repeat(64),
+        };
+        let context = crate::github::CommentContext {
+            binding: binding.clone(),
+            subject_id: "legacy".into(),
+            epoch: state.review_epoch("guest", peer).unwrap(),
+            revision: state.comment_revision("guest").unwrap(),
+        };
+        let target = crate::github::tests::target();
+        let last_activity = state.view().containers[0].last_activity;
+        let id = state
+            .add_comment_permission("guest", &context, target.clone())
+            .unwrap();
+        assert_eq!(
+            state.view().containers[0].last_activity,
+            last_activity,
+            "grant is not guest traffic"
+        );
+        assert!(
+            state
+                .add_comment_permission("guest", &context, target.clone())
+                .is_err(),
+            "stale grant cannot replay"
+        );
+        let loaded = AppState::load(&dir.0).unwrap();
+        let grant = loaded.comment_permissions("guest", &binding).pop().unwrap();
+        assert_eq!(grant.id, id);
+        let snapshot = serde_json::to_string(&loaded.view()).unwrap();
+        assert!(!snapshot.contains(&binding.digest));
+        let epoch = loaded.review_epoch("guest", peer).unwrap();
+        assert!(loaded.admit_comment(Uuid::new_v4(), "guest", peer, epoch, &grant, &target));
+        assert!(!loaded.admit_comment(
+            Uuid::new_v4(),
+            "guest",
+            "127.0.0.2".parse().unwrap(),
+            epoch,
+            &grant,
+            &target
+        ));
+        let path = dir.0.join("containers.json");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(loaded.revoke_comment_permission("guest", id).is_err());
+        assert_eq!(loaded.comment_permissions("guest", &binding).len(), 1);
+        fs::remove_dir(&path).unwrap();
+        loaded.revoke_comment_permission("guest", id).unwrap();
+        let stale = crate::github::CommentContext {
+            epoch: loaded.review_epoch("guest", peer).unwrap(),
+            ..context.clone()
+        };
+        assert!(
+            loaded
+                .add_comment_permission("guest", &stale, target.clone())
+                .is_err(),
+            "revocation must prevent stale UI from restoring grant"
+        );
+        assert!(!loaded.admit_comment(Uuid::new_v4(), "guest", peer, epoch, &grant, &target));
+        assert!(
+            AppState::load(&dir.0)
+                .unwrap()
+                .comment_permissions("guest", &binding)
+                .is_empty()
+        );
+        let context = crate::github::CommentContext {
+            epoch: loaded.review_epoch("guest", peer).unwrap(),
+            revision: loaded.comment_revision("guest").unwrap(),
+            ..context
+        };
+        loaded
+            .add_comment_permission("guest", &context, target.clone())
+            .unwrap();
+        loaded.set_killed("guest".into(), true).unwrap();
+        assert!(!loaded.admit_comment(Uuid::new_v4(), "guest", peer, epoch, &grant, &target));
+        assert!(
+            loaded
+                .add_comment_permission("guest", &context, target.clone())
+                .is_err()
+        );
+        loaded.remove_container("guest").unwrap();
+        loaded.add_container("guest").unwrap();
+        assert!(
+            AppState::load(&dir.0)
+                .unwrap()
+                .comment_permissions("guest", &binding)
+                .is_empty()
+        );
+    }
 
     #[tokio::test]
     async fn restart_restores_guest_permission_but_never_pending_request_or_grant() {

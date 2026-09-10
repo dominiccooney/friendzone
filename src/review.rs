@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use hudsucker::{Body, hyper::Request};
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,11 @@ pub struct Detail {
     /// Broker-parsed view of the same body, not an alternate authorization or
     /// request representation. Kept out of SSE and notifications with bodies.
     pub graphql: Option<crate::graphql::Review>,
+    pub comment_permission_supported: bool,
+    pub resolved_target: Option<crate::github::Resolved>,
+    pub resolution_id: Option<Uuid>,
+    #[serde(skip)]
+    pub comment_context: Option<crate::github::CommentContext>,
 }
 
 impl Detail {
@@ -137,7 +142,7 @@ impl Detail {
             }
         });
         let reason = if is_graphql {
-            "GitHub GraphQL: inspect the selected operation, actual fields, arguments and targets. Parsed views are advisory; all GraphQL POSTs still require one-shot approval."
+            "GitHub GraphQL: this request did not qualify for automatic comment permission. Review it once, or resolve an eligible comment target and explicitly save a permission for future requests."
         } else {
             "GitHub operation requires one-shot approval. Review the full destination and payload; this does not grant future requests."
         };
@@ -156,6 +161,10 @@ impl Detail {
             headers,
             body: body.into(),
             graphql,
+            comment_permission_supported: false,
+            resolved_target: None,
+            resolution_id: None,
+            comment_context: None,
         })
     }
 }
@@ -252,6 +261,9 @@ impl Queue {
             .lock()
             .expect("review queue")
             .get(&id)
+            .filter(|entry| {
+                entry.deadline > tokio::time::Instant::now() && !entry.sender.is_closed()
+            })
             .map(|entry| entry.detail.clone())
     }
     pub fn decide(&self, id: Uuid, fingerprint: &str, decision: Decision) -> Result<()> {
@@ -275,6 +287,31 @@ impl Queue {
             .sender
             .send(decision)
             .map_err(|_| anyhow::anyhow!("waiting proxy request was cancelled"))
+    }
+    pub fn set_resolved(
+        &self,
+        id: Uuid,
+        fingerprint: &str,
+        resolved: crate::github::Resolved,
+        revision: Uuid,
+    ) -> Result<Detail> {
+        let mut entries = self.0.entries.lock().expect("review queue");
+        let entry = entries.get_mut(&id).context("request no longer waiting")?;
+        if entry.detail.summary.fingerprint != fingerprint
+            || entry.deadline <= tokio::time::Instant::now()
+            || entry.sender.is_closed()
+        {
+            bail!("request changed, expired or cancelled");
+        }
+        entry.detail.resolved_target = Some(resolved);
+        entry
+            .detail
+            .comment_context
+            .as_mut()
+            .context("no comment context")?
+            .revision = revision;
+        entry.detail.resolution_id = Some(Uuid::new_v4());
+        Ok(entry.detail.clone())
     }
     pub fn cancel_container(&self, container: &str) {
         let mut entries = self.0.entries.lock().expect("review queue");

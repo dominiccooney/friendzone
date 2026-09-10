@@ -38,12 +38,21 @@
             <h4>Supplied variables</h4><pre id="request-graphql-variables"></pre>
             <details><summary>Effective variables and structured data (for future rules)</summary><pre id="request-graphql-data"></pre></details>
           </section>
-          <h4>Exact request body (unchanged on approval)</h4><pre id="request-review-body"></pre>
+          <section id="comment-permission-panel" hidden>
+            <h4>Allow this guest to comment on one issue/PR</h4>
+            <p>Resolve the target using the broker's GitHub credential, inspect its repository and number, then explicitly save a permission for future comments. Comment text can vary; this does not permit edits, closing issues, reviews, or other mutations.</p>
+            <button id="resolve-comment-target" type="button">Resolve GitHub target</button>
+            <div id="resolved-comment-target"></div>
+            <button id="save-comment-permission" type="button" disabled>Allow future comments here</button>
+            <p id="comment-permission-status" role="status"></p>
+          </section>
+          <h4>Exact request body (unchanged on Approve once)</h4><pre id="request-review-body"></pre>
           <div class="mcp-card-actions"><button id="request-approve" type="button" disabled>Approve once</button><button id="request-deny" type="button" disabled>Deny</button><button id="request-close" type="button">Close review</button></div>
         </section>
         <p id="request-review-status" role="status"></p>
       </section>
       <div id="containers" class="containers"></div>
+      <section class="request-inbox"><h2>Saved comment permissions</h2><p>One guest, one verified issue/PR, one GitHub credential. Future supported comments are reconstructed by the broker and rechecked against GitHub. Other requests still require review. Saved permissions survive restart; token changes require a new grant.</p><div id="comment-permissions"></div><p id="comment-permissions-status" role="status"></p></section>
     </section>
     <section id="log-view" class="view">
       <div class="page-heading"><div><h1>Request log</h1><p>Search the last 10,000 application requests (memory only). Successful CONNECT setup and authentication challenges are omitted.</p><p id="log-status" class="meta"></p></div></div>

@@ -1,6 +1,7 @@
 mod browser;
 mod ca;
 mod doctor;
+mod github;
 mod graphql;
 mod guest_http;
 mod mcp;

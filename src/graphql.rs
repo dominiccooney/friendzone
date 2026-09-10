@@ -914,11 +914,192 @@ pub struct Analysis {
     pub effective_variables: Vec<VariableView>,
     pub fields: Vec<FieldView>,
     pub warnings: Vec<String>,
+    /// Not deserialized from UI data. A strict, reconstructable command,
+    /// independent of the advisory field/target summaries above.
+    #[serde(skip)]
+    pub comment: Option<CommentPlan>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CommentPlan {
+    pub subject_id: String,
+    pub body: String,
+    client_mutation_id: Option<Json>,
+    response: String,
+}
+impl CommentPlan {
+    /// Automatic grants send only this broker-owned mutation with validated
+    /// values. Arbitrary guest GraphQL is never forwarded under a pin.
+    pub fn request_body(&self) -> Vec<u8> {
+        let mut input = serde_json::json!({"subjectId":self.subject_id,"body":self.body});
+        if let Some(value) = &self.client_mutation_id {
+            input["clientMutationId"] = value.clone();
+        }
+        serde_json::to_vec(&serde_json::json!({
+            "query":format!("mutation FriendzoneComment($input: AddCommentInput!) {{ {} }}",self.response),
+            "operationName":"FriendzoneComment", "variables":{"input":input}
+        })).expect("validated command JSON")
+    }
+}
+
+fn comment_plan(
+    document: &Document,
+    selected: &Operation,
+    variables: &BTreeMap<String, Value>,
+    supplied: &serde_json::Map<String, Json>,
+) -> Option<CommentPlan> {
+    if document.operations.len() != 1
+        || !document.fragments.is_empty()
+        || selected.kind != "mutation"
+        || !selected.directives.is_empty()
+        || selected.variables.iter().any(|v| !v.directives.is_empty())
+        || selected.selections.len() != 1
+        || supplied.keys().any(|key| !variables.contains_key(key))
+    {
+        return None;
+    }
+    let Selection::Field {
+        name,
+        alias,
+        arguments,
+        directives,
+        selections,
+    } = &selected.selections[0]
+    else {
+        return None;
+    };
+    if name != "addComment" || !directives.is_empty() || arguments.len() != 1 {
+        return None;
+    }
+    let mut used = HashSet::new();
+    fn resolve(
+        value: &Value,
+        expected: &str,
+        definitions: &[Variable],
+        vars: &BTreeMap<String, Value>,
+        used: &mut HashSet<String>,
+    ) -> Option<Value> {
+        if let Value::Variable(name) = value {
+            let definition = definitions.iter().find(|v| v.name == *name)?;
+            if definition.type_name.trim_end_matches('!') != expected {
+                return None;
+            }
+            used.insert(name.clone());
+            return vars.get(name).cloned();
+        }
+        Some(value.clone())
+    }
+    let input = resolve(
+        arguments.get("input")?,
+        "AddCommentInput",
+        &selected.variables,
+        variables,
+        &mut used,
+    )?;
+    let Value::Object(input) = input else {
+        return None;
+    };
+    if input
+        .keys()
+        .any(|k| !matches!(k.as_str(), "subjectId" | "body" | "clientMutationId"))
+    {
+        return None;
+    }
+    let Value::String(subject_id) = resolve(
+        input.get("subjectId")?,
+        "ID",
+        &selected.variables,
+        variables,
+        &mut used,
+    )?
+    else {
+        return None;
+    };
+    let Value::String(body) = resolve(
+        input.get("body")?,
+        "String",
+        &selected.variables,
+        variables,
+        &mut used,
+    )?
+    else {
+        return None;
+    };
+    if subject_id.is_empty() || subject_id.len() > 512 || body.trim().is_empty() {
+        return None;
+    }
+    let client_mutation_id = match input.get("clientMutationId") {
+        None => None,
+        Some(value) => match resolve(value, "String", &selected.variables, variables, &mut used)? {
+            Value::String(text) => Some(Json::String(text)),
+            Value::Null => Some(Json::Null),
+            _ => return None,
+        },
+    };
+    if used.len() != selected.variables.len() {
+        return None;
+    }
+    fn response(selections: &[Selection], parent: &str) -> bool {
+        if selections.is_empty() {
+            return false;
+        }
+        let mut names = HashSet::new();
+        for selection in selections {
+            let Selection::Field {
+                name,
+                alias,
+                arguments,
+                directives,
+                selections,
+            } = selection
+            else {
+                return false;
+            };
+            if !arguments.is_empty()
+                || !directives.is_empty()
+                || !names.insert(alias.as_ref().unwrap_or(name))
+            {
+                return false;
+            }
+            let next = match (parent, name.as_str()) {
+                ("payload", "subject") => Some("subject"),
+                ("payload", "commentEdge") => Some("edge"),
+                ("edge", "node") => Some("comment"),
+                (_, "__typename")
+                | ("payload", "clientMutationId")
+                | ("subject", "id")
+                | ("comment", "id" | "url" | "body") => None,
+                _ => return false,
+            };
+            if let Some(next) = next {
+                if !response(selections, next) {
+                    return false;
+                }
+            } else if !selections.is_empty() {
+                return false;
+            }
+        }
+        true
+    }
+    if !response(selections, "payload") {
+        return None;
+    }
+    let mut response = format!(
+        "{}addComment(input: $input) ",
+        alias.as_ref().map(|a| format!("{a}: ")).unwrap_or_default()
+    );
+    selections_text(selections, 0, &mut response);
+    Some(CommentPlan {
+        subject_id,
+        body,
+        client_mutation_id,
+        response,
+    })
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Review {
-    Parsed { analysis: Analysis },
+    Parsed { analysis: Box<Analysis> },
     Unavailable { message: String },
 }
 
@@ -995,7 +1176,9 @@ impl<'de> Deserialize<'de> for UniqueJson {
 
 pub fn review(body: &str, content_type: &str) -> Review {
     match analyze(body, content_type) {
-        Ok(analysis) => Review::Parsed { analysis },
+        Ok(analysis) => Review::Parsed {
+            analysis: Box::new(analysis),
+        },
         Err(message) => Review::Unavailable { message },
     }
 }
@@ -1062,7 +1245,7 @@ fn analyze(body: &str, content_type: &str) -> Result<Analysis> {
     } else {
         return Err("multiple operations require operationName; no operation was guessed".into());
     };
-    let mut warnings=vec!["Parsed syntax, not GitHub schema validation or an authorization grant. All GraphQL POSTs still require approval.".into(),
+    let mut warnings=vec!["Parsed syntax, not full GitHub schema validation or an authorization grant. Only an explicitly saved narrow comment permission can bypass one-shot review.".into(),
         "Targets come from request arguments and are unverified. Opaque node IDs are not issue/PR numbers; no GitHub lookup has run.".into(),
         "The target hint identifies a primary subject only. Other arguments may change permissions, reference other objects, or perform additional effects; a future rule must constrain the entire operation.".into(),
         "Formatting removes comments and normalizes whitespace/string escapes. The exact original body below remains the approval identity.".into()];
@@ -1124,6 +1307,7 @@ fn analyze(body: &str, content_type: &str) -> Result<Analysis> {
         effective_variables,
         fields: expander.fields,
         warnings,
+        comment: comment_plan(&document, selected, &variables, &supplied),
     })
 }
 
@@ -1443,6 +1627,67 @@ fn target_for(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn comment_command_is_reconstructed_from_a_closed_shape_not_arbitrary_graphql() {
+        let source = r#"mutation GuestName($target:ID!, $text:String!){alias:addComment(input:{subjectId:$target,body:$text,clientMutationId:null}){commentEdge{node{id url body}}subject{id}clientMutationId}}"#;
+        let analysis = parse(
+            source,
+            json!({"target":"opaque","text":"arbitrary \" mutation { deleteIssue } text"}),
+            None,
+        )
+        .unwrap();
+        let plan = analysis.comment.unwrap();
+        let body: Json = serde_json::from_slice(&plan.request_body()).unwrap();
+        assert_eq!(body["operationName"], "FriendzoneComment");
+        assert_eq!(body["variables"]["input"]["subjectId"], "opaque");
+        assert_eq!(
+            body["variables"]["input"]["body"],
+            "arbitrary \" mutation { deleteIssue } text"
+        );
+        assert!(!body["query"].as_str().unwrap().contains("deleteIssue"));
+        assert!(
+            body["query"]
+                .as_str()
+                .unwrap()
+                .contains("alias: addComment")
+        );
+        assert!(
+            analyze(
+                &String::from_utf8(plan.request_body()).unwrap(),
+                "application/json"
+            )
+            .unwrap()
+            .comment
+            .is_some()
+        );
+        let whole = parse(
+            "mutation($input:AddCommentInput!){addComment(input:$input){clientMutationId}}",
+            json!({"input":{"subjectId":"opaque","body":"hello"}}),
+            None,
+        )
+        .unwrap();
+        assert!(whole.comment.is_some());
+        for source in [
+            "mutation{addComment(input:{subjectId:\"x\",body:\"y\"}){clientMutationId} closeIssue(input:{issueId:\"x\"}){clientMutationId}}",
+            "mutation{addComment(input:{subjectId:\"x\",body:\"y\",unknown:true}){clientMutationId}}",
+            "mutation{addComment(input:{subjectId:\"x\",body:\"y\"}) @skip(if:false){clientMutationId}}",
+            "mutation{...F} fragment F on Mutation{addComment(input:{subjectId:\"x\",body:\"y\"}){clientMutationId}}",
+            "mutation{addComment(input:{subjectId:\"x\",body:\"y\"}){subject{secret}}}",
+            "mutation{addComment(input:{subjectId:\"x\",body:\"y\"}){x:clientMutationId x:subject{id}}}",
+            "mutation($id:String!){addComment(input:{subjectId:$id,body:\"y\"}){clientMutationId}}",
+            "mutation($unused:String){addComment(input:{subjectId:\"x\",body:\"y\"}){clientMutationId}}",
+            "query{viewer{login}}",
+        ] {
+            let variables = if source.contains("$id:String!") {
+                json!({"id":"x"})
+            } else {
+                Json::Null
+            };
+            let analysis = parse(source, variables, None).unwrap();
+            assert!(analysis.comment.is_none(), "{source}");
+        }
+    }
     fn parse(query: &str, variables: Json, operation: Option<&str>) -> Result<Analysis> {
         analyze(
             &json!({"query":query,"variables":variables,"operationName":operation}).to_string(),
