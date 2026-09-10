@@ -1,9 +1,11 @@
+mod bootstrap;
 mod browser;
 mod ca;
 mod doctor;
 mod github;
 mod graphql;
 mod guest_http;
+mod guest_profile;
 mod mcp;
 mod mcp_import;
 mod mcp_oauth;
@@ -61,6 +63,12 @@ enum Command {
         /// guest's hostname.
         #[arg(long)]
         container: Option<String>,
+        /// Environment file syntax (defaults to powershell on Windows, sh elsewhere).
+        #[arg(long, value_enum)]
+        shell: Option<setup::Shell>,
+        /// Persist guest profile hooks (Unix) or user environment (Windows).
+        #[arg(long)]
+        persist_profile: bool,
     },
     /// Check this guest's Friendzone network setup.
     Doctor {
@@ -100,7 +108,19 @@ async fn main() -> Result<()> {
             output,
             install,
             container,
-        } => setup::run(&broker, output, install, container).await,
+            shell,
+            persist_profile,
+        } => {
+            setup::run(
+                &broker,
+                output,
+                install,
+                container,
+                shell.unwrap_or_default(),
+                persist_profile,
+            )
+            .await
+        }
         Command::Doctor { broker, proxy } => doctor::run(&broker, &proxy).await,
     }
 }

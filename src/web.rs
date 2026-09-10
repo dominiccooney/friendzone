@@ -158,6 +158,7 @@ fn ui_router(state: UiState) -> Router {
         )
         .route("/api/escrow/{name}/secret", post(set_escrow_secret))
         .route("/api/guest-env", get(guest_env))
+        .route("/api/bootstrap/commands", get(guest_setup_commands))
         .route("/api/mcp", get(list_forwards))
         .route("/api/mcp/config", get(get_mcp_config).put(put_mcp_config))
         .route("/api/mcp/reload", post(reload_mcp_config))
@@ -396,6 +397,15 @@ async fn list_forwards(State(state): State<UiState>) -> Json<serde_json::Value> 
 /// endpoints. Host overrides only describe guest routing; they do not bind
 /// a new listener or make a network request.
 fn guest_mcp_endpoint(addr: SocketAddr, host: Option<&str>, name: &str) -> Result<String> {
+    let mut url = guest_broker_url(addr, host)?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("invalid broker URL"))?
+        .push("mcp")
+        .push(name);
+    Ok(url.into())
+}
+
+fn guest_broker_url(addr: SocketAddr, host: Option<&str>) -> Result<reqwest::Url> {
     let host = host
         .map(str::trim)
         .filter(|host| !host.is_empty())
@@ -440,11 +450,25 @@ fn guest_mcp_endpoint(addr: SocketAddr, host: Option<&str>, name: &str) -> Resul
     }
     url.set_port(Some(addr.port()))
         .map_err(|_| anyhow::anyhow!("invalid bootstrap port"))?;
-    url.path_segments_mut()
-        .map_err(|_| anyhow::anyhow!("invalid broker URL"))?
-        .push("mcp")
-        .push(name);
-    Ok(url.into())
+    Ok(url)
+}
+
+#[derive(Deserialize)]
+struct SetupCommandsQuery {
+    host: Option<String>,
+    #[serde(default)]
+    container: String,
+}
+async fn guest_setup_commands(
+    State(state): State<UiState>,
+    axum::extract::Query(query): axum::extract::Query<SetupCommandsQuery>,
+) -> impl IntoResponse {
+    match guest_broker_url(state.bootstrap_addr, query.host.as_deref())
+        .and_then(|url| crate::bootstrap::commands(url.as_str(), &query.container))
+    {
+        Ok(commands) => Json(commands).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -743,9 +767,39 @@ fn bootstrap_router(state: BootstrapState) -> Router {
         .route("/bootstrap/info", get(bootstrap_info))
         .route("/bootstrap/hello", get(bootstrap_hello))
         .route("/bootstrap/env", get(bootstrap_env))
+        .route("/bootstrap/setup", get(bootstrap_script))
         .route("/mcp/{name}", post(mcp_message))
         .route("/health", get(|| async { "ok" }))
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScriptQuery {
+    shell: String,
+    broker: String,
+    #[serde(default)]
+    container: String,
+}
+async fn bootstrap_script(
+    axum::extract::Query(query): axum::extract::Query<ScriptQuery>,
+) -> impl IntoResponse {
+    // Explicit broker origin avoids trusting Host/X-Forwarded-* as executable
+    // template input. Fetching a script never announces or approves a guest.
+    match crate::setup::Shell::parse(&query.shell)
+        .and_then(|shell| crate::bootstrap::script(shell, &query.broker, &query.container))
+    {
+        Ok(script) => (
+            [
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            script,
+        )
+            .into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1245,6 +1299,30 @@ async fn binary(
 ) -> impl IntoResponse {
     let host_platform = std::env::consts::OS; // "windows" | "macos" | "linux"
     let wanted = query.unwrap_or_default().trim().to_lowercase();
+    if let Some(target) = wanted.strip_prefix("target=") {
+        let filename = match crate::bootstrap::target_filename(target) {
+            Ok(name) => name,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        };
+        let host = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        if target == host {
+            return (
+                [
+                    (header::CONTENT_TYPE, "application/octet-stream"),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                state.binary.as_ref().clone(),
+            )
+                .into_response();
+        }
+        // Exact platform AND architecture; no substring/fallback matching.
+        let name = if state.guest_binaries.contains_key(&filename) {
+            filename
+        } else {
+            format!("{filename}.exe")
+        };
+        return guest_binary(State(state), Path(name)).await.into_response();
+    }
     let wanted = match wanted.as_str() {
         "" => String::new(),
         "win" | "windows" => "windows".to_owned(),
@@ -2339,6 +2417,34 @@ mod tests {
             std::str::from_utf8(&body).unwrap(),
             render_index(&default.to_string_lossy()).0
         );
+        let response = ui
+            .clone()
+            .oneshot(
+                Request::get("/api/bootstrap/commands?host=192.0.2.44&container=scratch-kali")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 32 * 1024)
+            .await
+            .unwrap();
+        let commands: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(commands["broker"], "http://192.0.2.44:8082");
+        assert!(
+            commands["sh_url"]
+                .as_str()
+                .unwrap()
+                .contains("/bootstrap/setup?shell=sh")
+        );
+        assert!(
+            commands["powershell_url"]
+                .as_str()
+                .unwrap()
+                .contains("shell=powershell")
+        );
+        assert!(!commands.to_string().contains("8081"));
         let bootstrap = bootstrap_router(BootstrapState {
             cert: Arc::new(String::new()),
             binary: Arc::new(vec![]),
@@ -2650,6 +2756,78 @@ mod tests {
         assert_eq!(
             response.headers()[header::CONTENT_DISPOSITION],
             "attachment; filename=fz-linux-x86_64"
+        );
+    }
+
+    #[tokio::test]
+    async fn guest_scripts_and_exact_target_selection_are_public_without_management() {
+        for shell in ["sh", "/bin/zsh", "powershell", "pwsh"] {
+            let url = format!(
+                "/bootstrap/setup?shell={shell}&broker=http%3A%2F%2F192.0.2.1%3A9082&container=guest"
+            );
+            let response = bootstrap_app()
+                .oneshot(Request::get(url).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let body = axum::body::to_bytes(response.into_body(), 32 * 1024)
+                .await
+                .unwrap();
+            let text = String::from_utf8(body.to_vec()).unwrap();
+            assert!(text.contains("http://192.0.2.1:9082"));
+            assert!(text.contains("--persist-profile"));
+            assert!(!text.contains("-addstore"));
+            assert!(!text.contains("secrets.json"));
+        }
+        for url in [
+            "/bootstrap/setup?shell=fish&broker=http://host:8082",
+            "/bootstrap/setup?shell=sh&broker=http://host:8082/path",
+            "/bootstrap/setup?shell=sh",
+            "/bootstrap/fz?target=linux-mips",
+        ] {
+            assert_eq!(
+                bootstrap_app()
+                    .oneshot(Request::get(url).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST,
+                "{url}"
+            );
+        }
+        let response = bootstrap_app()
+            .oneshot(
+                Request::get("/bootstrap/fz?target=linux-x86_64")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        if std::env::consts::OS != "linux" {
+            assert_eq!(
+                &axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()[..],
+                b"\x7fELF-test"
+            );
+        }
+        assert_eq!(
+            bootstrap_app()
+                .oneshot(
+                    Request::get("/bootstrap/fz?target=linux-aarch64")
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            if std::env::consts::OS == "linux" && std::env::consts::ARCH == "aarch64" {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            }
         );
     }
 

@@ -159,7 +159,23 @@
         <textarea id="mcp-editor" aria-label="MCP forwards JSON configuration" rows="12" spellcheck="false" style="width:100%;font-family:monospace"></textarea>
         <div class="filters"><button id="mcp-save" type="button">Save &amp; apply</button><button id="mcp-reload" type="button" class="quiet">Reload from disk</button><span id="mcp-editor-status" class="meta"></span></div>
       </details>
-      <h2>Guest environment</h2>
+      <section id="guest-setup" class="mcp-setup-panel" aria-labelledby="guest-setup-title">
+        <h2 id="guest-setup-title">Set up a guest</h2>
+        <p><strong>Run in the guest, NOT on this host.</strong> Downloads the matching fz binary, configures proxy/CA/fake keys and Cline, and persists this guest user's environment. Stop guest Cline before setup. No firewall or system trust-store changes.</p>
+        <div class="filters"><label>Broker host reachable from guest<input id="setup-host" placeholder="Host IP or DNS name" autocomplete="off"></label><label>Guest name<input id="setup-container" placeholder="Default: guest hostname" autocomplete="off"></label></div>
+        <p id="setup-address" class="meta"></p>
+        <h3>Linux — sh, bash or zsh</h3>
+        <p class="meta">Adds a managed hook once to .profile, .bashrc, .zshenv (honors ZDOTDIR) and existing bash login files. Non-interactive bash uses BASH_ENV from an activated parent; zsh reads .zshenv. Plain sh/services need an activated launcher.</p>
+        <textarea id="setup-sh" rows="5" readonly spellcheck="false" aria-label="Linux guest setup command"></textarea>
+        <div class="mcp-card-actions"><button id="setup-copy-sh" type="button" disabled>Copy Linux command</button><a id="setup-view-sh" target="_blank" rel="noopener noreferrer" hidden>Inspect Linux script</a></div>
+        <h3>Windows — PowerShell 5.1 or 7</h3>
+        <p class="meta">Saves user environment variables (not machine-wide), including proxies, loopback exclusions and CA paths; activates this PowerShell process. New child processes inherit it. Sign out/in for fresh GUI launchers, and restart existing agents. Normal execution policy applies.</p>
+        <textarea id="setup-powershell" rows="7" readonly spellcheck="false" aria-label="PowerShell guest setup command"></textarea>
+        <div class="mcp-card-actions"><button id="setup-copy-powershell" type="button" disabled>Copy PowerShell command</button><a id="setup-view-powershell" target="_blank" rel="noopener noreferrer" hidden>Inspect PowerShell script</a></div>
+        <p id="setup-status" role="status"></p>
+        <p class="meta">Trust-on-first-use: scripts and binaries come from your host over the bootstrap connection. Use only a trusted host/network. Requires a matching x86_64/aarch64 build in the broker; missing builds fail before profile/user-environment changes. Approve the guest in Inbox afterward. Existing profile contents are preserved, with .friendzone-backup files; Windows records previous user values for rollback.</p>
+      </section>
+      <h2>Guest environment (manual)</h2>
       <p>Fake keys for the container; <code>fz setup</code> fetches these automatically, or pull them by hand:</p>
       <pre id="guest-env-curl"></pre>
       <pre id="guest-env"></pre>

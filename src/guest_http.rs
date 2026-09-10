@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 pub fn broker_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10))
         .build()
         .context("build direct broker client")

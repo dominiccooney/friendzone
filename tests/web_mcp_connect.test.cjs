@@ -337,6 +337,27 @@ async function resolveSettings(f, forwards = []) {
   f.calls.filter(c=>c.url==="/api/guest-env").at(-1).resolve({text:async()=>"# environment"});
 }
 
+test("guest bootstrap commands discard stale responses, use explicit platform choices and copy safely", async () => {
+  const f=fixture(); const element=id=>f.sandbox.document.querySelector("#setup-"+id);
+  element("host").value="172.31.208.1"; element("container").value="scratch-kali";
+  const first=f.run("loadGuestSetup()"); const old=f.calls.at(-1);
+  element("host").value="192.0.2.1";
+  const second=f.run("loadGuestSetup()"); const current=f.calls.at(-1);
+  assert.match(current.url,/host=192.0.2.1/);
+  const reply={broker:"http://192.0.2.1:9082",sh:"safe-linux-command",powershell:"safe-powershell-command",sh_url:"http://192.0.2.1:9082/bootstrap/setup?shell=sh",powershell_url:"http://192.0.2.1:9082/bootstrap/setup?shell=powershell"};
+  current.resolve({ok:true,json:async()=>reply}); await second;
+  old.resolve({ok:true,json:async()=>({...reply,sh:"stale"})}); await first;
+  assert.equal(element("sh").value,"safe-linux-command");
+  assert.equal(element("powershell").value,"safe-powershell-command");
+  assert.equal(element("view-sh").href,reply.sh_url);
+  let copied;f.sandbox.navigator.clipboard={async writeText(text){copied=text;}};
+  await element("copy-powershell").onclick(); assert.equal(copied,reply.powershell);
+  assert.match(element("status").textContent,/only in the guest/);
+  element("host").value="";await f.run("loadGuestSetup()");
+  assert.equal(element("sh").value,"");assert.equal(element("copy-sh").disabled,true);
+  assert.equal(element("view-sh").hidden,true);
+});
+
 const linearForward = {
   name:"Linear", url:"https://mcp.linear.app/mcp", tools:["read"], guests:["scratch-kali"],
   auth:"cline-link", guest_endpoint:"http://172.31.208.1:8082/mcp/Linear",

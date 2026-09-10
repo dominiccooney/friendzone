@@ -6,12 +6,56 @@ use std::{
 
 use anyhow::{Context, Result};
 
+#[derive(Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+pub enum Shell {
+    Sh,
+    Powershell,
+}
+impl Default for Shell {
+    fn default() -> Self {
+        if cfg!(windows) {
+            Self::Powershell
+        } else {
+            Self::Sh
+        }
+    }
+}
+impl Shell {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value
+            .rsplit('/')
+            .next()
+            .unwrap_or(value)
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "sh" | "bash" | "zsh" => Ok(Self::Sh),
+            "powershell" | "pwsh" | "powershell.exe" | "pwsh.exe" => Ok(Self::Powershell),
+            _ => anyhow::bail!(
+                "supported shell values: sh, bash, zsh, powershell, pwsh (or /bin/zsh)"
+            ),
+        }
+    }
+}
+
 pub async fn run(
     broker: &str,
     output: Option<PathBuf>,
     install: bool,
     container: Option<String>,
+    shell: Shell,
+    persist_profile: bool,
 ) -> Result<()> {
+    if persist_profile
+        && ((cfg!(windows) && shell != Shell::Powershell) || (!cfg!(windows) && shell != Shell::Sh))
+    {
+        anyhow::bail!("profile persistence requires the platform-native shell syntax");
+    }
+    if persist_profile && std::env::var_os("SUDO_USER").is_some() {
+        anyhow::bail!(
+            "run persistent setup as the guest user, without sudo; install system CA trust separately if needed"
+        );
+    }
     let client = crate::guest_http::broker_client()?;
     let url = format!("{}/bootstrap/ca.pem", broker.trim_end_matches('/'));
     let cert = client
@@ -24,7 +68,9 @@ pub async fn run(
         .bytes()
         .await?;
     let target = TargetUser::resolve();
-    let path = output.unwrap_or_else(|| target.config_dir().join("friendzone-ca.pem"));
+    let path = std::path::absolute(
+        output.unwrap_or_else(|| target.config_dir().join("friendzone-ca.pem")),
+    )?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
         target.adopt(parent);
@@ -33,7 +79,16 @@ pub async fn run(
     target.adopt(&path);
     println!("Saved Friendzone CA to {}", path.display());
     let container = container.unwrap_or_else(guest_hostname);
-    fetch_guest_env(&client, broker, &path, &container, &target).await?;
+    fetch_guest_env(
+        &client,
+        broker,
+        &path,
+        &container,
+        &target,
+        shell,
+        persist_profile,
+    )
+    .await?;
     if install {
         install_ca(&path)?;
     } else {
@@ -115,6 +170,7 @@ fn guest_hostname() -> String {
     std::env::var("HOSTNAME")
         .ok()
         .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("COMPUTERNAME").ok().filter(|h| !h.is_empty()))
         .or_else(|| {
             fs::read_to_string("/etc/hostname")
                 .ok()
@@ -124,8 +180,108 @@ fn guest_hostname() -> String {
         .unwrap_or_else(|| "guest".to_owned())
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+pub(crate) fn powershell_quote(value: &str) -> String {
+    // PowerShell also treats typographic single quotes as delimiters.
+    let escaped: String = value
+        .chars()
+        .flat_map(|c| {
+            if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}') {
+                vec![c, c]
+            } else {
+                vec![c]
+            }
+        })
+        .collect();
+    format!("'{escaped}'")
+}
+
+fn powershell_environment(
+    broker: &str,
+    port: u16,
+    container: &str,
+    cert: &Path,
+    fakes: &str,
+) -> Result<(String, std::collections::BTreeMap<String, String>)> {
+    let broker = reqwest::Url::parse(broker)?;
+    let host = broker
+        .host_str()
+        .context("broker has no host")?
+        .trim_matches(['[', ']']);
+    let mut proxy = broker.clone();
+    proxy
+        .set_scheme("http")
+        .map_err(|_| anyhow::anyhow!("invalid scheme"))?;
+    proxy
+        .set_port(Some(port))
+        .map_err(|_| anyhow::anyhow!("invalid port"))?;
+    proxy
+        .set_username(container)
+        .map_err(|_| anyhow::anyhow!("invalid guest"))?;
+    proxy
+        .set_password(Some("x"))
+        .map_err(|_| anyhow::anyhow!("invalid guest"))?;
+    proxy.set_path("");
+    proxy.set_query(None);
+    proxy.set_fragment(None);
+    let mut values: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    values.insert("FZ_HOST".into(), host.into());
+    values.insert(
+        "FZ_BROKER".into(),
+        broker.as_str().trim_end_matches('/').into(),
+    );
+    // Windows environment and ConvertFrom-Json 5.1 are case-insensitive.
+    for name in ["HTTP_PROXY", "HTTPS_PROXY"] {
+        values.insert(name.into(), proxy.as_str().trim_end_matches('/').into());
+    }
+    for name in [
+        "NODE_EXTRA_CA_CERTS",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "GIT_SSL_CAINFO",
+        "GIT_PROXY_SSL_CAINFO",
+    ] {
+        values.insert(name.into(), cert.to_string_lossy().into_owned());
+    }
+    values.insert(
+        "NO_PROXY".into(),
+        format!("{host},localhost,127.0.0.1,::1,[::1]"),
+    );
+    for line in fakes
+        .lines()
+        .filter_map(|line| line.strip_prefix("export "))
+    {
+        let (name, value) = line.split_once('=').context("invalid fake export")?;
+        if !valid_env_name(name) || values.keys().any(|key| key.eq_ignore_ascii_case(name)) {
+            anyhow::bail!("invalid or conflicting guest environment variable {name}");
+        }
+        values.insert(name.into(), value.into());
+    }
+    let mut script =
+        String::from("\u{feff}# Friendzone guest environment; dot-source in guest PowerShell.\n");
+    for (name, value) in &values {
+        if name == "NO_PROXY" {
+            continue;
+        }
+        script.push_str(&format!(
+            "[Environment]::SetEnvironmentVariable({}, {}, 'Process')\n",
+            powershell_quote(name),
+            powershell_quote(value)
+        ));
+    }
+    script.push_str(&format!("$fzExclusions = @(({} + ',' + $env:NO_PROXY + ',' + $env:no_proxy).Split(',') | ForEach-Object {{ $_.Trim() }} | Where-Object {{ $_ }} | Select-Object -Unique) -join ','\n$env:NO_PROXY = $fzExclusions\n$env:no_proxy = $fzExclusions\nRemove-Variable fzExclusions\n",powershell_quote(&values["NO_PROXY"])));
+    Ok((script, values))
+}
+
+fn valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .enumerate()
+            .all(|(i, c)| c == b'_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
 }
 
 fn guest_environment(
@@ -157,6 +313,38 @@ fn guest_environment(
     let proxy = shell_quote(proxy.as_str().trim_end_matches('/'));
     let host = shell_quote(host);
     let cert = shell_quote(&cert.to_string_lossy());
+    // Treat fetched fake exports as data, never persist arbitrary shell code.
+    let mut safe_fakes = String::new();
+    for line in fakes
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+    {
+        let (name, value) = line
+            .strip_prefix("export ")
+            .and_then(|line| line.split_once('='))
+            .context("invalid fake export")?;
+        if !valid_env_name(name)
+            || [
+                "FZ_HOST",
+                "FZ_BROKER",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "NO_PROXY",
+                "NODE_EXTRA_CA_CERTS",
+                "REQUESTS_CA_BUNDLE",
+                "SSL_CERT_FILE",
+                "GIT_SSL_CAINFO",
+                "GIT_PROXY_SSL_CAINFO",
+                "BASH_ENV",
+                "ENV",
+            ]
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        {
+            anyhow::bail!("invalid or conflicting guest environment variable {name}");
+        }
+        safe_fakes.push_str(&format!("export {name}={}\n", shell_quote(value)));
+    }
     Ok(format!(
         "# Friendzone guest environment; source this in the agent's shell.\n\
          export FZ_HOST={host}\n\
@@ -188,7 +376,7 @@ fn guest_environment(
          export SSL_CERT_FILE={cert}\n\
          export GIT_SSL_CAINFO={cert}\n\
          export GIT_PROXY_SSL_CAINFO={cert}\n\
-         {fakes}",
+         {safe_fakes}",
         shell_quote(broker.as_str().trim_end_matches('/')),
     ))
 }
@@ -203,6 +391,8 @@ async fn fetch_guest_env(
     cert_path: &Path,
     container: &str,
     target: &TargetUser,
+    shell: Shell,
+    persist_profile: bool,
 ) -> Result<()> {
     let base = broker.trim_end_matches('/');
     let url = format!("{base}/bootstrap/env");
@@ -228,19 +418,30 @@ async fn fetch_guest_env(
         .and_then(serde_json::Value::as_u64)
         .context("no proxy_port in broker info")?;
     let proxy_port = u16::try_from(proxy_port).context("invalid proxy_port")?;
-    let env = guest_environment(base, proxy_port, container, cert_path, &fakes)?;
-    let env_path = cert_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("friendzone-env.sh");
-    fs::write(&env_path, &env).with_context(|| format!("write {}", env_path.display()))?;
+    let (env, user_values) = if shell == Shell::Powershell {
+        let (env, values) = powershell_environment(base, proxy_port, container, cert_path, &fakes)?;
+        (env, Some(values))
+    } else {
+        (
+            guest_environment(base, proxy_port, container, cert_path, &fakes)?,
+            None,
+        )
+    };
+    let env_path =
+        cert_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(if shell == Shell::Sh {
+                "friendzone-env.sh"
+            } else {
+                "friendzone-env.ps1"
+            });
+    crate::storage::atomic_write(&env_path, env.as_bytes())?;
     target.adopt(&env_path);
     // Announce this guest so a join request appears in the UI now.
     let approved = client
-        .get(format!(
-            "{base}/bootstrap/hello?container={}",
-            urlencoding_min(container)
-        ))
+        .get(format!("{base}/bootstrap/hello"))
+        .query(&[("container", container)])
         .send()
         .await
         .ok();
@@ -264,9 +465,60 @@ async fn fetch_guest_env(
     println!();
     println!("Copy-paste to activate now, and add to the agent's shell profile:");
     println!();
-    println!("  . {}", env_path.display());
+    let mut activation = env_path.clone();
+    if persist_profile {
+        if shell == Shell::Sh {
+            let home = target.home();
+            let zdotdir = std::env::var_os("ZDOTDIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.clone());
+            activation = crate::guest_profile::persist(
+                &home,
+                &zdotdir,
+                &env_path,
+                std::env::var("BASH_ENV").ok().as_deref(),
+            )?;
+            println!(
+                "Saved idempotent guest profile hooks (.profile, .bashrc, .zshenv and existing bash login files). Backups use .friendzone-backup."
+            );
+        } else {
+            let config = env_path.parent().context("env file has no parent")?;
+            let values_path = config.join("user-environment.json");
+            let script = config.join("persist-environment.ps1");
+            crate::storage::atomic_write(&values_path, &serde_json::to_vec_pretty(&user_values)?)?;
+            crate::storage::atomic_write(
+                &script,
+                include_bytes!("bootstrap/persist-environment.ps1"),
+            )?;
+            let status = Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-File"])
+                .arg(&script)
+                .arg("-ValuesPath")
+                .arg(&values_path)
+                .arg("-BackupPath")
+                .arg(config.join("user-environment-backup.json"))
+                .status()
+                .context("persist guest user environment")?;
+            if !status.success() {
+                anyhow::bail!(
+                    "user environment persistence failed; inspect backup and error before retrying"
+                );
+            }
+            println!(
+                "Saved Windows USER environment (not machine). Sign out/in for fresh launchers; restart existing agents."
+            );
+        }
+    }
+    println!(
+        "  . {}",
+        if shell == Shell::Sh {
+            shell_quote(&activation.to_string_lossy())
+        } else {
+            powershell_quote(&activation.to_string_lossy())
+        }
+    );
     println!();
-    if let Some(fake_key) = env_export_value(&env, "CLINE_API_KEY") {
+    if let Some(fake_key) = env_export_value(&fakes, "CLINE_API_KEY") {
         // The agent runs as the invoking user; its Cline reads that
         // user's ~/.cline, not root's.
         let home = target.home();
@@ -300,16 +552,6 @@ async fn fetch_guest_env(
         }
     }
     Ok(())
-}
-
-/// Percent-encodes the few characters plausible in a container name.
-fn urlencoding_min(value: &str) -> String {
-    value
-        .replace('%', "%25")
-        .replace(' ', "%20")
-        .replace('&', "%26")
-        .replace('#', "%23")
-        .replace('?', "%3F")
 }
 
 /// Extracts `export NAME=value` from the fetched env file.
@@ -433,6 +675,72 @@ fn install_ca(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_user_persistence_is_validated_with_mock_not_host_registry() {
+        let dir = std::env::temp_dir().join(format!("fz-ps-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let (env, _) = powershell_environment(
+            "http://192.0.2.1:9082",
+            9080,
+            "guest",
+            &dir.join("CA with space.pem"),
+            "export CLINE_API_KEY=fake'$(not-a-command)\n",
+        )
+        .unwrap();
+        let env_path = dir.join("env.ps1");
+        fs::write(&env_path, env).unwrap();
+        let script_path = dir.join("bootstrap.ps1");
+        fs::write(
+            &script_path,
+            crate::bootstrap::script(
+                Shell::Powershell,
+                "http://192.0.2.1:9082",
+                "guest'$(not-a-command)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let command_path = dir.join("command.ps1");
+        fs::write(
+            &command_path,
+            crate::bootstrap::commands("http://192.0.2.1:9082", "guest").unwrap()["powershell"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let inline = format!(
+            "& ([scriptblock]::Create([IO.File]::ReadAllText({}))) -Implementation {} -TemporaryDirectory {} -EnvironmentFile {} -BootstrapScript {} -BootstrapCommand {}",
+            powershell_quote(
+                &root
+                    .join("tests/fixtures/test_user_environment.ps1")
+                    .to_string_lossy()
+            ),
+            powershell_quote(
+                &root
+                    .join("src/bootstrap/persist-environment.ps1")
+                    .to_string_lossy()
+            ),
+            powershell_quote(&dir.to_string_lossy()),
+            powershell_quote(&env_path.to_string_lossy()),
+            powershell_quote(&script_path.to_string_lossy()),
+            powershell_quote(&command_path.to_string_lossy())
+        );
+        let output = Command::new("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &inline])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("PASS: mocked"));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn source_guest_env_preserves_exclusions_and_is_idempotent() {

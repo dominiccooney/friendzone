@@ -188,6 +188,17 @@ security boundaries and cancellation details.
 
 ## 3. Container: bootstrap
 
+**Preferred: host UI → Settings → Set up a guest.** Choose the guest-reachable
+host/name, inspect the script, copy either the Linux (sh/bash/zsh) or Windows
+PowerShell command, and run it **in the guest**, with guest Cline stopped.
+This downloads the exact matching build and runs setup with persistent guest
+configuration. Linux adds profile hooks once; Windows sets user environment,
+not machine environment. No sudo, firewall or system trust-store changes.
+Start a fresh shell or use the printed activation command; on Windows sign
+out/in to refresh GUI launchers. [Full behavior and rollback](GUEST-BOOTSTRAP.md).
+
+The manual path below is useful when no matching guest build is hosted yet.
+
 Cross-OS note: `/bootstrap/fz` is the *host's* binary. On a Linux guest
 of a Windows host, build `fz` in the guest instead (needs rust +
 build-essential):
@@ -261,7 +272,10 @@ This is a client-routing fix, not access control: a guest can override it.
 Keep the host-enforced network restrictions in place, and do not expose
 host-local services through the proxy expecting `NO_PROXY` to protect them.
 
-Add the environment-file source line to the agent's shell profile so it persists. The
+Add the environment-file source line to the agent's shell profile so it persists.
+The served scripts automate that step, or run setup as the normal guest user with
+`--persist-profile`. Windows defaults to `friendzone-env.ps1` and persists
+user environment; `-NoProfile` processes inherit it from fresh launchers. The
 container identity defaults to the guest hostname; pass
 `--container reviewer` to `fz setup` to match a name you added in the
 UI. Then check everything:

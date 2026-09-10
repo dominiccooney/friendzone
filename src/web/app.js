@@ -6,6 +6,7 @@ let mcpConnectData = null, mcpHostInitialized = false, mcpConnectGeneration = 0,
 const mcpOAuthPolls = new Map();
 let reviewingMcp = null;
 let activeMcpOAuth = null;
+let setupInitialized = false, setupGeneration = 0;
 let activeReview = null, reviewGeneration = 0, pendingSignature = "";
 let commentPermissionGeneration = 0, commentPermissionSignature = "";
 let notificationTimer = null, newNotificationIds = new Set();
@@ -357,6 +358,12 @@ async function renderSettings() {
     fetch("/api/guest-env").then(r=>r.text()),
   ]);
   mcpConnectData = mcp;
+  if (!setupInitialized) {
+    $("#setup-host").value = mcp.guest_host || "";
+    setupInitialized = true;
+  }
+  $("#setup-address").textContent = `Scripts use bootstrap port ${mcp.guest_port}, not the UI/proxy port. ${mcp.guest_address_warning || "Run these commands in the guest user account."}`;
+  loadGuestSetup();
   if (!mcpHostInitialized) {
     $("#mcp-connect-host").value = mcp.guest_host || "";
     mcpHostInitialized = true;
@@ -643,6 +650,33 @@ async function copyMcpText(input, status, successMessage, isCurrent) {
     status.textContent = "Clipboard access unavailable. Text selected; press Ctrl+C / Cmd+C to copy.";
   }
 }
+
+async function loadGuestSetup() {
+  const generation=++setupGeneration;
+  for (const shell of ["sh","powershell"]) {
+    $("#setup-"+shell).value=""; $("#setup-copy-"+shell).disabled=true; $("#setup-view-"+shell).hidden=true;
+  }
+  const host=$("#setup-host").value.trim();
+  if (!host) { $("#setup-status").textContent="Enter the broker host IP or DNS name reachable from the guest."; return; }
+  $("#setup-status").textContent="Preparing guest setup commands…";
+  const query=new URLSearchParams({host,container:$("#setup-container").value.trim()});
+  try {
+    const response=await fetch(`/api/bootstrap/commands?${query}`);
+    if (!response.ok) throw new Error(await response.text());
+    const commands=await response.json();
+    if (generation!==setupGeneration) return;
+    for (const shell of ["sh","powershell"]) {
+      $("#setup-"+shell).value=commands[shell]; $("#setup-copy-"+shell).disabled=false;
+      $("#setup-view-"+shell).href=commands[shell+"_url"]; $("#setup-view-"+shell).hidden=false;
+    }
+    $("#setup-status").textContent=`Ready for ${commands.broker}. Downloaded scripts are executed only after a complete successful download. Run in the guest, not the host.`;
+  } catch(error) { if(generation===setupGeneration) $("#setup-status").textContent=String(error); }
+}
+for (const id of ["setup-host","setup-container"]) $("#"+id).addEventListener("input",loadGuestSetup);
+for (const shell of ["sh","powershell"]) $("#setup-copy-"+shell).onclick=()=>{
+  const generation=setupGeneration;
+  return copyMcpText($("#setup-"+shell),$("#setup-status"),"Copied. Run only in the guest user account, with Cline stopped.",()=>generation===setupGeneration);
+};
 
 let clineLink = null, validatedMcp = null;
 function mcpDraft() {

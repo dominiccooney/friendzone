@@ -38,6 +38,10 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
       response.writeHead(200, { "content-type": "text/event-stream" });
       response.write("data: " + JSON.stringify(state) + "\n\n"); return;
     }
+    if (route === "/api/bootstrap/commands") {
+      response.writeHead(200,{"content-type":"application/json"});
+      response.end(JSON.stringify({broker:"http://172.31.208.1:8082",sh:"(curl --noproxy '*' 'http://172.31.208.1:8082/bootstrap/setup?shell=sh&broker="+"x".repeat(350)+"')",powershell:"& { "+"PowerShell command ".repeat(60)+"}",sh_url:"http://172.31.208.1:8082/bootstrap/setup?shell=sh",powershell_url:"http://172.31.208.1:8082/bootstrap/setup?shell=powershell"}));return;
+    }
     if (route === "/api/requests/request-id/github-target" || route === "/api/requests/request-id/comment-permission") {
       let body="";request.on("data",chunk=>body+=chunk);request.on("end",()=>{
         permissionActions.push({route,headers:request.headers,body:JSON.parse(body)});
@@ -127,6 +131,9 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
       assert.equal(layout.copyText, "Copy URL");
       assert.ok(layout.copyLeft >= 0 && layout.copyRight <= width, JSON.stringify(layout));
       assert.ok(layout.pageWidth <= width + 1, JSON.stringify(layout));
+      const setup=await evaluate(`(() => {const panel=document.querySelector('#guest-setup'), command=document.querySelector('#setup-sh');return {width:panel.clientWidth,scroll:panel.scrollWidth,value:command.value,copyDisabled:document.querySelector('#setup-copy-sh').disabled,inspect:document.querySelector('#setup-view-sh').href};})()`);
+      assert.ok(setup.scroll<=setup.width+1,JSON.stringify(setup));
+      assert.match(setup.value,/--noproxy/);assert.equal(setup.copyDisabled,false);assert.match(setup.inspect,/bootstrap\/setup\?shell=sh/);
       if (process.env.FZ_SCREENSHOT_DIR) {
         fs.mkdirSync(process.env.FZ_SCREENSHOT_DIR, { recursive: true });
         const shot = await send("Page.captureScreenshot", { format: "png", captureBeyondViewport: false });

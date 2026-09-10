@@ -82,6 +82,19 @@ changing the data directory also starts a separate policy store.
 
 ## Set up a guest
 
+**Recommended:** use **Settings → Set up a guest**. Copy the Linux shell or
+Windows PowerShell command and execute it **in the guest user account**, not
+on the host. It downloads the exact platform/architecture binary, invokes
+setup, and persists user configuration: idempotent shell profile hooks on
+Linux, user-scoped environment variables on Windows. No firewall or system
+trust-store changes. See [GUEST-BOOTSTRAP.md](GUEST-BOOTSTRAP.md) for script
+inspection, non-interactive-shell behavior, missing builds, rollback, and
+Windows execution-policy requirements. Stop guest Cline before running it.
+
+Manual binary setup remains available below. Add `--persist-profile` as the
+normal guest user (without sudo) for persistence. `--shell sh` and
+`--shell powershell` explicitly choose output; Windows defaults to PowerShell.
+
 The broker exposes its own binary at `http://HOST_IP:8082/bootstrap/fz`
 — right only when the guest matches the host's OS/arch.
 

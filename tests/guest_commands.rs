@@ -173,6 +173,8 @@ async fn setup_fetches_all_bootstrap_endpoints_directly_with_proxy_env_set() {
             &broker.url(),
             "--container",
             "scratch-kali",
+            "--shell",
+            "sh",
             "--output",
             cert_path.to_str().unwrap(),
         ],
@@ -188,5 +190,5 @@ async fn setup_fetches_all_bootstrap_endpoints_directly_with_proxy_env_set() {
     let env = std::fs::read_to_string(dir.0.join("friendzone-env.sh")).unwrap();
     assert!(env.contains("export HTTP_PROXY='http://scratch-kali:x@127.0.0.1:8080'"));
     assert!(env.contains("export FZ_HOST='127.0.0.1'"));
-    assert!(env.contains("export ANTHROPIC_API_KEY=fz-test-fake"));
+    assert!(env.contains("export ANTHROPIC_API_KEY='fz-test-fake'"));
 }
