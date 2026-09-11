@@ -225,7 +225,7 @@ test("review outcomes stay visible, survive reopening and never enable resolved 
   f.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)}]`);
   const opening=f.run('openRequestReview("request-id")');
   f.calls.at(-1).resolve({ok:true,json:async()=>pendingRequest}); await opening;
-  for (const [status,code,label] of [["approved",null,"Approved"],["sending",null,"Sending"],["response_received",201,"Response received · HTTP 201"],["graphql_error",200,"GraphQL error · HTTP 200"],["denied",null,"Denied"],["expired",null,"Expired"],["cancelled",null,"Cancelled"],["blocked",null,"Blocked"],["upstream_error",502,"Upstream error · HTTP 502"],["unknown",null,"Outcome unknown"]]) {
+  for (const [status,code,label] of [["approved",null,"Approved"],["sending",null,"Sending"],["response_received",201,"Response received · HTTP 201"],["graphql_error",200,"GraphQL error · HTTP 200"],["denied",null,"Denied"],["expired",null,"Expired"],["cancelled",null,"Cancelled"],["blocked",null,"Blocked"],["upstream_error",502,"Upstream error · HTTP 502"]]) {
     const summary={...pendingRequest,status,http_status:code,outcome:"Exact outcome <script>",updated_at:"2099-01-01T00:00:00Z"};
     f.run(`snapshot.pending_requests=[];snapshot.recent_reviews=[${JSON.stringify(summary)}];renderPendingRequests()`);
     assert.equal(element("request-review-badge").textContent,label);
@@ -246,6 +246,50 @@ test("review outcomes stay visible, survive reopening and never enable resolved 
   f.run('snapshot.pending_requests=[];snapshot.recent_reviews=[];renderPendingRequests()');
   assert.equal(element("request-review-badge").textContent,"Not retained");
   assert.doesNotMatch(element("request-review-outcome").textContent,/Check the log/);
+});
+
+test("one-shot decisions need one click, never a confirmation dialog or automatic retry", async () => {
+  for (const action of ["approve", "deny"]) {
+    const f=fixture(), element=id=>f.sandbox.document.querySelector("#"+id);
+    f.sandbox.confirm=()=>{assert.fail("one-shot approval must not open a dialog");};
+    const opening=f.run('openRequestReview("request-id")');
+    f.calls.at(-1).resolve({ok:true,json:async()=>pendingRequest});await opening;
+    const submitting=element(`request-${action}`).onclick();
+    const call=f.calls.at(-1);
+    assert.equal(call.url,"/api/requests/request-id/decision");
+    assert.deepEqual(JSON.parse(call.options.body),{fingerprint:"exact-hash",decision:action});
+    assert.equal(call.options.headers["x-friendzone-review"],"1");
+    assert.equal(element("request-approve").disabled,true);
+    assert.equal(element("request-deny").disabled,true);
+    const count=f.calls.length;
+    await element(`request-${action}`).onclick();assert.equal(f.calls.length,count);
+    call.resolve({ok:false,text:async()=>"request already cancelled"});await submitting;
+    assert.equal(f.calls.length,count,"failed decision must not be replayed automatically");
+    assert.match(element("request-review-status").textContent,/cancelled/);
+    f.run(`applyReviewOutcome({status:"cancelled",outcome:"Not sent."})`);
+    await element(`request-${action}`).onclick();assert.equal(f.calls.length,count);
+  }
+});
+
+test("uncertain responses describe observed facts consistently in list and detail", async () => {
+  const f=fixture(), element=id=>f.sandbox.document.querySelector("#"+id);
+  const opening=f.run('openRequestReview("request-id")');
+  f.calls.at(-1).resolve({ok:true,json:async()=>pendingRequest});await opening;
+  for (const [code,label,message] of [[null,"No response received",/did not receive a reply.*may have completed/], [200,"Response incomplete · HTTP 200",/server replied.*complete response.*does not mean.*failed/]]) {
+    const unknown={...pendingRequest,status:"unknown",http_status:code,outcome:"HTTP response was not fully observed. Check upstream before retrying.",updated_at:"2099-01-01T00:00:00Z"};
+    f.run(`snapshot.pending_requests=[];snapshot.recent_reviews=[${JSON.stringify(unknown)}];renderPendingRequests()`);
+    assert.equal(element("request-review-badge").textContent,label);
+    const explanation=element("request-review-outcome").textContent;
+    assert.match(explanation,message);
+    assert.ok(element("recent-reviews").innerHTML.includes(label));
+    assert.ok(element("recent-reviews").innerHTML.includes(explanation));
+    assert.doesNotMatch(element("recent-reviews").innerHTML,/Outcome unknown|stale retry/);
+    assert.equal(element("request-review-actions").hidden,true);
+    assert.equal(f.run("activeReview.status"),"unknown","display must not fabricate a successful outcome");
+    const reopening=f.run('openRequestReview("request-id")');
+    f.calls.at(-1).resolve({ok:true,json:async()=>unknown});await reopening;
+    assert.equal(element("request-review-badge").textContent,label);
+  }
 });
 
 test("newer SSE outcome wins over slow detail and decision responses", async () => {

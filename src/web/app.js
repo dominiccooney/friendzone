@@ -192,15 +192,25 @@ const REVIEW_STATUSES = {
   response_received:["Response received","response"], denied:["Denied","blocked"], expired:["Expired","muted"],
   graphql_error:["GraphQL error","blocked"],
   cancelled:["Cancelled","muted"], blocked:["Blocked","blocked"], upstream_error:["Upstream error","blocked"],
-  unknown:["Outcome unknown","blocked"], unavailable:["Not retained","muted"],
+  unknown:["No response received","blocked"], unavailable:["Not retained","muted"],
 };
 function reviewStatus(request) {
   const [label, color] = REVIEW_STATUSES[request.status || "pending"] || REVIEW_STATUSES.unavailable;
-  return {label:label + (request.http_status ? ` · HTTP ${request.http_status}` : ""), color:request.http_status>=400?"blocked":color};
+  const observed = request.status === "unknown" && request.http_status ? "Response incomplete" : label;
+  return {label:observed + (request.http_status ? ` · HTTP ${request.http_status}` : ""), color:request.http_status>=400?"blocked":color};
+}
+function reviewOutcomeText(request) {
+  // Explain the evidence, including older brokers' retained `unknown` records.
+  // Receiving HTTP headers is not the same as observing a complete response.
+  if (request.status === "unknown") return request.http_status
+    ? "The server replied, but Friendzone did not observe the complete response. This does not mean the operation failed."
+    : "Friendzone did not receive a reply after approval. The operation may have completed.";
+  return request.outcome || "";
 }
 function reviewRow(request) {
   const status = reviewStatus(request), pending = !request.status || request.status === "pending";
-  return `<article class="pending-request"><div class="request-row-heading"><span class="request-badge ${status.color}">${esc(status.label)}</span><strong>${esc(request.container)}</strong><span class="meta">${pending?`expires ${esc(displayTime(request.expires_at))}`:esc(displayTime(request.updated_at || request.created_at))}</span><button type="button" data-review="${esc(request.id)}">${pending?"Review":"Details"}</button></div><div class="request-destination"><span class="method">${esc(request.method)}</span> <code>${esc(request.url)}</code></div>${request.outcome?`<p class="meta">${esc(request.outcome)}</p>`:""}</article>`;
+  const outcome = reviewOutcomeText(request);
+  return `<article class="pending-request"><div class="request-row-heading"><span class="request-badge ${status.color}">${esc(status.label)}</span><strong>${esc(request.container)}</strong><span class="meta">${pending?`expires ${esc(displayTime(request.expires_at))}`:esc(displayTime(request.updated_at || request.created_at))}</span><button type="button" data-review="${esc(request.id)}">${pending?"Review":"Details"}</button></div><div class="request-destination"><span class="method">${esc(request.method)}</span> <code>${esc(request.url)}</code></div>${outcome?`<p class="meta">${esc(outcome)}</p>`:""}</article>`;
 }
 function applyReviewOutcome(summary) {
   if (!activeReview) return;
@@ -213,7 +223,7 @@ function applyReviewOutcome(summary) {
   const status = reviewStatus(activeReview);
   $("#request-review-badge").textContent = status.label;
   $("#request-review-badge").className = `request-badge ${status.color}`;
-  $("#request-review-outcome").textContent = activeReview.outcome || `Waiting for your decision · expires ${displayTime(activeReview.expires_at)}`;
+  $("#request-review-outcome").textContent = reviewOutcomeText(activeReview) || (waiting ? "Waiting for your decision." : "");
   $("#request-review-actions").hidden = !waiting;
   $("#request-approve").disabled = !waiting || decisionInFlight === activeReview.id;
   $("#request-deny").disabled = !waiting || decisionInFlight === activeReview.id;
@@ -402,7 +412,8 @@ async function decideRequest(decision) {
   if (!activeReview || (activeReview.status && activeReview.status !== "pending") || decisionInFlight === activeReview.id) return;
   const reviewed = activeReview;
   const generation = reviewGeneration;
-  if (decision === "approve" && !confirm("Send this request once? Don't approve a stale retry of a write.")) return;
+  // Approve once is the explicit user confirmation. The broker atomically
+  // checks that this exact request is still pending; no second dialog/replay.
   decisionInFlight = reviewed.id;
   $("#request-approve").disabled = true; $("#request-deny").disabled = true;
   try {

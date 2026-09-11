@@ -156,6 +156,11 @@ payload, then **Approve once** or **Deny**. Approval releases only that
 immutable request through the normal escrow path, not a rule for future
 requests. The log shows pending, denied, approved and upstream status.
 
+**Approve once is the confirmation**: one click submits the loaded request's
+fingerprint, without another dialog. Duplicate clicks are suppressed and the
+broker rejects requests that have already been decided, cancelled or expired.
+No failed decision or upstream request is automatically replayed by the UI.
+
 `POST https://api.github.com/graphql` now has a **GraphQL operation** viewer:
 selected query/mutation/subscription, actual fields behind aliases, expanded
 fragments, resolved arguments, variable defaults, formatted document and
@@ -228,7 +233,9 @@ observed as they stream to the guest; a nonempty `errors` array produces a
 GraphQL error badge without copying upstream payloads into history. Larger,
 encoded or unparseable responses remain HTTP-only outcomes. If the handler
 ends after admission without a response,
-the outcome is Unknown, not a promise that retrying is safe. Recent is
+the badge says **No response received**. If headers arrived but the response
+was not fully observed, it says **Response incomplete · HTTP …**. These report
+what the proxy observed, not that the upstream operation failed. Recent is
 read-only: no replay, reapproval or new permissions from old requests. Reload
 preserves this server-side history; broker restart clears it. Bodies remain
 host-only and are never included in SSE or desktop notifications.

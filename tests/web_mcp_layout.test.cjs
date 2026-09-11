@@ -324,7 +324,7 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
       const layout=await evaluate(`(() => {document.querySelector('#request-raw').open=true;const body=document.querySelector('#request-review-body'), button=document.querySelector('#request-approve');return {page:document.documentElement.scrollWidth,body:body.clientWidth,scroll:body.scrollWidth,button:button.getBoundingClientRect().right,disabled:button.disabled};})()`);
       assert.ok(layout.page<=width+1,JSON.stringify(layout)); assert.ok(layout.scroll<=layout.body+1,JSON.stringify(layout)); assert.ok(layout.button<=width,JSON.stringify(layout)); assert.equal(layout.disabled,false);
     }
-    await evaluate("window.confirm=()=>true; document.querySelector('#request-approve').click()");
+    await evaluate("window.confirm=()=>{throw new Error('Unexpected approval dialog')}; document.querySelector('#request-approve').click(); document.querySelector('#request-approve').click()");
     for(let i=0;i<100 && !decisions.length;i++) await delay(25);
     assert.deepEqual(decisions.map(d=>d.body),[{fingerprint:"immutable-hash",decision:"approve"}]);
     assert.equal(decisions[0].headers["x-friendzone-review"],"1");
@@ -359,6 +359,15 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
         await send("Emulation.setDeviceMetricsOverride",{width,height:1000,deviceScaleFactor:1,mobile:false});
         assert.ok(await evaluate(`document.documentElement.scrollWidth <= ${width+1}`));
       }
+    }
+    for(const code of [null,200]) {
+      const uncertain={...detail,status:"unknown",http_status:code,outcome:"HTTP response was not fully observed.",updated_at:"2099-02-01T00:00:00Z"};
+      await evaluate(`activeReview=${JSON.stringify(uncertain)};snapshot.pending_requests=[];snapshot.recent_reviews=[activeReview];renderPendingRequests()`);
+      const expected=code?"Response incomplete · HTTP 200":"No response received";
+      assert.equal(await evaluate("document.querySelector('#request-review-badge').textContent"),expected);
+      assert.equal(await evaluate("document.querySelector('#recent-reviews .request-badge').textContent"),expected);
+      assert.equal(await evaluate("document.querySelector('#request-review-actions').hidden"),true);
+      assert.equal(await evaluate("document.querySelector('#request-review-outcome').textContent===document.querySelector('#recent-reviews .pending-request>p').textContent"),true);
     }
     const now=Date.now();
     const draft={...detail,url:"https://api.github.com/graphql",status:"pending",outcome:null,http_status:null,created_at:new Date(now-25000).toISOString(),updated_at:new Date(now-25000).toISOString(),expires_at:new Date(now+95000).toISOString(),graphql:{status:"parsed",analysis:{...detail.graphql.analysis,operation_name:null,effective_variables:[{name:"id",declared_type:"ID!",source:"supplied",value:{kind:"string",value:"PR_fixture_opaque"}}],
