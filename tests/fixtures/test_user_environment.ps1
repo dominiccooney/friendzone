@@ -54,8 +54,17 @@ $provider=Join-Path $homeDir '.cline/data/settings/providers.json'
 [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($provider)) | Out-Null
 [IO.File]::WriteAllText($provider,'{"version":1,"lastUsedProvider":"other","modes":{},"providers":{"cline":{"settings":{"provider":"cline","model":"keep","auth":{"refreshToken":"stale"}}},"other":{"settings":{"key":"preserved"}}}}')
 $data=[pscustomobject]@{broker='http://192.0.2.1:9082';container='guest';proxy_port=9080;ca='CERTIFICATE';fakes=[pscustomobject]@{CLINE_API_KEY="fake'`$(not-a-command)"}}
+$repoRoot=Split-Path (Split-Path (Split-Path $Implementation))
+$data | Add-Member -NotePropertyName plugin -NotePropertyValue ([Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $repoRoot 'src/plugin/friendzone.js'))))
 $EnvironmentFile=Invoke-FzConfigure $data $homeDir $configDir
 $EnvironmentFile=Invoke-FzConfigure $data $homeDir $configDir
+$plugin=Join-Path $homeDir '.cline/plugins/friendzone.js'
+if(-not ([IO.File]::ReadAllText($plugin).Contains('steer_message'))){throw 'plugin not installed'}
+$pluginConfig=Get-Content -Raw -LiteralPath (Join-Path $homeDir '.cline/friendzone.json') | ConvertFrom-Json
+if($pluginConfig.broker -ne $data.broker -or $pluginConfig.container -ne 'guest'){throw 'wrong plugin configuration'}
+$customCline=Join-Path $TemporaryDirectory 'custom-cline'
+$null=Invoke-FzConfigure $data $homeDir $configDir $customCline
+if(-not (Test-Path -LiteralPath (Join-Path $customCline 'plugins/friendzone.js'))){throw 'custom Cline path ignored'}
 $root=Get-Content -Raw -Encoding UTF8 -LiteralPath $provider | ConvertFrom-Json
 if($root.providers.cline.settings.model -ne 'keep' -or $root.providers.cline.settings.auth -or $root.providers.other.settings.key -ne 'preserved' -or $root.lastUsedProvider -ne 'other'){throw 'Provider merge failed'}
 $beforeEnv=[IO.File]::ReadAllText($EnvironmentFile)

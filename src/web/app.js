@@ -233,6 +233,9 @@ function applyReviewOutcome(summary) {
 let reviewClock = null;
 function reviewTiming(request, now = Date.now()) {
   const created = Date.parse(request.created_at), expires = Date.parse(request.expires_at);
+  if (request.asynchronous) return (request.status || "pending") === "pending"
+    ? `Async job · review by ${new Date(request.expires_at).toLocaleString()}. Client does not need to wait.`
+    : "Async job · result available to the submitting Cline session.";
   if ((request.status || "pending") === "pending") {
     if (!Number.isFinite(expires)) return "Client may stop waiting before the broker deadline.";
     const remaining = Math.max(0, Math.ceil((expires - now) / 1000));

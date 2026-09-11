@@ -21,7 +21,7 @@ pub const MAX_PER_GUEST: usize = 8;
 pub const WAIT_LIMIT: Duration = Duration::from_secs(120);
 pub const HISTORY_LIMIT: usize = 100;
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Pending,
@@ -58,6 +58,8 @@ pub struct Summary {
     pub updated_at: DateTime<Utc>,
     pub http_status: Option<u16>,
     pub outcome: Option<String>,
+    /// Durable plugin job vs a waiting proxy connection.
+    pub asynchronous: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -83,11 +85,20 @@ pub struct Detail {
 
 impl Detail {
     pub fn from_request(container: &str, request: &Request<Body>, bytes: &[u8]) -> Result<Self> {
+        Self::from_request_with_limit(container, request, bytes, MAX_BODY)
+    }
+
+    pub fn from_request_with_limit(
+        container: &str,
+        request: &Request<Body>,
+        bytes: &[u8],
+        max_body: usize,
+    ) -> Result<Self> {
         if request.uri().to_string().len() > 8192 {
             bail!("request URL exceeds the review limit");
         }
-        if bytes.len() > MAX_BODY {
-            bail!("request body exceeds the 64 KiB review limit");
+        if bytes.len() > max_body {
+            bail!("request body exceeds the review limit ({max_body} bytes)");
         }
         if request.headers().contains_key("content-encoding") {
             bail!("compressed/encoded writes cannot be safely reviewed in this inbox");
@@ -169,7 +180,7 @@ impl Detail {
             if request.uri().query().is_some() {
                 crate::graphql::Review::Unavailable { message: "URL query parameters may change GraphQL operation selection; structured review is unavailable. Inspect the complete URL and raw body.".into() }
             } else {
-                let (read_only, view) = crate::graphql::inspect(body, request.headers().get("content-type").and_then(|v|v.to_str().ok()).unwrap_or(""));
+                let (read_only, view) = crate::graphql::inspect_with_limit(body, request.headers().get("content-type").and_then(|v|v.to_str().ok()).unwrap_or(""), max_body);
                 graphql_read = read_only && crate::github::read_transport(request);
                 view
             }
@@ -194,6 +205,7 @@ impl Detail {
                 updated_at: created_at,
                 http_status: None,
                 outcome: None,
+                asynchronous: false,
             },
             headers,
             body: body.into(),

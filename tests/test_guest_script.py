@@ -26,6 +26,7 @@ class GuestScriptTests(unittest.TestCase):
         self.home = Path(self.temp.name)
         self.config = self.home / "config"
         self.data = dict(broker="http://192.0.2.1:9082", container="guest", proxy_port=9080,
+                         plugin=base64.b64encode((SOURCE.parents[1] / "plugin/friendzone.js").read_bytes()).decode(),
                          ca="CERTIFICATE", fakes={"CLINE_API_KEY": "fake'$(bad)", "OTHER_KEY": "other"})
 
     def apply(self, env=None):
@@ -44,6 +45,27 @@ class GuestScriptTests(unittest.TestCase):
         self.assertEqual((self.home / ".profile.friendzone-backup").read_text(), "# original\n")
         self.assertIn("/old hook.sh", (self.config / "bash-env.sh").read_text())
         self.assertIn(configure.MARKER, (self.home / "zsh/.zshenv").read_text())
+
+    def test_plugin_install_is_idempotent_custom_home_and_preserves_other_plugins(self):
+        cline = self.home / "custom-cline"
+        (cline / "plugins").mkdir(parents=True)
+        other = cline / "plugins/other.js"
+        other.write_text("other plugin")
+        self.apply({"CLINE_DIR": str(cline)})
+        plugin = cline / "plugins/friendzone.js"
+        original = plugin.read_bytes()
+        self.apply({"CLINE_DIR": str(cline)})
+        self.assertEqual(plugin.read_bytes(), original)
+        self.assertEqual(other.read_text(), "other plugin")
+        settings = json.loads((cline / "friendzone.json").read_text())
+        self.assertEqual(settings["container"], "guest")
+        self.assertEqual(settings["broker"], self.data["broker"])
+        plugin.write_text("// manually owned plugin")
+        before = (self.config / "friendzone-env.sh").read_bytes()
+        self.data["proxy_port"] = 9999
+        with self.assertRaises(ValueError):
+            self.apply({"CLINE_DIR": str(cline)})
+        self.assertEqual((self.config / "friendzone-env.sh").read_bytes(), before)
 
     def test_provider_merge_keeps_model_other_credentials_and_rejects_invalid_before_writes(self):
         provider = self.home / ".cline/data/settings/providers.json"

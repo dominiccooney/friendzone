@@ -54,7 +54,7 @@
         </section>
         <p id="request-review-status" role="status"></p>
         <details id="recent-reviews-panel" open><summary>Recent <span id="recent-count" class="request-count">0</span></summary><div id="recent-reviews"></div></details>
-        <details class="review-help"><summary>About approvals</summary><p>Approve once sends the exact request. Pending requests expire after 2 minutes. Deny a timed-out request before retrying to avoid duplicate writes.</p><p>Recent keeps the last 100 reviews in this broker session. A restart clears this history and never replays requests. Credential headers are redacted.</p></details>
+        <details class="review-help"><summary>About approvals</summary><p>Approve once sends the exact request. Proxy calls wait up to 2 minutes. Async plugin jobs allow 24 hours for review without a waiting client.</p><p>Recent includes the last 100 proxy reviews for this broker session and durable plugin jobs. Restart never replays interrupted writes. Credential headers are redacted.</p></details>
       </section>
     </section>
     <section id="log-view" class="view">
@@ -192,7 +192,7 @@
           <div class="mcp-card-actions"><button id="setup-copy-sh" type="button" disabled>Copy download command</button><a id="setup-view-sh" target="_blank" rel="noopener noreferrer" hidden>View script</a></div>
           <h3>2. Run the downloaded script</h3>
           <pre>sh ./friendzone-setup.sh</pre>
-          <p class="meta">Requires Python 3. The script adds profile hooks for bash and zsh and prints an activation command for this terminal.</p>
+          <p class="meta">Requires Python 3. Installs the Cline plugin, adds profile hooks for bash and zsh, and prints an activation command.</p>
         </div>
         <div id="setup-platform-powershell" hidden>
           <h3>1. Download in guest PowerShell</h3>
@@ -200,7 +200,7 @@
           <div class="mcp-card-actions"><button id="setup-copy-powershell" type="button" disabled>Copy download command</button><a id="setup-view-powershell" target="_blank" rel="noopener noreferrer" hidden>View script</a></div>
           <h3>2. Run the downloaded script</h3>
           <pre>&amp; .\friendzone-setup.ps1</pre>
-          <p class="meta">Requires curl.exe and PowerShell 5.1 or 7. The script saves user environment variables and activates this terminal. Sign out/in to refresh other Windows launchers.</p>
+          <p class="meta">Requires curl.exe and PowerShell 5.1 or 7. Installs the Cline plugin and saves user environment variables. Sign out/in to refresh other Windows launchers.</p>
         </div>
         <h3>3. Activate and approve</h3>
         <p>Follow the script's activation instructions, then restart guest Cline so it inherits the new environment.</p>
@@ -210,6 +210,7 @@
           <p>The script saves the broker CA, proxy variables, loopback exclusions and fake provider keys in the guest account. When Cline is configured, it updates that guest's provider file; close Cline first so it cannot overwrite the changes, then restart it after activation.</p>
           <p>Linux profile hooks are added once, with backups. Windows writes user—not machine—environment values and records previous values for rollback. Non-interactive bash inherits BASH_ENV from an activated parent; zsh reads .zshenv. Plain sh and services need an activated launcher.</p>
           <p>The script does not change firewall rules or install the CA in a system trust store. It uses runtime CA variables instead. Bootstrap trusts the host/network on first download; inspect the script if unsure. Windows execution policy is not changed.</p>
+          <p>The Friendzone plugin adds async GitHub GraphQL tools. Requests return immediately; completion updates steer the originating Cline session. Requires a Cline build with the plugin host bridge. Restart guest Cline after setup; other plugins are preserved.</p>
         </details>
         <details id="guest-preapprove"><summary>Advanced: preapprove a name</summary>
           <p>Normally, run setup and approve the guest's observed IP in Inbox. Preapproval allows this name from any IP before it connects; it does not configure the guest.</p>

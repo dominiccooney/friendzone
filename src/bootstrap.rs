@@ -101,6 +101,7 @@ pub fn script(
         }
     }
     let payload = serde_json::json!({"broker":broker,"container":container,"ca":ca,"proxy_port":proxy_port,"fakes":fakes,
+        "plugin":STANDARD.encode(include_bytes!("plugin/friendzone.js")),
         "persistence":STANDARD.encode(include_bytes!("bootstrap/persist-environment.ps1"))});
     let encoded = STANDARD.encode(serde_json::to_vec(&payload)?);
     Ok(match shell {

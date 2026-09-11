@@ -164,6 +164,18 @@ test("review timing distinguishes broker expiry from early cancellation without 
   assert.equal(f.run(`reviewTiming({status:"cancelled",created_at:"${created}",updated_at:"2026-09-10T00:00:00Z"})`),"");
 });
 
+test("async jobs keep normal approval controls without claiming a live waiting client", async () => {
+  const f=fixture();
+  const job={...pendingRequest,asynchronous:true,status:"pending",outcome:"Awaiting host approval",created_at:"2026-09-11T05:00:00Z"};
+  const opening=f.run('openRequestReview("request-id")');
+  f.calls.at(-1).resolve({ok:true,json:async()=>job});await opening;
+  assert.equal(f.sandbox.document.querySelector("#request-approve").disabled,false);
+  assert.match(f.sandbox.document.querySelector("#request-review-timing").textContent,/Async job.*Client does not need to wait/);
+  f.run('applyReviewOutcome({status:"cancelled",outcome:"Broker restarted before execution. Not sent."})');
+  assert.equal(f.sandbox.document.querySelector("#request-approve").disabled,true);
+  assert.doesNotMatch(f.sandbox.document.querySelector("#request-review-timing").textContent,/timeout|client.*cancell/i);
+});
+
 test("repository issue/PR targets preserve repository context rather than extracting a bare number", () => {
   const f=fixture(); const graph=JSON.parse(JSON.stringify(parsedGraphql));
   Object.assign(graph.analysis,{operation_type:"query",operation_name:null});

@@ -118,6 +118,11 @@ resumed.
 
 ## GitHub policy
 
+For operations that need human review or large GraphQL payloads, use the
+[async Cline plugin](ASYNC-GRAPHQL.md), installed by the guest setup script.
+It returns a job ID immediately and steers the originating session on completion.
+The limits and connection-lifetime behavior below describe the proxy path.
+
 ### Git HTTPS authentication
 
 Git's `Authorization: Basic base64(username:fake-token)` is supported. The
@@ -223,7 +228,8 @@ No general approve-for-session/always rules or MCP write approval are added here
 Other origins remain logged and unpoliced.
 
 **Outcomes in Inbox:** Pending contains only requests needing a decision.
-Recent retains the last 100 reviewed requests and their redacted details for
+Recent also includes [durable async jobs](ASYNC-GRAPHQL.md). For the proxy,
+it retains the last 100 reviewed requests and their redacted details for
 this broker session, separate from the busy traffic log. Open details stay
 visible after approval/denial and update live: Approved, Sending, Response
 received (with HTTP status), Denied, Expired, Cancelled, Blocked, or Upstream

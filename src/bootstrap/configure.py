@@ -114,6 +114,23 @@ unset _fz_rest _fz_list _fz_item
     profiles = {home / ".profile", home / ".bashrc", zdotdir / ".zshenv"}
     profiles.update(home / name for name in (".bash_profile", ".bash_login") if (home / name).exists())
     backups = []
+    cline_home = Path(environ.get("CLINE_DIR", "").strip() or home / ".cline").absolute()
+    plugin_path = cline_home / "plugins/friendzone.js"
+    plugin_config = cline_home / "friendzone.json"
+    plugin = base64.b64decode(data["plugin"], validate=True).decode("utf-8")
+    if not plugin.startswith("// Friendzone managed plugin v1."):
+        raise ValueError("Invalid Friendzone plugin payload")
+    if plugin_path.exists():
+        old_plugin = plugin_path.read_text(encoding="utf-8")
+        if not old_plugin.startswith("// Friendzone managed plugin v1."):
+            raise ValueError("Unmanaged friendzone.js already exists; configuration unchanged")
+        backups.append((plugin_path.with_name("friendzone.js.backup"), old_plugin))
+    if plugin_config.exists():
+        old_config = json.loads(plugin_config.read_text(encoding="utf-8"))
+        if not isinstance(old_config, dict) or old_config.get("managed_by") != "friendzone":
+            raise ValueError("Unmanaged Friendzone plugin configuration; configuration unchanged")
+        backups.append((plugin_config.with_name("friendzone.json.backup"), plugin_config.read_text(encoding="utf-8")))
+    edits.extend([(plugin_path, plugin), (plugin_config, json.dumps(dict(managed_by="friendzone",broker=data["broker"],container=data["container"]), indent=2)+"\n")])
     for path in sorted(profiles):
         old = path.read_text(encoding="utf-8") if path.exists() else ""
         updated = profile_update(old, activation, env, home)
@@ -156,4 +173,5 @@ def main(encoded):
     config = Path(os.environ.get("XDG_CONFIG_HOME", str(home / ".config"))) / "friendzone"
     activation = configure(data, home, config, os.environ.get("ZDOTDIR", str(home)), os.environ)
     print("Configured guest " + data["container"] + ". " + ("Approved." if approval.get("approved") else "Approve it in the host Inbox."))
+    print("Installed the Friendzone Cline plugin for async GraphQL and session updates.")
     print("Activate this terminal, then restart guest Cline so it inherits the environment:\n  . " + shlex.quote(str(activation)))

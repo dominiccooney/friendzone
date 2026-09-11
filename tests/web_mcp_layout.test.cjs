@@ -131,6 +131,9 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     const joinGuest={id:"joining-guest",name:"joining-guest",approved:false,state:"pending",request_count:1,last_activity:null,pinned_ip:"~10.0.0.2"};
     state.containers.push(joinGuest);
     await evaluate("refresh()");
+    // The initial SSE snapshot can race the explicit fetch. Wait for the
+    // rendered join, rather than asserting before the winning snapshot paints.
+    for (let i=0;i<100 && !await evaluate("document.querySelector('#joining-guests .container') !== null");i++) {await evaluate("refresh()");await delay(25);}
     for(const width of [1058,480]) {
       await send("Emulation.setDeviceMetricsOverride",{width,height:1000,deviceScaleFactor:1,mobile:false});
       await evaluate("window.scrollTo(0,0)");

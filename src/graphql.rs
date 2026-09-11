@@ -1191,8 +1191,13 @@ pub fn review(body: &str, content_type: &str) -> Review {
 
 /// One parse/operation-selection authority for policy and the review view.
 /// Display expansion limits must not turn a large read into an approval prompt.
+#[cfg(test)]
 pub fn inspect(body: &str, content_type: &str) -> (bool, Review) {
-    let parsed = match parse_request(body, content_type) {
+    inspect_with_limit(body, content_type, crate::review::MAX_BODY)
+}
+
+pub fn inspect_with_limit(body: &str, content_type: &str, max_body: usize) -> (bool, Review) {
+    let parsed = match parse_request_with_limit(body, content_type, max_body) {
         Ok(parsed) => parsed,
         Err(message) => return (false, Review::Unavailable { message }),
     };
@@ -1213,9 +1218,18 @@ struct ParsedRequest {
     supplied: serde_json::Map<String, Json>,
 }
 
+#[cfg(test)]
 fn parse_request(body: &str, content_type: &str) -> Result<ParsedRequest> {
-    if body.len() > crate::review::MAX_BODY {
-        return Err("GraphQL body exceeds the 64 KiB review limit".into());
+    parse_request_with_limit(body, content_type, crate::review::MAX_BODY)
+}
+
+fn parse_request_with_limit(
+    body: &str,
+    content_type: &str,
+    max_body: usize,
+) -> Result<ParsedRequest> {
+    if body.len() > max_body {
+        return Err("GraphQL body exceeds the review limit".into());
     }
     let content_type = content_type
         .split(';')

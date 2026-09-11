@@ -89,6 +89,8 @@ struct ContainerRecord {
     /// Changes to authorization invalidate one-shot reviews, even if a kill
     /// is subsequently resumed or a removed guest is re-added under its name.
     policy_epoch: Uuid,
+    /// Durable incarnation: removing/re-adding a name never inherits its jobs.
+    instance: Uuid,
     comment_permissions: Vec<crate::github::Grant>,
     comment_revision: Uuid,
 }
@@ -102,6 +104,7 @@ impl Default for ContainerRecord {
             last_ip: None,
             managed: false,
             policy_epoch: Uuid::new_v4(),
+            instance: Uuid::new_v4(),
             comment_permissions: Vec::new(),
             comment_revision: Uuid::new_v4(),
         }
@@ -119,6 +122,8 @@ struct SavedContainers {
 #[serde(deny_unknown_fields)]
 struct SavedContainer {
     name: String,
+    #[serde(default = "Uuid::new_v4")]
+    instance: Uuid,
     approved: bool,
     killed: bool,
     // The explicit null is meaningful (any IP). Missing a security field
@@ -191,6 +196,7 @@ pub struct AppState {
     changes: tokio::sync::watch::Sender<u64>,
     pub reviews: crate::review::Queue,
     pub github: crate::github::Client,
+    pub jobs: crate::jobs::Jobs,
 }
 
 impl Default for AppState {
@@ -201,6 +207,7 @@ impl Default for AppState {
             policy_path: None,
             reviews: crate::review::Queue::new(changes.clone()),
             github: crate::github::Client::default(),
+            jobs: crate::jobs::Jobs::new(changes.clone()),
             changes,
         }
     }
@@ -254,6 +261,7 @@ impl AppState {
                 entry.name,
                 ContainerRecord {
                     approved: entry.approved,
+                    instance: entry.instance,
                     pinned_ip: entry.pinned_ip,
                     managed: true,
                     comment_permissions: entry.comment_permissions,
@@ -267,6 +275,7 @@ impl AppState {
             policy_path: Some(Arc::new(path)),
             reviews: crate::review::Queue::new(changes.clone()),
             github: crate::github::Client::default(),
+            jobs: crate::jobs::Jobs::load(data_dir, changes.clone())?,
             changes,
         })
     }
@@ -288,6 +297,7 @@ impl AppState {
                 .filter(|(_, record)| record.managed)
                 .map(|(name, record)| SavedContainer {
                     name: name.clone(),
+                    instance: record.instance,
                     approved: record.approved,
                     killed: killed.contains(name),
                     pinned_ip: record.pinned_ip,
@@ -465,6 +475,41 @@ impl AppState {
             && !state.killed.contains(container)
             && record.pinned_ip.is_none_or(|pin| pin == peer))
         .then_some(record.policy_epoch)
+    }
+
+    pub fn persist_guest_identity(&self) -> Result<()> {
+        self.update_policy(|_, _| Ok(()))
+    }
+
+    pub fn async_identity(&self, container: &str, peer: IpAddr) -> Option<(Uuid, Uuid)> {
+        let state = self.data.read().expect("state lock");
+        let record = state.containers.get(container)?;
+        (record.approved
+            && !state.killed.contains(container)
+            && record.pinned_ip.is_none_or(|pin| pin == peer))
+        .then_some((record.instance, record.policy_epoch))
+    }
+
+    pub fn with_async_identity<T: Default>(
+        &self,
+        container: &str,
+        peer: IpAddr,
+        instance: Uuid,
+        epoch: Uuid,
+        action: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let state = self.data.read().expect("state lock");
+        if state.killed.contains(container)
+            || state.containers.get(container).is_none_or(|r| {
+                !r.approved
+                    || r.instance != instance
+                    || r.policy_epoch != epoch
+                    || r.pinned_ip.is_some_and(|ip| ip != peer)
+            })
+        {
+            return Ok(T::default());
+        }
+        action()
     }
 
     pub fn add_comment_permission(
@@ -812,7 +857,12 @@ impl AppState {
                 .cmp(&a.last_activity)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        let (pending_requests, recent_reviews) = self.reviews.view();
+        let (mut pending_requests, mut recent_reviews) = self.reviews.view();
+        let (pending_jobs, recent_jobs) = self.jobs.summaries();
+        pending_requests.extend(pending_jobs);
+        recent_reviews.extend(recent_jobs);
+        pending_requests.sort_by_key(|s| s.created_at);
+        recent_reviews.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
         StateView {
             containers,
             comment_permissions: state

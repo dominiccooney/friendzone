@@ -25,6 +25,12 @@ trust-on-first-use, not an authenticated software distribution channel.
 
 ## What changes
 
+Setup also installs the [Friendzone Cline plugin](ASYNC-GRAPHQL.md) for async
+GraphQL submissions and session updates. The managed file is
+`${CLINE_DIR:-~/.cline}/plugins/friendzone.js`; unrelated plugins are preserved.
+Restart guest Cline after setup. A compatible Cline plugin host is required;
+the installer does not download or upgrade Cline.
+
 The script contains a snapshot of the public CA, proxy port and fake keys from
 the broker at download time. It registers the guest directly with the broker,
 then writes the guest account's environment and Cline settings. Refetch before

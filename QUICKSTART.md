@@ -149,7 +149,11 @@ The original HTTP call waits up to two minutes; nothing is replayed on
 restart. Approval uses the normal configured credential and requires its
 upstream scopes; it does not override GitHub permissions or future requests.
 
-If reviews cancel after 25–30 seconds rather than expire at two minutes,
+Prefer the [async Cline plugin](ASYNC-GRAPHQL.md) for manual approval or large
+GraphQL payloads. Rerun guest setup and restart guest Cline to install it.
+It returns immediately and delivers completion to the originating session.
+
+If proxy reviews cancel after 25–30 seconds rather than expire at two minutes,
 check the guest HTTP client's timeout and its enclosing command/tool deadline.
 Both must leave time for a human decision (e.g. 180 seconds). The broker cannot
 keep a client waiting after it disconnects. Check the outcome and upstream

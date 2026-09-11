@@ -30,7 +30,7 @@ function Get-FzProviderJson([string]$Path, [string]$Fake) {
     if ($null -eq $root.lastUsedProvider) {Set-FzProperty $root lastUsedProvider 'cline'}
     ConvertTo-Json -InputObject $root -Depth 100
 }
-function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirectory) {
+function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirectory, [string]$ClineDirectory) {
     $cert=Join-Path $ConfigDirectory 'friendzone-ca.pem'
     $envFile=Join-Path $ConfigDirectory 'friendzone-env.ps1'
     $origin=[Uri]$Data.broker
@@ -48,8 +48,19 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     $lines += '$env:NO_PROXY = @(('+ (Quote-FzPowerShell $values.NO_PROXY) + ' + '','' + $env:NO_PROXY).Split('','') | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique) -join '','''
     $provider=Join-Path $HomeDirectory '.cline/data/settings/providers.json'
     $providerJson=if($Data.fakes.CLINE_API_KEY){Get-FzProviderJson $provider $Data.fakes.CLINE_API_KEY}else{$null}
+    if (-not $ClineDirectory) {$ClineDirectory=Join-Path $HomeDirectory '.cline'}
+    $pluginPath=Join-Path $ClineDirectory 'plugins/friendzone.js'
+    $pluginConfig=Join-Path $ClineDirectory 'friendzone.json'
+    $plugin=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Data.plugin))
+    if(-not $plugin.StartsWith('// Friendzone managed plugin v1.')){throw 'Invalid Friendzone plugin payload'}
+    if((Test-Path -LiteralPath $pluginPath) -and -not ([IO.File]::ReadAllText($pluginPath).StartsWith('// Friendzone managed plugin v1.'))){throw 'Unmanaged friendzone.js exists; configuration unchanged'}
+    if(Test-Path -LiteralPath $pluginConfig){$old=Get-Content -Raw -LiteralPath $pluginConfig | ConvertFrom-Json;if($old.managed_by -ne 'friendzone'){throw 'Unmanaged Friendzone plugin configuration; configuration unchanged'}}
+    $pluginJson=ConvertTo-Json -InputObject @{managed_by='friendzone';broker=$Data.broker;container=$Data.container}
     # Validate/prepare JSON before writes; backup first, never overwrite a backup.
     if ($providerJson -and (Test-Path -LiteralPath $provider) -and -not (Test-Path -LiteralPath ($provider+'.friendzone-backup'))) {Copy-Item -LiteralPath $provider -Destination ($provider+'.friendzone-backup')}
+    foreach($path in @($pluginPath,$pluginConfig)){if((Test-Path -LiteralPath $path) -and -not (Test-Path -LiteralPath ($path+'.backup'))){Copy-Item -LiteralPath $path -Destination ($path+'.backup')}}
+    Write-FzFile $pluginPath $plugin
+    Write-FzFile $pluginConfig $pluginJson
     Write-FzFile $cert $Data.ca
     Write-FzFile $envFile ($lines -join "`n")
     if($providerJson){Write-FzFile $provider $providerJson}
@@ -72,9 +83,10 @@ function Start-FzGuestSetup($Data) {
         $approval=$response.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
         $config=Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'friendzone'
         Write-FzFile (Join-Path $config 'persist-environment.ps1') ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Data.persistence)))
-        $envFile=Invoke-FzConfigure $Data ([Environment]::GetFolderPath('UserProfile')) $config
+        $envFile=Invoke-FzConfigure $Data ([Environment]::GetFolderPath('UserProfile')) $config $env:CLINE_DIR
         . $envFile
         Write-Host ('Configured guest '+$Data.container+'. '+$(if($approval.approved){'Approved.'}else{'Approve it in the host Inbox.'}))
+        Write-Host 'Installed the Friendzone Cline plugin for async GraphQL and session updates.'
         Write-Host 'Restart guest Cline from this terminal. Sign out/in to refresh other Windows launchers.'
     } finally {$client.Dispose();$handler.Dispose()}
 }

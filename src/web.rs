@@ -756,9 +756,167 @@ fn bootstrap_router(state: BootstrapState) -> Router {
         .route("/bootstrap/hello", get(bootstrap_hello))
         .route("/bootstrap/env", get(bootstrap_env))
         .route("/bootstrap/setup", get(bootstrap_script))
+        .route(
+            "/bootstrap/friendzone.js",
+            get(|| async {
+                (
+                    [
+                        (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                        (header::CACHE_CONTROL, "no-store"),
+                    ],
+                    include_str!("plugin/friendzone.js"),
+                )
+            }),
+        )
+        .route("/guest/jobs", post(submit_job).get(list_jobs))
+        .route("/guest/jobs/{id}", get(get_job).delete(delete_job))
+        .route("/guest/jobs/{id}/cancel", post(cancel_job))
         .route("/mcp/{name}", post(mcp_message))
         .route("/health", get(|| async { "ok" }))
+        .layer(axum::middleware::from_fn(
+            |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                let mut response = next.run(request).await;
+                response
+                    .headers_mut()
+                    .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+                response
+            },
+        ))
         .with_state(state)
+}
+
+fn job_identity(
+    state: &BootstrapState,
+    headers: &axum::http::HeaderMap,
+    peer: SocketAddr,
+) -> Result<(String, uuid::Uuid)> {
+    let name = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(crate::proxy::basic_username)
+        .context("guest Basic authorization required")?;
+    if state.mcp.app.authorize(&name, peer.ip()) != crate::state::Authorization::Allowed {
+        anyhow::bail!("guest awaiting approval or IP pin mismatch");
+    }
+    let (instance, _) = state
+        .mcp
+        .app
+        .async_identity(&name, peer.ip())
+        .context("guest killed or unauthorized")?;
+    Ok((name, instance))
+}
+async fn submit_job(
+    State(state): State<BootstrapState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    let (name, _) = match job_identity(&state, &headers, peer) {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::FORBIDDEN, error.to_string()).into_response(),
+    };
+    let Ok(_slot) = crate::review::buffer_slots().clone().try_acquire_owned() else {
+        return (StatusCode::TOO_MANY_REQUESTS, "upload slots busy").into_response();
+    };
+    let bytes = match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        axum::body::to_bytes(request.into_body(), crate::jobs::MAX_PAYLOAD + 4096),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        _ => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "job upload incomplete or exceeds 10 MiB",
+            )
+                .into_response();
+        }
+    };
+    let input = match serde_json::from_slice::<crate::jobs::Submission>(&bytes) {
+        Ok(value) => value,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid job submission JSON").into_response(),
+    };
+    match state
+        .mcp
+        .app
+        .jobs
+        .submit(&state.mcp.app, &state.settings, &name, peer.ip(), input)
+    {
+        Ok(value) => (StatusCode::ACCEPTED, Json(value)).into_response(),
+        Err(e) => (StatusCode::CONFLICT, e.to_string()).into_response(),
+    }
+}
+#[derive(Deserialize)]
+struct JobSession {
+    session_id: String,
+}
+async fn list_jobs(
+    State(state): State<BootstrapState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<JobSession>,
+) -> axum::response::Response {
+    match job_identity(&state, &headers, peer) {
+        Ok((name, instance)) => {
+            Json(state.mcp.app.jobs.list(&name, instance, &query.session_id)).into_response()
+        }
+        Err(e) => (StatusCode::FORBIDDEN, e.to_string()).into_response(),
+    }
+}
+async fn get_job(
+    State(state): State<BootstrapState>,
+    Path(id): Path<uuid::Uuid>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<JobSession>,
+) -> axum::response::Response {
+    match job_identity(&state, &headers, peer).and_then(|(name, instance)| {
+        state
+            .mcp
+            .app
+            .jobs
+            .get(&name, instance, id, &query.session_id)
+    }) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => (StatusCode::FORBIDDEN, e.to_string()).into_response(),
+    }
+}
+async fn cancel_job(
+    State(state): State<BootstrapState>,
+    Path(id): Path<uuid::Uuid>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<JobSession>,
+) -> axum::response::Response {
+    match job_identity(&state, &headers, peer).and_then(|(name, instance)| {
+        state
+            .mcp
+            .app
+            .jobs
+            .cancel(&name, instance, id, &query.session_id)
+    }) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::CONFLICT, e.to_string()).into_response(),
+    }
+}
+async fn delete_job(
+    State(state): State<BootstrapState>,
+    Path(id): Path<uuid::Uuid>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<JobSession>,
+) -> axum::response::Response {
+    match job_identity(&state, &headers, peer).and_then(|(name, instance)| {
+        state
+            .mcp
+            .app
+            .jobs
+            .delete(&name, instance, id, &query.session_id)
+    }) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::CONFLICT, e.to_string()).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -966,7 +1124,12 @@ async fn review_request(
         )
             .into_response();
     }
-    match state.app.reviews.inspect(id) {
+    match state
+        .app
+        .reviews
+        .inspect(id)
+        .or_else(|| state.app.jobs.inspect(id))
+    {
         Some(detail) => ([(header::CACHE_CONTROL, "no-store")], Json(detail)).into_response(),
         None => (
             StatusCode::NOT_FOUND,
@@ -1083,11 +1246,18 @@ async fn decide_request(
         )
             .into_response();
     }
-    match state
-        .app
-        .reviews
-        .decide(id, &request.fingerprint, request.decision)
-    {
+    let result = if state.app.jobs.contains(id) {
+        state
+            .app
+            .jobs
+            .decide(id, &request.fingerprint, request.decision)
+    } else {
+        state
+            .app
+            .reviews
+            .decide(id, &request.fingerprint, request.decision)
+    };
+    match result {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
     }
@@ -1414,6 +1584,178 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn async_guest_routes_return_immediately_and_host_api_controls_execution() {
+        let dir = std::env::temp_dir().join(format!("fz-async-http-{}", uuid::Uuid::new_v4()));
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "github".into(),
+                hosts: vec!["api.github.com".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fake".into(),
+                real_env: None,
+                guest_env: None,
+            })
+            .unwrap();
+        settings.set_secret("github", "test-host-secret").unwrap();
+        let app = AppState::load(&dir).unwrap();
+        app.add_container("guest").unwrap();
+        app.add_container("other").unwrap();
+        let registry = crate::mcp::ForwardRegistry::load(&dir, settings.clone()).unwrap();
+        let guest = bootstrap_router(BootstrapState {
+            cert: Arc::new("test".into()),
+            binary: Arc::new(vec![]),
+            guest_binaries: Arc::new(Default::default()),
+            mcp: crate::mcp::McpState::new(app.clone(), registry.clone()),
+            settings: settings.clone(),
+            proxy_port: 8080,
+        });
+        let ui = ui_router(UiState {
+            app: app.clone(),
+            settings: settings.clone(),
+            registry,
+            oauth: Default::default(),
+            cline: Default::default(),
+            ui_addr: "127.0.0.1:8081".parse().unwrap(),
+            bootstrap_addr: "127.0.0.1:8082".parse().unwrap(),
+        });
+        let request = |method: &str, path: &str, body: String, name: Option<&str>| {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(name) = name {
+                builder = builder.header(
+                    header::AUTHORIZATION,
+                    format!("Basic {}", STANDARD.encode(format!("{name}:x"))),
+                );
+            }
+            let mut req = builder.body(Body::from(body)).unwrap();
+            req.extensions_mut().insert(axum::extract::ConnectInfo(
+                "127.0.0.1:23456".parse::<SocketAddr>().unwrap(),
+            ));
+            req
+        };
+        let payload=serde_json::json!({"request_key":"large","session_id":"s","query":"mutation($body:String!){addComment(input:{subjectId:\"ID\",body:$body}){clientMutationId}}","variables":{"body":"x".repeat(90000)}}).to_string();
+        let denied = guest
+            .clone()
+            .oneshot(request("POST", "/guest/jobs", payload.clone(), None))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            guest.clone().oneshot(request(
+                "POST",
+                "/guest/jobs",
+                payload.clone(),
+                Some("guest"),
+            )),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let value: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let id = value["id"].as_str().unwrap();
+        assert_eq!(value["status"], "pending");
+        assert_eq!(app.view().pending_requests.len(), 1);
+        let response = guest
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("/guest/jobs/{id}?session_id=s"),
+                "".into(),
+                Some("other"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = guest
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!("/api/requests/{id}/decision"),
+                "{}".into(),
+                Some("guest"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = ui
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/requests/{id}"))
+                    .header(header::HOST, "127.0.0.1:8081")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let detail: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(detail["asynchronous"].as_bool().unwrap());
+        assert!(detail["body"].as_str().unwrap().len() > 65536);
+        let decision =
+            serde_json::json!({"fingerprint":detail["fingerprint"],"decision":"deny"}).to_string();
+        let response = ui
+            .oneshot(
+                Request::post(format!("/api/requests/{id}/decision"))
+                    .header(header::HOST, "127.0.0.1:8081")
+                    .header("x-friendzone-review", "1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(decision))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = guest
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("/guest/jobs/{id}?session_id=s"),
+                "".into(),
+                Some("guest"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["status"], "denied");
+        assert!(value["terminal"].as_bool().unwrap());
+        let response = guest
+            .oneshot(request("POST", "/guest/jobs", payload, Some("guest")))
+            .await
+            .unwrap();
+        let repeated: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(repeated["id"], id);
+        assert_eq!(repeated["status"], "denied");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn github_queries_flow_and_pr_review_mutations_wait_for_host_decisions_over_real_tls() {
@@ -2925,7 +3267,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-            let body = axum::body::to_bytes(response.into_body(), 32 * 1024)
+            let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
                 .await
                 .unwrap();
             let text = String::from_utf8(body.to_vec()).unwrap();
