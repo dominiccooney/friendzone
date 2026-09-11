@@ -58,6 +58,23 @@ struct ReviewResponseBody {
     bytes: Option<Vec<u8>>,
     ended: bool,
 }
+impl ReviewResponseBody {
+    fn finish(&mut self) {
+        if self.ended {
+            return;
+        }
+        self.ended = true;
+        if let Some(bytes) = &self.bytes
+            && let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes)
+            && json
+                .get("errors")
+                .and_then(|errors| errors.as_array())
+                .is_some_and(|errors| !errors.is_empty())
+        {
+            self.state.reviews.response_detail(self.id, crate::review::Status::GraphqlError, "GitHub returned GraphQL errors; the operation may have partially executed. Check upstream before retrying.");
+        }
+    }
+}
 impl hudsucker::hyper::body::Body for ReviewResponseBody {
     type Data = hudsucker::hyper::body::Bytes;
     type Error = hudsucker::Error;
@@ -80,18 +97,14 @@ impl hudsucker::hyper::body::Body for ReviewResponseBody {
                         this.bytes = None;
                     }
                 }
+                // A transport can stop polling after the last declared byte.
+                // Do not require an extra poll returning None to record EOF.
+                if this.inner.is_end_stream() {
+                    this.finish();
+                }
             }
             Poll::Ready(None) => {
-                this.ended = true;
-                if let Some(bytes) = &this.bytes
-                    && let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes)
-                    && json
-                        .get("errors")
-                        .and_then(|errors| errors.as_array())
-                        .is_some_and(|errors| !errors.is_empty())
-                {
-                    this.state.reviews.response_detail(this.id, crate::review::Status::GraphqlError, "GitHub returned GraphQL errors; the operation may have partially executed. Check upstream before retrying.");
-                }
+                this.finish();
             }
             Poll::Ready(Some(Err(_))) => {
                 this.ended = true;
@@ -634,6 +647,51 @@ pub fn basic_username(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn response_final_frame_does_not_need_an_extra_poll_to_record_completion() {
+        use crate::review::{Decision, Detail, Status};
+        use http_body_util::BodyExt;
+        let state = AppState::default();
+        for (payload, expected) in [
+            (r#"{"data":{"ok":true}}"#, Status::ResponseReceived),
+            (
+                r#"{"errors":[{"message":"private"}]}"#,
+                Status::GraphqlError,
+            ),
+        ] {
+            let req = request("POST", "https://api.github.com/graphql", Some("guest"));
+            let detail = Detail::from_request("guest", &req, b"").unwrap();
+            let id = detail.summary.id;
+            let ticket = state.reviews.enqueue(detail.clone()).unwrap();
+            state
+                .reviews
+                .decide(id, &detail.summary.fingerprint, Decision::Approve)
+                .unwrap();
+            ticket.wait().await.unwrap();
+            state.reviews.observe(
+                id,
+                Status::ResponseReceived,
+                Some(200),
+                "HTTP response received",
+            );
+            let mut body = ReviewResponseBody {
+                inner: Body::from(payload),
+                state: state.clone(),
+                id,
+                bytes: Some(Vec::new()),
+                ended: false,
+            };
+            assert_eq!(
+                body.frame().await.unwrap().unwrap().into_data().unwrap(),
+                payload
+            );
+            drop(body); // HTTP implementations may not ask for a trailing None.
+            let outcome = state.reviews.inspect(id).unwrap().summary;
+            assert_eq!(outcome.status, expected);
+            assert!(!outcome.outcome.unwrap().contains("private"));
+        }
+    }
 
     #[tokio::test]
     async fn response_observation_is_bounded_keeps_bytes_and_reports_uncertainty() {

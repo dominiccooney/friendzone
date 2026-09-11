@@ -128,6 +128,11 @@ password. Existing API Bearer substitution is unchanged. Missing secrets
 and known fakes sent to non-pinned hosts are denied; anonymous requests and
 unrelated/malformed credentials do not cause token injection.
 
+GitHub CLI's `Authorization: token <fake>` is also recognized for GitHub
+Bearer escrow entries. It goes through the same exact-token, host-pin and
+current-secret checks, then uses the configured upstream Bearer header.
+This does not inject credentials into anonymous or unrelated requests.
+
 Git must actually supply the fake token as its HTTPS password (through a
 credential helper or prompt). Exporting `GITHUB_TOKEN` alone does not make
 plain Git use it. The guest bootstrap does not install a Git credential
@@ -145,8 +150,8 @@ therefore still requires an already-published head branch.
 ### Reads and manual review
 
 GitHub reads (GET/HEAD/OPTIONS, `git-upload-pack`, and parsed GraphQL queries) flow through the
-proxy. Potential writes wait in **Inbox → Requests awaiting review**.
-Open **Review request**, inspect the complete URL, headers and literal
+proxy. Potential writes wait in **Inbox → Requests**.
+Open **Review**, inspect the complete URL, input values and literal
 payload, then **Approve once** or **Deny**. Approval releases only that
 immutable request through the normal escrow path, not a rule for future
 requests. The log shows pending, denied, approved and upstream status.
@@ -154,7 +159,9 @@ requests. The log shows pending, denied, approved and upstream status.
 `POST https://api.github.com/graphql` now has a **GraphQL operation** viewer:
 selected query/mutation/subscription, actual fields behind aliases, expanded
 fragments, resolved arguments, variable defaults, formatted document and
-supplied variables. Comment text is shown literally, separately from its
+supplied variables. **All input values are visible immediately** as labeled
+rows, including nested/unknown inputs; only response-only selections and
+technical representations are collapsed. Comment text is shown literally, separately from its
 target. The exact original body remains visible and is forwarded unchanged.
 **GitHub GraphQL queries now flow automatically**, including aliases,
 fragments, variables and introspection. Classification uses the selected
@@ -164,6 +171,16 @@ the query. This relies on GitHub's read-only Query root; it is not a promise
 about arbitrary GraphQL servers, nor full GitHub schema validation.
 Malformed, ambiguous or unsupported input
 shows a diagnostic and raw body instead of a partial structured summary.
+
+The standard `gh` PR-query header `GraphQL-Features: merge_queue` is supported;
+unknown feature switches still require review. The view shows elapsed time
+and the remaining broker review window. A cancellation before that deadline
+is not broker expiry: the client or its tool runner may have stopped waiting.
+If doing a manual review, give **both the HTTP client and its enclosing tool**
+more than 120 seconds (for example, `curl --max-time 180` for an intentional
+curl test). Extending only the broker timeout cannot extend a client timeout.
+Never automatically replay a timed-out mutation: inspect the retained outcome
+and upstream state first.
 
 **PR creation and review comments/threads/submission are allowed with manual
 approval.** Open the pending request, inspect all inputs, then **Approve once**

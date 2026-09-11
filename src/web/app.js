@@ -217,6 +217,26 @@ function applyReviewOutcome(summary) {
   $("#request-review-actions").hidden = !waiting;
   $("#request-approve").disabled = !waiting || decisionInFlight === activeReview.id;
   $("#request-deny").disabled = !waiting || decisionInFlight === activeReview.id;
+  updateReviewTiming();
+}
+
+let reviewClock = null;
+function reviewTiming(request, now = Date.now()) {
+  const created = Date.parse(request.created_at), expires = Date.parse(request.expires_at);
+  if ((request.status || "pending") === "pending") {
+    if (!Number.isFinite(expires)) return "Client may stop waiting before the broker deadline.";
+    const remaining = Math.max(0, Math.ceil((expires - now) / 1000));
+    const elapsed = Number.isFinite(created) ? `Waiting ${Math.max(0, Math.floor((now-created)/1000))}s · ` : "";
+    return `${elapsed}${remaining}s until broker expiry. Client timeout may be shorter.`;
+  }
+  const elapsed = Math.round((Date.parse(request.updated_at) - created) / 1000);
+  if (!Number.isFinite(elapsed) || elapsed < 0) return "";
+  return `${elapsed}s after arrival${request.status === "cancelled" ? " · cancelled before forwarding; client timeout or cancellation is possible" : ""}.`;
+}
+function updateReviewTiming() {
+  clearTimeout(reviewClock); reviewClock = null;
+  $("#request-review-timing").textContent = activeReview ? reviewTiming(activeReview) : "";
+  if (activeReview && (activeReview.status || "pending") === "pending") reviewClock = setTimeout(updateReviewTiming, 1000);
 }
 
 async function openRequestReview(id) {
@@ -309,10 +329,52 @@ function renderCommentPermissions() {
   });
 }
 
+// Values come from the broker's typed AST, never reparse GraphQL or use these
+// display rows as approval input. Expand every input, including unknown fields.
+function graphqlValueRows(value, path, labels = {}, rows = []) {
+  if (value?.kind === "object" && Object.keys(value.value).length) {
+    for (const [name, child] of Object.entries(value.value)) graphqlValueRows(child, path ? `${path}.${name}` : name, labels, rows);
+  } else if (value?.kind === "list" && value.value.length) {
+    value.value.forEach((child,index)=>graphqlValueRows(child, `${path}[${index}]`, labels, rows));
+  } else {
+    const kind = value?.kind || "unknown";
+    const text = kind === "null" ? "null" : kind === "object" ? "{}" : kind === "list" ? "[]"
+      : kind === "missing_variable" ? `Not supplied ($${value.value})` : kind === "variable" ? `Unresolved $${value.value}`
+      : kind === "string" && value.value === "" ? "(empty string)"
+      : value?.value === undefined ? JSON.stringify(value) : String(value.value);
+    rows.push({path, label:labels[path] || path, kind, text});
+  }
+  return rows;
+}
+function graphqlValuesMarkup(rows) {
+  return `<dl class="graphql-values">${rows.map(row=>`<div class="graphql-value"><dt>${esc(row.label)}${row.label!==row.path?` <code>${esc(row.path)}</code>`:""}<small>${esc(row.kind)}</small></dt><dd><pre>${esc(row.text)}</pre></dd></div>`).join("")}</dl>`;
+}
+function graphqlFieldMarkup(field) {
+  const target = field.target, conditions = field.conditions_text || [];
+  const inputs = field.mutation_inputs || [];
+  const labels = Object.fromEntries(inputs.map(input=>[input.path, input.label]));
+  if (field.comment_body !== null && field.comment_body !== undefined) labels["input.body"] = "Comment text";
+  const rows = Object.entries(field.arguments || {}).flatMap(([name,value])=>graphqlValueRows(value, name, labels));
+  // Compatibility with older snapshots without typed arguments: never hide the
+  // broker's text representation or recognized values just because it is unknown.
+  if (!rows.length) {
+    for (const input of inputs) rows.push({path:input.path,label:input.label,kind:"value",text:input.value});
+    if (field.comment_body !== null && field.comment_body !== undefined) rows.push({path:"input.body",label:"Comment text",kind:"string",text:field.comment_body});
+    if (field.arguments_text) rows.push({path:"Arguments",label:"Arguments",kind:"GraphQL",text:field.arguments_text});
+  }
+  const targetText = !target ? "" : target.kind === "node_id"
+    ? `${target.expected_type} node ID (unverified): ${target.id}. Not an issue/PR number.`
+    : `${target.owner}/${target.repository} #${target.number} · ${target.expected_type} (not a verified pin).`;
+  const context = [field.action ? field.field : "", field.response_name !== field.field ? `alias ${field.response_name}` : "", field.parent===null?"":field.path.join(" → ")].filter(Boolean).join(" · ");
+  return `<article class="graphql-field"><h4>${esc(field.action || field.field)}</h4>${context?`<p class="meta">${esc(context)}</p>`:""}${targetText?`<p class="graphql-target">${esc(targetText)}</p>`:""}${conditions.length?`<p class="graphql-conditions">Conditions: ${esc(conditions.join("; "))}</p>`:""}${rows.length?graphqlValuesMarkup(rows):'<p class="meta">No arguments.</p>'}</article>`;
+}
 function renderGraphqlReview(graphql) {
   $("#request-graphql").hidden = !graphql;
-  for (const id of ["operation","warning","document","variables","data"]) $("#request-graphql-"+id).textContent = "";
+  for (const id of ["operation","warning","notes","document","variables","data"]) $("#request-graphql-"+id).textContent = "";
   $("#request-graphql-fields").innerHTML = "";
+  $("#request-graphql-effective").innerHTML = "";
+  $("#request-graphql-response").textContent = "";
+  $("#request-graphql-variables-panel").hidden = true;
   if (!graphql) return;
   if (graphql.status !== "parsed") {
     $("#request-graphql-warning").textContent = `Structured review unavailable: ${graphql.message || "unsupported response"}. No operation or target was inferred. Review the raw body; this does not make the request safe.`;
@@ -320,20 +382,20 @@ function renderGraphqlReview(graphql) {
   }
   const analysis = graphql.analysis;
   $("#request-graphql-operation").textContent = `${analysis.operation_type.toUpperCase()} · ${analysis.operation_name || "(anonymous)"} · ${analysis.operation_count} operation(s)`;
-  $("#request-graphql-warning").textContent = analysis.warnings.join("\n");
+  $("#request-graphql-notes").textContent = (analysis.warnings || []).join("\n");
+  // Show request-specific warnings immediately; keep repeated parser caveats
+  // in notes. Missing/unknown variable values remain visible in the value rows.
+  const genericNotes = ["GitHub queries flow automatically", "Targets come from request arguments", "The target hint identifies", "Formatting removes comments"];
+  $("#request-graphql-warning").textContent = (analysis.warnings || []).filter(warning=>!genericNotes.some(prefix=>warning.startsWith(prefix))).join("\n");
   $("#request-graphql-document").textContent = analysis.formatted_document;
   $("#request-graphql-variables").textContent = analysis.supplied_variables;
   $("#request-graphql-data").textContent = JSON.stringify({version:analysis.version, effective_variables:analysis.effective_variables, fields:analysis.fields},null,2);
-  $("#request-graphql-fields").innerHTML = analysis.fields.map(field=>{
-    const target = field.target;
-    const conditions = field.conditions_text || [];
-    const targetText = !target ? "No target identified."
-      : target.kind === "node_id" ? `Unverified ${target.expected_type} node ID at ${target.input_path}: ${target.id}. This is NOT an issue/PR number; a trusted GitHub lookup is needed.`
-      : `Unverified ${target.expected_type}: ${target.owner}/${target.repository} #${target.number} (explicit request arguments, not a verified pin).`;
-    const inputs = field.mutation_inputs || [];
-    const inputView = inputs.length ? `<h4>PR / review inputs — approve once only</h4>${inputs.map(input=>`<div class="mutation-input"><strong>${esc(input.label)}</strong> <code>${esc(input.path)}</code><pre>${esc(input.value)}</pre></div>`).join("")}` : "";
-    return `<article class="graphql-field"><strong>${esc(field.action || field.field)}</strong><p>Actual field: <code>${esc(field.field)}</code> · response path: <code>${esc(field.path.join(" → "))}</code>${field.parent===null?"":" · response selection"}</p><p class="graphql-target">${esc(targetText)}</p>${conditions.length?`<p>Conditions (all branches retained): ${esc(conditions.join("; "))}</p>`:""}${inputView}${field.comment_body!==null && field.comment_body!==undefined?`<h4>Comment text (literal, not Markdown)</h4><pre>${esc(field.comment_body)}</pre>`:""}<details><summary>Resolved arguments</summary><pre>${esc(field.arguments_text || "(none)")}</pre></details></article>`;
-  }).join("");
+  const hasInputs = field => field.parent === null || Object.keys(field.arguments || {}).length || field.arguments_text || field.target || (field.conditions_text || []).length;
+  $("#request-graphql-fields").innerHTML = analysis.fields.filter(hasInputs).map(graphqlFieldMarkup).join("");
+  $("#request-graphql-response").textContent = analysis.fields.filter(field=>!hasInputs(field)).map(field=>`${field.path.join(" → ")}${field.response_name !== field.field?` (${field.field})`:""}`).join("\n") || "(none)";
+  const variables = analysis.effective_variables || [];
+  $("#request-graphql-effective").innerHTML = variables.map(variable=>`<section class="graphql-variable"><h5>$${esc(variable.name)} <span class="meta">${esc(variable.declared_type)} · ${esc(variable.source)}</span></h5>${graphqlValuesMarkup(graphqlValueRows(variable.value, `$${variable.name}`))}</section>`).join("");
+  $("#request-graphql-variables-panel").hidden = !variables.length && (!analysis.supplied_variables || analysis.supplied_variables === "{}");
 }
 
 async function decideRequest(decision) {
@@ -357,7 +419,7 @@ async function decideRequest(decision) {
 }
 $("#request-approve").onclick = () => decideRequest("approve");
 $("#request-deny").onclick = () => decideRequest("deny");
-$("#request-close").onclick = () => { activeReview = null; ++reviewGeneration; ++commentPermissionGeneration; renderCommentPermissionPanel(null); $("#request-review").hidden = true; };
+$("#request-close").onclick = () => { activeReview = null; updateReviewTiming(); ++reviewGeneration; ++commentPermissionGeneration; renderCommentPermissionPanel(null); $("#request-review").hidden = true; };
 updateNotificationStatus();
 
 async function loadLog(older = false) {

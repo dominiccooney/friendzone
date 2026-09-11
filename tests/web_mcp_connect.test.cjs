@@ -124,10 +124,10 @@ test("GraphQL review shows actual action, opaque target and comment separately w
   assert.equal(element("document").textContent,parsedGraphql.analysis.formatted_document);
   assert.equal(element("variables").textContent,parsedGraphql.analysis.supplied_variables);
   const markup=element("fields").innerHTML;
-  assert.match(markup,/Post comment/); assert.match(markup,/Actual field: <code>addComment/);
-  assert.match(markup,/harmless/); assert.match(markup,/opaque-node/); assert.match(markup,/NOT an issue\/PR number/);
-  assert.match(markup,/Comment text \(literal, not Markdown\)/); assert.match(markup,/&lt;img/); assert.doesNotMatch(markup,/<img/);
-  assert.match(markup,/Conditions \(all branches retained\)/);
+  assert.match(markup,/Post comment/); assert.match(markup,/addComment/);
+  assert.match(markup,/harmless/); assert.match(markup,/opaque-node/); assert.match(markup,/Not an issue\/PR number/);
+  assert.match(markup,/Comment text/); assert.match(markup,/&lt;img/); assert.doesNotMatch(markup,/<img|<details/);
+  assert.match(markup,/Conditions:/);
   assert.equal(f.sandbox.document.querySelector("#request-review-body").textContent,pendingRequest.body);
   assert.equal(f.run("activeReview.fingerprint"),"exact-hash");
 });
@@ -140,6 +140,28 @@ test("structured GraphQL warnings and non-GraphQL reviews clear previously displ
   assert.match(f.sandbox.document.querySelector("#request-graphql-warning").textContent,/fragment cycle.*No operation or target was inferred/);
   assert.equal(f.sandbox.document.querySelector("#request-graphql-warning").innerHTML,"");
   f.run('renderGraphqlReview(null)'); assert.equal(f.sandbox.document.querySelector("#request-graphql").hidden,true);
+});
+
+test("unknown mutations expose every typed input without field expanders and separate response-only selections", () => {
+  const f=fixture();
+  const field={field:"convertPullRequestToDraft",response_name:"safeName",path:["safeName"],parent:null,action:null,target:null,conditions_text:[],
+    arguments:{input:{kind:"object",value:{pullRequestId:{kind:"string",value:"PR_fixture"},futureFlag:{kind:"boolean",value:false},items:{kind:"list",value:[{kind:"object",value:{label:{kind:"string",value:"<img src=x>\nsecond line"},count:{kind:"int",value:"9007199254740993"}}}]},empty:{kind:"list",value:[]},absent:{kind:"null"},missing:{kind:"missing_variable",value:"optional"}}}},mutation_inputs:[]};
+  const nested={field:"comments",response_name:"comments",path:["safeName","comments"],parent:0,arguments:{first:{kind:"int",value:"5"}},conditions_text:["@include(if: false) (not evaluated)"]};
+  const graph={...parsedGraphql,analysis:{...parsedGraphql.analysis,fields:[field,nested,{field:"id",response_name:"id",path:["safeName","id"],parent:0,arguments:{}}],effective_variables:[{name:"n",declared_type:"Int",source:"default",value:{kind:"int",value:"5"}}]}};
+  f.run(`renderGraphqlReview(${JSON.stringify(graph)})`);
+  const markup=f.sandbox.document.querySelector("#request-graphql-fields").innerHTML;
+  for(const text of ["PR_fixture","input.futureFlag","false","input.items[0].label","9007199254740993","input.empty","[]","null","Not supplied ($optional)","first","@include(if: false)"]) assert.ok(markup.includes(text),text);
+  assert.doesNotMatch(markup,/<details|<img/);assert.match(markup,/&lt;img/);
+  assert.match(f.sandbox.document.querySelector("#request-graphql-response").textContent,/safeName → id/);
+  assert.match(f.sandbox.document.querySelector("#request-graphql-effective").innerHTML,/default.*5/s);
+  assert.equal(f.sandbox.document.querySelector("#request-graphql-variables-panel").hidden,false);
+});
+
+test("review timing distinguishes broker expiry from early cancellation without claiming a timeout", () => {
+  const f=fixture(), created="2026-09-11T05:00:00Z";
+  assert.match(f.run(`reviewTiming({status:"pending",created_at:"${created}",expires_at:"2026-09-11T05:02:00Z"}, Date.parse("2026-09-11T05:00:30Z"))`),/Waiting 30s · 90s.*Client timeout may be shorter/);
+  assert.match(f.run(`reviewTiming({status:"cancelled",created_at:"${created}",updated_at:"2026-09-11T05:00:25Z"})`),/25s.*timeout or cancellation is possible/);
+  assert.equal(f.run(`reviewTiming({status:"cancelled",created_at:"${created}",updated_at:"2026-09-10T00:00:00Z"})`),"");
 });
 
 test("repository issue/PR targets preserve repository context rather than extracting a bare number", () => {
@@ -165,7 +187,7 @@ test("PR and review inputs are readable, escaped and explicitly manually approva
     assert.equal(element("#request-review-badge").textContent,"Pending");
     const markup=element("#request-graphql-fields").innerHTML;
     assert.ok(markup.includes(example.action)); assert.ok(markup.includes(example.highlight));
-    assert.match(markup,/approve once only/);assert.doesNotMatch(markup,/<img|<script/);
+    assert.match(markup,/graphql-values/);assert.doesNotMatch(markup,/<img|<script|<details/);
     assert.equal(element("#comment-permission-panel").hidden,true);
     assert.equal(element("#request-approve").disabled,false);
     assert.equal(element("#save-comment-permission").disabled,true);

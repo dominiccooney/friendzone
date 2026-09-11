@@ -301,8 +301,8 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     assert.equal(await evaluate("document.querySelector('#request-review-body').children.length"),0);
     assert.equal(await evaluate("document.querySelector('#request-graphql-document').textContent"),detail.graphql.analysis.formatted_document);
     assert.equal(await evaluate("document.querySelector('#request-graphql-fields').querySelectorAll('img').length"),0);
-    assert.match(await evaluate("document.querySelector('#request-graphql-fields').textContent"),/Post comment.*Actual field:/s);
-    assert.match(await evaluate("document.querySelector('#request-graphql-fields').textContent"),/NOT an issue\/PR number/);
+    assert.match(await evaluate("document.querySelector('#request-graphql-fields').textContent"),/Post comment.*addComment/s);
+    assert.match(await evaluate("document.querySelector('#request-graphql-fields').textContent"),/Not an issue\/PR number/);
     assert.equal(await evaluate("!!window.pwned"),false);
     assert.equal(await evaluate("document.querySelector('#inbox-count').textContent"),"1");
     await evaluate("document.querySelector('#resolve-comment-target').click()");
@@ -359,6 +359,22 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
         await send("Emulation.setDeviceMetricsOverride",{width,height:1000,deviceScaleFactor:1,mobile:false});
         assert.ok(await evaluate(`document.documentElement.scrollWidth <= ${width+1}`));
       }
+    }
+    const now=Date.now();
+    const draft={...detail,url:"https://api.github.com/graphql",status:"pending",outcome:null,http_status:null,created_at:new Date(now-25000).toISOString(),updated_at:new Date(now-25000).toISOString(),expires_at:new Date(now+95000).toISOString(),graphql:{status:"parsed",analysis:{...detail.graphql.analysis,operation_name:null,effective_variables:[{name:"id",declared_type:"ID!",source:"supplied",value:{kind:"string",value:"PR_fixture_opaque"}}],
+      fields:[{field:"convertPullRequestToDraft",response_name:"convertPullRequestToDraft",path:["convertPullRequestToDraft"],parent:null,arguments:{input:{kind:"object",value:{pullRequestId:{kind:"string",value:"PR_fixture_opaque"},note:{kind:"string",value:"first line\n<img src=x onerror=window.pwned=true>\nlast line"},count:{kind:"int",value:"9007199254740993"}}}},conditions_text:[],mutation_inputs:[]},
+        {field:"number",response_name:"number",path:["convertPullRequestToDraft","pullRequest","number"],parent:0,arguments:{},conditions_text:[]}]}}};
+    await evaluate(`activeReview=${JSON.stringify(draft)};snapshot.pending_requests=[activeReview];snapshot.recent_reviews=[];renderPendingRequests();renderGraphqlReview(activeReview.graphql);applyReviewOutcome(activeReview);document.querySelector('#request-review-url').textContent=activeReview.url;document.querySelector('#request-raw').open=false;document.querySelector('#comment-permission-panel').hidden=true;`);
+    for(const width of [1058,480]) {
+      await send("Emulation.setDeviceMetricsOverride",{width,height:1000,deviceScaleFactor:1,mobile:false});
+      await evaluate("document.querySelector('#request-review').scrollIntoView({block:'start'})");
+      const visible=await evaluate(`(() => { const root=document.querySelector('#request-graphql-fields');return {rows:[...root.querySelectorAll('dd pre')].map(node=>({text:node.textContent,visible:node.checkVisibility(),clipped:node.scrollHeight>node.clientHeight+1})),hidden:root.querySelectorAll('details').length,overflow:document.documentElement.scrollWidth>innerWidth+1,executed:!!window.pwned}; })()`);
+      assert.equal(visible.hidden,0);assert.equal(visible.overflow,false);assert.equal(visible.executed,false);
+      assert.equal(visible.rows.length,3);assert.ok(visible.rows.every(row=>row.visible&&!row.clipped));
+      assert.ok(visible.rows.some(row=>row.text==="PR_fixture_opaque"));assert.ok(visible.rows.some(row=>row.text==="9007199254740993"));
+      assert.equal(await evaluate("document.querySelector('#request-graphql-effective').checkVisibility()"),true);
+      assert.equal(await evaluate("document.querySelector('#request-review-actions').hidden"),false);
+      if(process.env.FZ_SCREENSHOT_DIR){const shot=await send('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});fs.writeFileSync(path.join(process.env.FZ_SCREENSHOT_DIR,`approval-values-${width}.png`),Buffer.from(shot.data,'base64'));}
     }
     assert.deepEqual(errors, []);
   } finally {

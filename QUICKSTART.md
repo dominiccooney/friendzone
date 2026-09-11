@@ -141,11 +141,19 @@ do not substitute the guest MCP endpoint for an OAuth redirect URI.
 
 GitHub GraphQL queries flow without approval. If a guest submits a GitHub
 write (a GraphQL mutation or REST write), keep the
-host UI open and go to **Inbox → Requests awaiting review → Review request**.
-Inspect the full URL, headers and body, then **Approve once** or **Deny**.
+host UI open and go to **Inbox → Requests → Review**.
+Review the visible action, target and input values, then **Approve once** or
+**Deny**. Nested and unknown input values are expanded; response-only fields,
+headers and the exact raw representation remain available separately.
 The original HTTP call waits up to two minutes; nothing is replayed on
 restart. Approval uses the normal configured credential and requires its
 upstream scopes; it does not override GitHub permissions or future requests.
+
+If reviews cancel after 25–30 seconds rather than expire at two minutes,
+check the guest HTTP client's timeout and its enclosing command/tool deadline.
+Both must leave time for a human decision (e.g. 180 seconds). The broker cannot
+keep a client waiting after it disconnects. Check the outcome and upstream
+state before retrying a write; don't replay a possibly completed mutation.
 
 Click **Enable notifications** in Inbox and allow the browser prompt for
 desktop alerts. Click an alert to focus Inbox. This works with the UI open

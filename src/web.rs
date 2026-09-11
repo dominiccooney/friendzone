@@ -1525,7 +1525,12 @@ mod tests {
         let send = |url: &str, body: String| {
             let req = guest
                 .post(url)
-                .header("authorization", "Bearer fake-github")
+                // Real gh 2.100.0 wire shape: token scheme + merge queue preview.
+                .header("authorization", "token fake-github")
+                .header("graphql-features", "merge_queue")
+                .header("x-github-api-version", "2022-11-28")
+                .header("time-zone", "America/New_York")
+                .header("user-agent", "GitHub CLI 2.100.0")
                 .header("content-type", "application/json")
                 .body(body);
             tokio::spawn(async move { req.send().await.unwrap() })
@@ -1701,6 +1706,53 @@ mod tests {
                 assert_eq!(host.post(format!("{endpoint}/decision")).header("x-friendzone-review","1").json(&serde_json::json!({"fingerprint":summary.fingerprint,"decision":"approve"})).send().await.unwrap().status(),StatusCode::CONFLICT);
             }
         }
+        // Reproduce an enclosing client's shorter deadline: it must cancel the
+        // pending review, not look like broker expiry or leave a replayable write.
+        let before = received.lock().unwrap().len();
+        let timed_request = guest.post(crate::github::ENDPOINT)
+            .header("authorization", "token fake-github")
+            .header("graphql-features", "merge_queue")
+            .json(&serde_json::json!({"query":"mutation { convertPullRequestToDraft(input:{pullRequestId:\"PR_fixture\"}){clientMutationId} }"}))
+            .timeout(std::time::Duration::from_millis(750));
+        let timed = tokio::spawn(async move { timed_request.send().await });
+        let waiting = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(summary) = state.reviews.summaries().into_iter().next() {
+                    break summary;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(timed.await.unwrap().unwrap_err().is_timeout());
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let item = state.reviews.inspect(waiting.id).unwrap();
+                if item.summary.status != crate::review::Status::Pending {
+                    break item;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(cancelled.summary.status, crate::review::Status::Cancelled);
+        assert_eq!(
+            received.lock().unwrap().len(),
+            before,
+            "timed-out write never forwarded"
+        );
+        assert!(
+            state
+                .reviews
+                .decide(
+                    waiting.id,
+                    &waiting.fingerprint,
+                    crate::review::Decision::Approve
+                )
+                .is_err()
+        );
         ui_task.abort();
         proxy_task.abort();
         upstream_task.abort();

@@ -232,7 +232,18 @@ impl Settings {
                     !entry.fake.is_empty() && password == entry.fake.as_bytes()
                 });
             let literal_match = presented == entry.fake;
-            if !literal_match && basic.is_none() {
+            // GitHub CLI sends `token <PAT>`, not Bearer. Match only an exact
+            // fake in an Authorization entry configured for token escrow; keep
+            // the same pin/secret checks and configured upstream prefix.
+            let github_token = entry.header.eq_ignore_ascii_case("authorization")
+                && entry.prefix == "Bearer "
+                && entry.hosts.iter().any(|host| host == "api.github.com")
+                && value.split_once(' ').is_some_and(|(scheme, token)| {
+                    scheme.eq_ignore_ascii_case("token")
+                        && !entry.fake.is_empty()
+                        && token == entry.fake
+                });
+            if !literal_match && !github_token && basic.is_none() {
                 continue;
             }
             if !entry.hosts.iter().any(|h| h == host) {
@@ -247,7 +258,7 @@ impl Settings {
                     entry.name
                 ));
             };
-            let replacement = if literal_match {
+            let replacement = if literal_match || github_token {
                 // Preserve existing raw/prefixed (including whole-header) fakes.
                 format!("{}{real}", entry.prefix)
             } else {
@@ -316,6 +327,48 @@ mod tests {
 
     fn basic_substitution(settings: &Settings, host: &str, value: &str) -> Substitution {
         settings.substitute(host, |name| (name == "authorization").then(|| value.into()))
+    }
+
+    #[test]
+    fn github_cli_token_scheme_uses_same_exact_fake_pin_and_rotation() {
+        let (settings, dir) = basic_settings();
+        for scheme in ["token", "Token", "TOKEN"] {
+            let auth = format!("{scheme} fake-github-token");
+            let Substitution::Replace { value, .. } =
+                basic_substitution(&settings, "api.github.com", &auth)
+            else {
+                panic!("gh token substitution");
+            };
+            assert_eq!(value, "Bearer real-token");
+            assert!(matches!(
+                basic_substitution(&settings, "evil.example", &auth),
+                Substitution::Block(_)
+            ));
+        }
+        for auth in [
+            "token fake-github-token-extra",
+            "token wrong",
+            "token  fake-github-token",
+            "Digest fake-github-token",
+        ] {
+            assert!(matches!(
+                basic_substitution(&settings, "api.github.com", auth),
+                Substitution::None
+            ));
+        }
+        settings.set_secret("github", "rotated").unwrap();
+        let Substitution::Replace { value, .. } =
+            basic_substitution(&settings, "api.github.com", "token fake-github-token")
+        else {
+            panic!("rotation");
+        };
+        assert_eq!(value, "Bearer rotated");
+        settings.remove_secret("github").unwrap();
+        assert!(matches!(
+            basic_substitution(&settings, "api.github.com", "token fake-github-token"),
+            Substitution::Block(_)
+        ));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

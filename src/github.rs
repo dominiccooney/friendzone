@@ -39,10 +39,20 @@ pub fn read_transport(request: &hudsucker::hyper::Request<hudsucker::Body>) -> b
                     | "x-github-api-version"
                     | "time-zone"
                     | "cache-control"
+                    | "graphql-features"
             )
         {
             return false;
         }
+    }
+    // gh 2.100.0 includes this preview header in PR queries. Only the known
+    // read-schema preview is accepted, not arbitrary future feature switches.
+    if request
+        .headers()
+        .get("graphql-features")
+        .is_some_and(|value| value != "merge_queue")
+    {
+        return false;
     }
     if request.headers().get("host").is_some_and(|value| {
         !value.to_str().is_ok_and(|host| {
@@ -410,6 +420,8 @@ pub(crate) mod tests {
             assert!(!read_transport(&request(url)), "{url}");
         }
         for (name, value) in [
+            ("graphql-features", "unrecognized"),
+            ("graphql-features", "merge_queue,unrecognized"),
             ("host", "evil.test"),
             ("x-http-method-override", "DELETE"),
             ("x-operation-name", "Write"),
@@ -425,6 +437,26 @@ pub(crate) mod tests {
             );
             assert!(!read_transport(&req), "{name}");
         }
+        let mut gh = request(ENDPOINT);
+        for (name, value) in [
+            ("graphql-features", "merge_queue"),
+            ("time-zone", "America/New_York"),
+            ("x-github-api-version", "2022-11-28"),
+            ("authorization", "token fake-github"),
+            ("user-agent", "GitHub CLI 2.100.0"),
+        ] {
+            gh.headers_mut().insert(
+                hudsucker::hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        assert!(read_transport(&gh));
+        gh.headers_mut()
+            .append("graphql-features", "merge_queue".parse().unwrap());
+        assert!(
+            !read_transport(&gh),
+            "duplicate preview headers remain ambiguous"
+        );
         let mut req = request(ENDPOINT);
         req.headers_mut()
             .insert("x-github-next-global-id", "1".parse().unwrap());

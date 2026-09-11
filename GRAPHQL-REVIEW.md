@@ -13,6 +13,12 @@ The browser renders the broker's structured snapshot; it does not parse
 GraphQL independently. Approval still fingerprints and forwards the
 **original method, URL, headers and body**, through the existing
 authorization/escrow path. Formatting does not change what executes.
+The review expands every argument into typed path/value rows, including
+unknown mutation inputs, nested objects/lists, null, omitted variables and
+empty values. No per-field disclosure is needed. Fields carrying arguments,
+targets or conditions remain visible even when nested; response-only field
+names share a secondary disclosure. Effective variables/defaults are visible
+and raw supplied variables and the complete document remain available.
 GitHub queries on the supported transport now flow automatically; general
 mutations still require one-shot review. The explicit comment permission
 below remains the only automatic write exception. Parse failures
@@ -85,6 +91,9 @@ unknown headers and unknown directive extensions do not auto-pass. Allowed
 headers are Authorization, Content-Type, Content-Length, Transfer-Encoding,
 Host, User-Agent, Accept, Accept-Encoding, Connection (`close`/`keep-alive`),
 X-GitHub-Next-Global-ID, X-GitHub-Api-Version, Time-Zone and Cache-Control.
+`GraphQL-Features: merge_queue`, used by GitHub CLI 2.100.0 for PR queries,
+is accepted as a known read-schema preview; other values and duplicates are
+not auto-allowed. This does not change mutation admission.
 Standard `@skip`/`@include` on selections are supported; their Boolean/variable
 conditions cannot convert a query into a mutation. Other directives stay
 manual until supported. Batches, duplicate JSON keys, persisted queries,

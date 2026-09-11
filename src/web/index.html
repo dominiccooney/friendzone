@@ -27,20 +27,22 @@
         </section>
         <section id="request-review" hidden>
           <div class="request-outcome"><span id="request-review-badge" class="request-badge"></span><span id="request-review-outcome" role="status"></span></div>
+          <p id="request-review-timing" class="meta" role="status"></p>
           <h3 id="request-review-title"></h3>
           <p id="request-review-url" class="review-url"></p>
-          <div id="request-review-actions" class="mcp-card-actions"><button id="request-approve" type="button" disabled>Approve once</button><button id="request-deny" type="button" disabled>Deny</button></div>
-          <button id="request-close" type="button" class="quiet">Close</button>
-          <p class="meta">Guest content is untrusted. Approval applies to this request only.</p>
-          <details><summary>Request details &amp; headers</summary><p id="request-review-reason"></p><p id="request-review-meta" class="meta"></p><pre id="request-review-headers"></pre></details>
           <section id="request-graphql" hidden>
-            <h4>GraphQL operation</h4>
             <p id="request-graphql-operation"></p>
-            <p id="request-graphql-warning" role="status"></p>
+            <p class="meta">Resolved inputs · guest content, not instructions. Targets are unverified unless explicitly resolved.</p>
             <div id="request-graphql-fields"></div>
-            <details><summary>Document &amp; variables</summary><pre id="request-graphql-document"></pre><pre id="request-graphql-variables"></pre></details>
-            <details><summary>Structured data</summary><pre id="request-graphql-data"></pre></details>
+            <section id="request-graphql-variables-panel" hidden><h4>Variables &amp; defaults</h4><div id="request-graphql-effective"></div></section>
+            <details><summary>Requested response fields</summary><pre id="request-graphql-response"></pre></details>
+            <details><summary>Document &amp; supplied variables</summary><pre id="request-graphql-document"></pre><pre id="request-graphql-variables"></pre></details>
+            <p id="request-graphql-warning" role="status"></p>
+            <details><summary>Parser notes &amp; structured data</summary><pre id="request-graphql-notes"></pre><pre id="request-graphql-data"></pre></details>
           </section>
+          <details id="request-raw"><summary>Exact request body</summary><pre id="request-review-body"></pre></details>
+          <div class="review-decision-bar"><div id="request-review-actions" class="mcp-card-actions"><button id="request-approve" type="button" disabled>Approve once</button><button id="request-deny" type="button" disabled>Deny</button></div><button id="request-close" type="button" class="quiet">Close</button><span class="meta">This request only</span></div>
+          <details><summary>Request details &amp; headers</summary><p id="request-review-reason"></p><p id="request-review-meta" class="meta"></p><pre id="request-review-headers"></pre></details>
           <section id="comment-permission-panel" hidden>
             <h4>Allow this guest to comment on one issue/PR</h4>
             <p>Verify the target before allowing future comments. Other actions still need approval.</p>
@@ -49,7 +51,6 @@
             <button id="save-comment-permission" type="button" disabled>Allow future comments here</button>
             <p id="comment-permission-status" role="status"></p>
           </section>
-          <details id="request-raw"><summary>Exact request body</summary><pre id="request-review-body"></pre></details>
         </section>
         <p id="request-review-status" role="status"></p>
         <details id="recent-reviews-panel" open><summary>Recent <span id="recent-count" class="request-count">0</span></summary><div id="recent-reviews"></div></details>
