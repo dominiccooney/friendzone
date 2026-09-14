@@ -43,22 +43,22 @@ function request(config, method, route, body) {
   });
 }
 
-const plugin={name:'friendzone',manifest:{capabilities:['tools']},setup(api,ctx){
+// Configuration and observers belong to a real session, not tool discovery.
+// Each setup owns its runtime snapshots; a later setup replaces that session's
+// observer without allowing an in-flight old poll to steer it afterwards.
+function createSessionRuntime(session,ctx){
   const home=process.env.CLINE_DIR?.trim()||path.join(os.homedir(),'.cline');
   const config=JSON.parse(fs.readFileSync(path.join(home,'friendzone.json'),'utf8'));
   const origin=new URL(config.broker);
   if(!['http:','https:'].includes(origin.protocol)||origin.username||origin.password||origin.pathname!=='/'||origin.search||origin.hash||typeof config.container!=='string'||!config.container||config.container.includes(':'))throw new Error('Invalid Friendzone configuration; rerun guest setup');
-  const session=ctx.session?.sessionId;
-  if(typeof session!=='string'||!session)throw new Error('Friendzone requires a session-scoped Cline plugin host');
   const base=(process.env.CLINE_DATA_DIR?.trim()||path.join(home,'data'));
   const key=crypto.createHash('sha256').update(JSON.stringify([origin.origin,config.container,session])).digest('hex');
   const file=path.join(base,'friendzone',key+'.json');
-  const previous=observers.get(key);if(previous){previous.stopped=true;clearInterval(previous.timer);}
-  const observer={stopped:false,timer:null};observers.set(key,observer);
   let seen=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{};
   if(!seen||typeof seen!=='object'||Array.isArray(seen))throw new Error('Invalid Friendzone notification checkpoint');
+  const previous=observers.get(key);if(previous){previous.stopped=true;clearInterval(previous.timer);}
+  const observer={stopped:false,timer:null};observers.set(key,observer);
   const suffix='?session_id='+encodeURIComponent(session);
-  const idRoute=id=>{if(typeof id!=='string'||!/^[0-9a-f-]{36}$/i.test(id))throw new Error('Invalid request ID');return '/guest/jobs/'+id;};
   let polling=false;
   async function poll(){
     if(polling||observer.stopped)return;polling=true;
@@ -83,13 +83,36 @@ const plugin={name:'friendzone',manifest:{capabilities:['tools']},setup(api,ctx)
   const timer=setInterval(poll,3000);observer.timer=timer;timer.unref?.();void poll();
   // Sandboxed Cline kills the plugin child on session shutdown. No detached
   // process is launched; unref prevents an in-process host being kept alive.
+  if(typeof globalThis.__clinePluginHost?.emitEvent!=='function')ctx.logger?.log?.('Friendzone automatic session updates unavailable; use get/list requests.');
+  return {config,session,base,key,suffix,observer};
+}
+
+function sessionId(value){return typeof value==='string' && value.trim() && Buffer.byteLength(value)<=256 ? value : undefined;}
+function idRoute(id){if(typeof id!=='string'||!/^[0-9a-f-]{36}$/i.test(id))throw new Error('Invalid request ID');return '/guest/jobs/'+id;}
+
+const plugin={name:'friendzone',manifest:{capabilities:['tools']},setup(api,ctx={}){
+  const setupSession=sessionId(ctx?.session?.sessionId);
+  const runtimes=new Map();
+  function runtimeFor(context){
+    const raw=context?.sessionId;
+    const executionSession=sessionId(raw);
+    if(raw!=null && !executionSession)throw new Error('A valid Cline session ID is required to execute Friendzone tools');
+    if(setupSession && executionSession && setupSession!==executionSession)throw new Error('Friendzone tool session mismatch');
+    const session=executionSession||setupSession;
+    if(!session)throw new Error('A Cline session is required to execute Friendzone tools; discovery does not need one');
+    if(!runtimes.has(session))runtimes.set(session,createSessionRuntime(session,ctx));
+    const runtime=runtimes.get(session);
+    if(runtime.observer.stopped)throw new Error('Friendzone session runtime was replaced; reload the session tools');
+    return runtime;
+  }
+  // Cline's listPluginTools discovers contributions with {workspaceInfo}, no
+  // session. Always register descriptors; resolve state only for real execution.
   const tool=(name,description,properties,required,execute)=>api.registerTool({name,description,inputSchema:{type:'object',properties,required,additionalProperties:false},timeoutMs:20000,retryable:false,execute:async(input,context)=>{
-    if(context?.sessionId && context.sessionId!==session)throw new Error('Friendzone tool session mismatch');
-    return execute(input||{});
+    return execute(input||{},runtimeFor(context));
   }});
   tool('friendzone_submit_graphql','Submit GitHub GraphQL asynchronously. Returns immediately; mutations require host Inbox approval. Completion arrives as a steer message. Use the same request_key to recover a failed submission, never generate a new key to blindly retry a write. Large payloads: provide an absolute request_file containing {query,variables,operationName}.',{
     request_key:{type:'string',description:'Stable unique key for this intended operation; reuse only with identical content.'},query:{type:'string'},variables:{type:['object','null']},operation_name:{type:['string','null']},request_file:{type:'string',description:'Absolute guest path to a GraphQL JSON envelope (up to 10 MiB); mutually exclusive with inline query/variables.'},
-  },['request_key'],async input=>{
+  },['request_key'],async (input,{config,session})=>{
     if(typeof input.request_key!=='string'||!input.request_key)throw new Error('request_key required');
     let query=input.query,variables=input.variables??null,operation_name=input.operation_name??null;
     if(input.request_file){
@@ -105,15 +128,17 @@ const plugin={name:'friendzone',manifest:{capabilities:['tools']},setup(api,ctx)
     if(typeof query!=='string'||!query)throw new Error('query required');
     return request(config,'POST','/guest/jobs',{request_key:input.request_key,session_id:session,query,variables,operation_name});
   });
-  tool('friendzone_get_request','Retrieve a submitted request result. Does not execute or retry it. Large results are saved to a guest file.',{id:{type:'string'}},['id'],async input=>{
+  tool('friendzone_get_request','Retrieve a submitted request result. Does not execute or retry it. Large results are saved to a guest file.',{id:{type:'string'}},['id'],async (input,{config,suffix,base,key})=>{
     const result=await request(config,'GET',idRoute(input.id)+suffix);
     if(typeof result.result==='string'&&result.result.length>48000){const resultFile=path.join(base,'friendzone',key+'-'+input.id+'-result.json');atomic(resultFile,{result:result.result});return {...result,result:result.result.slice(0,48000),result_truncated:true,result_file:resultFile};}
     return result;
   });
-  tool('friendzone_list_requests','List this guest/session’s submitted requests and statuses.',{},[],()=>request(config,'GET','/guest/jobs'+suffix));
-  tool('friendzone_cancel_request','Cancel a pending or queued job. Execution already started cannot be cancelled or undone.',{id:{type:'string'}},['id'],async input=>{await request(config,'POST',idRoute(input.id)+'/cancel'+suffix);return {id:input.id,cancelled:true};});
-  tool('friendzone_remove_result','Remove a finished job and its deduplication key to release storage. Do not resubmit the removed operation.',{id:{type:'string'}},['id'],async input=>{await request(config,'DELETE',idRoute(input.id)+suffix);return {id:input.id,removed:true};});
-  if(typeof globalThis.__clinePluginHost?.emitEvent!=='function')ctx.logger?.log?.('Friendzone automatic session updates unavailable; use get/list requests.');
+  tool('friendzone_list_requests','List this guest/session’s submitted requests and statuses.',{},[],(_, {config,suffix})=>request(config,'GET','/guest/jobs'+suffix));
+  tool('friendzone_cancel_request','Cancel a pending or queued job. Execution already started cannot be cancelled or undone.',{id:{type:'string'}},['id'],async (input,{config,suffix})=>{await request(config,'POST',idRoute(input.id)+'/cancel'+suffix);return {id:input.id,cancelled:true};});
+  tool('friendzone_remove_result','Remove a finished job and its deduplication key to release storage. Do not resubmit the removed operation.',{id:{type:'string'}},['id'],async (input,{config,suffix})=>{await request(config,'DELETE',idRoute(input.id)+suffix);return {id:input.id,removed:true};});
+  // A resumed session must recover notifications without submitting another job.
+  // Bad configuration is an execution error, never a missing-tool/discovery error.
+  if(setupSession){try{runtimeFor();}catch{ctx.logger?.log?.('Friendzone notifications could not start; tool execution will report configuration errors.');}}
 }};
 // Cline imports this CommonJS file through Jiti/dynamic import, which supplies
 // the default namespace wrapper. Export the plugin itself, not another wrapper.

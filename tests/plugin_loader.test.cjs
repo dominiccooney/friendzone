@@ -1,4 +1,5 @@
-// Import-only tests. Never call setup or a contributed tool. Run on Node and
+// Import/discovery tests. Never execute a contributed tool or use a real
+// session/config. Sessionless setup must only register tool descriptors. Node and
 // Bun; optionally set FZ_CLINE_PLUGIN_IMPORT to the pinned Cline loader source
 // (with its dependencies available) for the actual Jiti-backed import path.
 const assert = require('node:assert/strict');
@@ -13,6 +14,33 @@ function validate(plugin) {
   assert.equal(plugin?.name, 'friendzone', 'Cline must receive the plugin, not an exports wrapper');
   assert.deepEqual(plugin.manifest.capabilities, ['tools']);
   assert.equal(typeof plugin.setup, 'function');
+}
+
+async function discover(plugin) {
+  const tools=[];
+  // Even a future regression must not read the developer's real config. This
+  // directory intentionally contains no friendzone.json or notification state.
+  const home=fs.mkdtempSync(path.join(os.tmpdir(),'fz empty discovery '));
+  const previous={CLINE_DIR:process.env.CLINE_DIR,CLINE_DATA_DIR:process.env.CLINE_DATA_DIR};
+  process.env.CLINE_DIR=home;process.env.CLINE_DATA_DIR=path.join(home,'data');
+  // Cline core/services/plugin-tools.ts calls collectPluginContributions with
+  // only workspaceInfo. Do not invent a session merely to make this test pass.
+  try {
+    await plugin.setup({registerTool:tool=>tools.push(tool)}, {workspaceInfo:{rootPath:home}});
+    assert.deepEqual(fs.readdirSync(home),[],'discovery must not create state');
+  } finally {
+    for(const [key,value] of Object.entries(previous)){if(value===undefined)delete process.env[key];else process.env[key]=value;}
+    fs.rmSync(home,{recursive:true,force:true});
+  }
+  assert.deepEqual(tools.map(tool=>tool.name).sort(),[
+    'friendzone_cancel_request','friendzone_get_request','friendzone_list_requests',
+    'friendzone_remove_result','friendzone_submit_graphql',
+  ]);
+  for(const tool of tools){
+    assert.equal(typeof tool.execute,'function');
+    assert.equal(tool.inputSchema.type,'object');
+    assert.equal(tool.retryable,false);
+  }
 }
 
 function artifact(t, sourceFile = source) {
@@ -33,19 +61,21 @@ test('CommonJS exposes the plugin itself without running setup', t => {
   delete require.cache[require.resolve(file)];
 });
 
-test('native dynamic import gives Cline a named plugin at the default export', async t => {
+test('native dynamic import and sessionless discovery expose the plugin and its tools', async t => {
   const exports = await import(pathToFileURL(artifact(t)).href);
   // This is the selection used by Cline's plugin loader, not exports.default
   // selected directly out of a VM mock of CommonJS module.exports.
   validate(exports.default ?? exports.plugin);
+  await discover(exports.default ?? exports.plugin);
 });
 
-test('actual Cline importPluginModule selects the standalone plugin', {
+test('actual Cline importPluginModule supports sessionless contribution discovery', {
   skip: !process.env.FZ_CLINE_PLUGIN_IMPORT && 'Set FZ_CLINE_PLUGIN_IMPORT for the upstream loader contract check',
 }, async t => {
   const { importPluginModule } = await import(pathToFileURL(process.env.FZ_CLINE_PLUGIN_IMPORT).href);
   const exports = await importPluginModule(artifact(t), { useCache: false });
   validate(exports.default ?? exports.plugin);
+  await discover(exports.default ?? exports.plugin);
 });
 
 test('generated Linux and installed Windows artifacts cross the same import boundary', {
@@ -64,9 +94,11 @@ test('generated Linux and installed Windows artifacts cross the same import boun
     validate(require(file));
     const exports = await import(pathToFileURL(file).href);
     validate(exports.default ?? exports.plugin);
+    await discover(exports.default ?? exports.plugin);
     if (cline) {
       const loaded = await cline.importPluginModule(file, { useCache: false });
       validate(loaded.default ?? loaded.plugin);
+      await discover(loaded.default ?? loaded.plugin);
     }
     delete require.cache[require.resolve(file)];
   }

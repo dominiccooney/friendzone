@@ -36,7 +36,20 @@ accept an arbitrary endpoint, Authorization header or redirect destination.
 
 ## Session updates
 
-The plugin polls every three seconds while its Cline sandbox is alive. Terminal
+Tool discovery is sessionless: setup registers all five tools without reading
+guest configuration, creating timers, contacting the broker or emitting messages.
+Missing or invalid configuration therefore does not hide tools. It is reported
+when a tool actually executes.
+
+Execution resolves the real session from Cline's tool context, falling back to
+the setup session when present. Without either, execution fails before I/O.
+A conflicting tool/setup session is rejected; there is no last-session fallback
+and tool input cannot set the session. One session-bound snapshot contains the
+broker configuration, result paths and notification observer. It is initialized
+on first execution, or on session-bound setup to resume notifications. Config
+edits become effective on session/plugin reload, not halfway through a request.
+
+Each initialized session polls every three seconds while its sandbox is alive. Terminal
 states emit `steer_message` with `{sessionId, prompt}` through Cline's plugin host
 bridge. The prompt contains only the job ID/status and a get-result instruction:
 no query, file content, GitHub message or token is promoted into a steer prompt.
@@ -54,10 +67,14 @@ Contract checked against Cline commit `dd50b97192e21e08408ee2ad1c5190aaf56d610e`
 [background-terminal example](https://github.com/cline/cline/blob/dd50b97192e21e08408ee2ad1c5190aaf56d610e/sdk/examples/plugins/background-terminal.ts),
 [sandbox tool/bridge contract](https://github.com/cline/cline/blob/dd50b97192e21e08408ee2ad1c5190aaf56d610e/sdk/packages/core/src/extensions/plugin/plugin-sandbox-bootstrap.ts),
 [discovery paths](https://github.com/cline/cline/blob/dd50b97192e21e08408ee2ad1c5190aaf56d610e/sdk/packages/shared/src/storage/paths.ts).
+Sessionless contribution discovery is defined in
+[plugin-tools.ts](https://github.com/cline/cline/blob/dd50b97192e21e08408ee2ad1c5190aaf56d610e/sdk/packages/core/src/services/plugin-tools.ts),
+which calls setup with `{ workspaceInfo }`, not a session.
 The intended runtime is Cline's Node plugin sandbox on Linux/Windows; bridge
 delivery to an actual installed Cline session still requires guest acceptance
-testing. Import-only tests now load the standalone file using native dynamic
-import and Cline's pinned `importPluginModule` under Node and Bun. The CommonJS
+testing. Import/discovery tests load the standalone file using native dynamic
+import and Cline's pinned `importPluginModule` under Node and Bun, then run
+sessionless contribution discovery. The CommonJS
 export is `module.exports = plugin`: wrapping it in `{ default: plugin, plugin }`
 causes Cline to select an object without a `name` and reject the plugin before
 tool registration. A VM test which selects `module.exports.default` does not
@@ -129,7 +146,8 @@ temporary guest homes and mocked Windows user-environment writes. They do not
 install into the developer's Cline, restart a live broker, change host networking
 or send real GitHub mutations.
 
-`tests/plugin_loader.test.cjs` loads but never calls `setup` or an agent tool.
+`tests/plugin_loader.test.cjs` imports and calls sessionless `setup` to collect
+tool descriptors, but never executes an agent tool or uses guest configuration.
 Run it with `node --test` or `bun test`. The optional `FZ_CLINE_PLUGIN_IMPORT`
 points at Cline's actual `plugin-module-import.ts` with its dependencies present.
 `tests/fixtures/prepare_plugin_loader.ps1 -Directory <empty absolute temp path>`

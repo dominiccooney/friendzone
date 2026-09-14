@@ -6,6 +6,29 @@ const path=require('node:path');
 const http=require('node:http');
 const vm=require('node:vm');
 const source=fs.readFileSync(path.join(__dirname,'../src/plugin/friendzone.js'),'utf8');
+const toolNames=['friendzone_submit_graphql','friendzone_get_request','friendzone_list_requests','friendzone_cancel_request','friendzone_remove_result'];
+
+test('discovery without a session registers tools without config, timers, networking or steering',async()=>{
+  for(const context of [undefined,{}, {workspaceInfo:{rootPath:'/workspace'}},{session:{}},{session:{sessionId:''}},{session:{sessionId:'   '}}]){
+    const tools=new Map(),effects=[];
+    const blocked=name=>()=>{effects.push(name);throw new Error('Unexpected discovery side effect: '+name);};
+    const sandbox={module:{exports:{}},require:name=>{
+      if(name==='node:fs')return new Proxy({}, {get:(_,method)=>blocked('fs.'+String(method))});
+      if(name==='node:os')return {homedir:blocked('homedir')};
+      if(name==='node:http'||name==='node:https')return {request:blocked('request')};
+      return require(name);
+    },Buffer,URL,process:{env:{}},setInterval:blocked('timer'),setTimeout:blocked('timer'),clearInterval:blocked('clear timer'),clearTimeout:blocked('clear timer'),
+      __clinePluginHost:{emitEvent:blocked('steer_message')}};
+    vm.runInNewContext(source,sandbox,{filename:'friendzone.js'});
+    sandbox.module.exports.setup({registerTool:tool=>tools.set(tool.name,tool)},context);
+    assert.deepEqual([...tools.keys()],toolNames);
+    for(const tool of tools.values()){
+      assert.equal(tool.retryable,false);assert.equal(typeof tool.execute,'function');
+      await assert.rejects(()=>tool.execute({session_id:'not-a-real-context',sessionId:'not-a-real-context'},{}),/session.*required|requires.*session/i);
+    }
+    assert.deepEqual(effects,[]);
+  }
+});
 
 async function fixture(t){
   const home=fs.mkdtempSync(path.join(os.tmpdir(),'fz-plugin-'));
@@ -39,8 +62,9 @@ async function fixture(t){
     if(bridge)sandbox.__clinePluginHost={emitEvent:(name,payload)=>events.push({name,payload})};
     vm.runInNewContext(source,sandbox,{filename:'friendzone.js'});
     assert.equal(sandbox.module.exports.name,'friendzone');
-    sandbox.module.exports.setup({registerTool:tool=>tools.set(tool.name,tool)},{session:{sessionId:session}});
-    return {tools,timers,run:(name,args)=>tools.get(name).execute(args,{sessionId:session})};
+    const setup=session=>{tools.clear();sandbox.module.exports.setup({registerTool:tool=>tools.set(tool.name,tool)},session===undefined?{workspaceInfo:{rootPath:home}}:{session:{sessionId:session}});};
+    setup(session);
+    return {tools,timers,setup,run:(name,args,executionSession=session)=>tools.get(name).execute(args,{sessionId:executionSession})};
   }
   async function waitFor(predicate){for(let i=0;i<100;i++){if(predicate())return;await new Promise(r=>setTimeout(r,10));}throw new Error('fixture timeout');}
   return {home,jobs,calls,events,load,waitFor};
@@ -76,4 +100,64 @@ test('large file input uses direct bootstrap, no SDK dependencies; polling fallb
   fs.writeFileSync(file,JSON.stringify({query:'query{viewer{id}}',endpoint:'https://evil.invalid'}));
   await assert.rejects(()=>plugin.run('friendzone_submit_graphql',{request_key:'x',request_file:file}),/Unsupported/);
   assert.equal(fs.existsSync(path.join(f.home,'data/friendzone')),false);
+});
+
+test('tools discovered without a session use execution context and keep concurrent sessions separate',async t=>{
+  const f=await fixture(t),plugin=f.load(undefined);
+  assert.deepEqual([...plugin.tools.keys()],toolNames);
+  assert.equal(plugin.timers.length,0);assert.equal(f.calls.length,0);
+  const submit=(key,session)=>plugin.run('friendzone_submit_graphql',{request_key:key,query:'mutation { example { id } }'},session);
+  const [a,b]=await Promise.all([submit('operation-a','session-a'),submit('operation-b','session-b')]);
+  assert.equal(a.session_id,'session-a');assert.equal(b.session_id,'session-b');
+  assert.equal(plugin.timers.length,2);
+  assert.deepEqual(Array.from(await plugin.run('friendzone_list_requests',{},'session-a'),j=>j.id),[a.id]);
+  assert.deepEqual(Array.from(await plugin.run('friendzone_list_requests',{},'session-b'),j=>j.id),[b.id]);
+  await assert.rejects(()=>plugin.run('friendzone_get_request',{id:b.id},'session-a'),/404/);
+  Object.assign(f.jobs.get(a.id),{terminal:true,status:'response_received',http_status:200,updated_at:'finished-a',result:'a result'});
+  Object.assign(f.jobs.get(b.id),{terminal:true,status:'denied',updated_at:'finished-b'});
+  await f.waitFor(()=>f.calls.filter(c=>c.method==='GET').length>=5);
+  for(const timer of plugin.timers)await timer.callback();
+  assert.equal(f.events.length,2);
+  assert.match(f.events.find(e=>e.payload.sessionId==='session-a').payload.prompt,new RegExp(a.id));
+  assert.match(f.events.find(e=>e.payload.sessionId==='session-b').payload.prompt,new RegExp(b.id));
+  for(const timer of plugin.timers)await timer.callback();
+  assert.equal(f.events.length,2,'one observer/checkpoint per session, not per tool');
+  assert.equal(fs.readdirSync(path.join(f.home,'data/friendzone')).length,2);
+  const before=f.calls.length;
+  for(const context of [{}, {sessionId:''},{sessionId:' '},{sessionId:42}])
+    await assert.rejects(()=>plugin.tools.get('friendzone_list_requests').execute({},context),/session.*required/i);
+  assert.equal(f.calls.length,before,'never reuse the last executed session');
+});
+
+test('session-bound setup supports missing execution context and discovery does not stop its observer',async t=>{
+  const f=await fixture(t),plugin=f.load('session-a');
+  const tool=plugin.tools.get('friendzone_submit_graphql');
+  const a=await tool.execute({request_key:'setup-session',query:'mutation { x }'});
+  assert.equal(a.session_id,'session-a');
+  const observer=plugin.timers[0];
+  plugin.setup(undefined);
+  assert.deepEqual([...plugin.tools.keys()],toolNames);
+  assert.equal(plugin.timers.length,1);assert.ok(!observer.stopped,'discovery must not mutate an active observer');
+  await plugin.run('friendzone_list_requests',{},'session-a');
+  assert.ok(observer.stopped,'real reinitialization replaces only its own session observer');
+  assert.equal(plugin.timers.length,2);
+  const count=f.calls.length;await observer.callback();assert.equal(f.calls.length,count);
+  await assert.rejects(()=>tool.execute({},{sessionId:'session-b'}),/session mismatch/);
+});
+
+test('discovery is independent of config validity; first execution reads config and can recover after repair',async t=>{
+  const f=await fixture(t),configFile=path.join(f.home,'friendzone.json');
+  const config=fs.readFileSync(configFile,'utf8');fs.unlinkSync(configFile);
+  const plugin=f.load(undefined);
+  assert.equal(plugin.tools.size,5);assert.equal(plugin.timers.length,0);
+  await assert.rejects(()=>plugin.run('friendzone_list_requests',{},'session-a'),/ENOENT/);
+  fs.writeFileSync(configFile,'{bad json');
+  await assert.rejects(()=>plugin.run('friendzone_list_requests',{},'session-a'));
+  assert.equal(f.calls.length,0);assert.equal(plugin.timers.length,0);
+  // Session-bound discovery must also keep its registered tools on bad config.
+  const bound=f.load('session-b');assert.equal(bound.tools.size,5);assert.equal(bound.timers.length,0);
+  fs.writeFileSync(configFile,config);
+  assert.equal((await plugin.run('friendzone_list_requests',{},'session-a')).length,0);
+  assert.equal((await bound.run('friendzone_list_requests',{})).length,0);
+  assert.equal(plugin.timers.length,1);assert.equal(bound.timers.length,1);
 });
