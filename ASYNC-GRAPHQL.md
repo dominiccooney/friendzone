@@ -18,13 +18,14 @@ the integration after restarting Cline; it does not cancel submitted jobs.
   Large results return a preview plus an absolute guest result-file path.
 - `friendzone_list_requests`: outstanding and completed requests for this session.
 - `friendzone_cancel_request`: cancels pending/queued work, not a running mutation.
-- `friendzone_remove_result`: removes a finished job and releases storage. This
-  **also removes its deduplication key**; do not resubmit the removed operation.
+- `friendzone_remove_result`: removes a finished job and releases storage. It
+  does not undo anything upstream.
 
-Keep `request_key` stable for one intended operation. If submission times out,
-submit the **same content and key** again to recover its ID, or list requests.
-Different content/session with the same guest-scoped key is rejected. Client
-disconnects after acceptance do not cancel jobs. Unknown mutations retain full
+`request_key` is a non-unique, human-readable correlation label. **Every submit
+call creates a fresh job and a fresh approval**, even for identical content/key.
+This permits explicit retries but cannot make them safe. If submission times out,
+list existing jobs before retrying; a retry may create a duplicate upstream
+effect. Client disconnects after acceptance do not cancel jobs. Unknown mutations retain full
 GraphQL input coverage: the broker does not need a new tool for each mutation.
 
 Queries classified by the existing parser execute without approval. Mutations
@@ -49,27 +50,37 @@ broker configuration, result paths and notification observer. It is initialized
 on first execution, or on session-bound setup to resume notifications. Config
 edits become effective on session/plugin reload, not halfway through a request.
 
-Each initialized session polls every three seconds while its sandbox is alive. Terminal
+Each initialized session polls every 15 seconds while its sandbox is alive. Terminal
 states emit `steer_message` with `{sessionId, prompt}` through Cline's plugin host
 bridge. The prompt contains only the job ID/status and a get-result instruction:
 no query, file content, GitHub message or token is promoted into a steer prompt.
 The result is fetched as tool output, which remains untrusted upstream content.
 
 **Cline sandbox lifetime matters:** Cline's default plugin idle timeout is 30
-minutes, measured from host calls into the sandbox. Our status polling does not
-reset it. Guest setup now sets `CLINE_PLUGIN_IDLE_TIMEOUT_MS=90000000` (25 hours),
-covering the 24-hour approval window plus delivery. This affects all plugins in
-that guest's Cline sandbox. Reloading a plugin alone cannot change a hub's
-inherited environment: restart the **guest hub** from the activated environment.
-An explicit SDK `idleTimeoutMs` option takes precedence over the environment.
+minutes, measured from host calls into the sandbox. The plugin does not override
+that global setting. If requests remain pending for 20 minutes since the last
+Friendzone message, it emits one grouped reminder containing only IDs/statuses.
+Cline starts a normal turn when the session is idle; Friendzone's no-op lifecycle
+hooks make that turn a host-to-sandbox call, refreshing ordinary sandbox liveness.
+Further reminders occur no more than every 20 minutes while work remains active.
+The reminder distinguishes pending, approved and sending jobs; it never implies
+that an approved job still needs another decision.
 
-Submission returns `notification_delivery` with bridge availability, configured
-idle timeout and a warning when too short. This is a configuration diagnostic,
-not proof of receipt by the agent. Closing the session/hub still stops polling.
+This is best-effort, not a daemon contract: a closed/failed session, unavailable
+bridge, or a session that stays busy/aborting can prevent the reminder turn and
+allow normal sandbox reaping. Reinitialization catches up from durable jobs.
+Closing the session/hub still stops polling.
 Get/list recover the accepted job; they never resubmit. HTTP 4xx/5xx (including
 499), GraphQL errors and other terminal states all trigger the same observer.
 New 4xx/5xx outcomes are stored as `upstream_error`; older `response_received`
 records containing those codes remain terminal and display as HTTP errors.
+
+Release `ebfa82b` briefly configured `CLINE_PLUGIN_IDLE_TIMEOUT_MS=90000000`.
+Current setup no longer sets it. Rerunning setup recognizes only that exact value
+when ownership is proven by the previous managed environment metadata, restores
+the prior Windows user value, and removes it from the generated shell activation.
+Other user-authored values are preserved. Existing hubs retain inherited values
+until restarted; this migration does not kill them.
 
 Notification checkpoints persist per broker/guest/session in Cline's data
 directory (`CLINE_DATA_DIR` respected). Resuming the same session discovers
@@ -125,7 +136,7 @@ broker per data directory. It is not a transactional filesystem/database against
 power-loss in all environments, and it is not encrypted storage.
 
 `Sending` is persisted **before** sending to GitHub. On restart:
-- Pending/approved jobs become cancelled, not sent; submit a new key if needed.
+- Pending/approved jobs become cancelled, not sent; submit again if needed.
 - Sending jobs become uncertain; never automatically replayed.
 - Completed/denied/cancelled jobs and results remain retrievable.
 
@@ -162,6 +173,13 @@ Tests use isolated broker data/ports, fake GitHub tokens/local upstreams, explic
 temporary guest homes and mocked Windows user-environment writes. They do not
 install into the developer's Cline, restart a live broker, change host networking
 or send real GitHub mutations.
+
+The publication acceptance test submits a large `createCommitOnBranch`, approves
+and executes it, reads the retained commit result, then independently submits,
+approves and executes `createPullRequest`. It verifies the expected-head and head
+branch inputs and proves that later worker ticks and broker reloads replay neither
+write. Changes to async publication are not considered complete unless this full
+workflow passes; isolated parser or tool-discovery tests are insufficient.
 
 `tests/plugin_loader.test.cjs` imports and calls sessionless `setup` to collect
 tool descriptors, but never executes an agent tool or uses guest configuration.

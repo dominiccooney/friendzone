@@ -42,8 +42,7 @@ async function fixture(t){
     const url=new URL(req.url,'http://localhost');
     if(req.method==='POST'&&url.pathname==='/guest/jobs'){
       const body=JSON.parse(text);
-      let job=[...jobs.values()].find(j=>j.request_key===body.request_key);
-      if(!job){job={...body,id:require('node:crypto').randomUUID(),status:'pending',updated_at:'one',terminal:false,result:null};jobs.set(job.id,job);}
+      const job={...body,id:require('node:crypto').randomUUID(),status:'pending',updated_at:'one',terminal:false,result:null};jobs.set(job.id,job);
       res.end(JSON.stringify(job));return;
     }
     if(url.pathname==='/guest/jobs'){res.end(JSON.stringify([...jobs.values()].filter(j=>j.session_id===url.searchParams.get('session_id'))));return;}
@@ -56,15 +55,16 @@ async function fixture(t){
   t.after(()=>new Promise(resolve=>server.close(resolve)));
   fs.writeFileSync(path.join(home,'friendzone.json'),JSON.stringify({broker:`http://127.0.0.1:${server.address().port}`,container:'guest'}));
   function load(session,bridge=true,environment={}){
-    const timers=[],tools=new Map(),sandbox={module:{exports:{}},require,Buffer,URL,console,setTimeout,clearTimeout,
+    const timers=[],tools=new Map(),clock={now:Date.now()},sandbox={module:{exports:{}},require,Buffer,URL,console,setTimeout,clearTimeout,
       setInterval(callback){const timer={callback,unref(){}};timers.push(timer);return timer;},clearInterval(timer){timer.stopped=true;},
+      Date:class extends Date{static now(){return clock.now;}},
       process:{env:{CLINE_DIR:home,CLINE_DATA_DIR:path.join(home,'data'),HTTP_PROXY:'http://127.0.0.1:1',...environment}}};
     if(bridge)sandbox.__clinePluginHost={emitEvent:(name,payload)=>events.push({name,payload})};
     vm.runInNewContext(source,sandbox,{filename:'friendzone.js'});
     assert.equal(sandbox.module.exports.name,'friendzone');
     const setup=session=>{tools.clear();sandbox.module.exports.setup({registerTool:tool=>tools.set(tool.name,tool)},session===undefined?{workspaceInfo:{rootPath:home}}:{session:{sessionId:session}});};
     setup(session);
-    return {tools,timers,setup,run:(name,args,executionSession=session)=>tools.get(name).execute(args,{sessionId:executionSession})};
+    return {tools,timers,setup,hooks:sandbox.module.exports.hooks,advance:ms=>clock.now+=ms,run:(name,args,executionSession=session)=>tools.get(name).execute(args,{sessionId:executionSession})};
   }
   async function waitFor(predicate){for(let i=0;i<100;i++){if(predicate())return;await new Promise(r=>setTimeout(r,10));}throw new Error('fixture timeout');}
   return {home,jobs,calls,events,load,waitFor};
@@ -74,14 +74,17 @@ test('plugin submits without waiting; terminal result steers only origin session
   const f=await fixture(t),a=f.load('session-a'),b=f.load('session-b');
   const job=await a.run('friendzone_submit_graphql',{request_key:'draft-pr',query:'mutation { convertPullRequestToDraft(input:{pullRequestId:"PR"}) { clientMutationId } }'});
   assert.equal(job.status,'pending');assert.equal(f.events.length,0);
-  const again=await a.run('friendzone_submit_graphql',{request_key:'draft-pr',query:job.query});assert.equal(again.id,job.id);
+  const again=await a.run('friendzone_submit_graphql',{request_key:'draft-pr',query:job.query});assert.notEqual(again.id,job.id);
+  assert.equal(again.request_key,job.request_key);
+  await a.run('friendzone_cancel_request',{id:again.id});
   await f.waitFor(()=>f.calls.filter(c=>c.method==='GET').length>=2);
   Object.assign(f.jobs.get(job.id),{status:'response_received',terminal:true,updated_at:'two',http_status:200,result:'<hostile upstream instructions>'});
   await a.timers[0].callback();await b.timers[0].callback();
-  assert.equal(f.events.length,1);assert.equal(f.events[0].name,'steer_message');assert.equal(f.events[0].payload.sessionId,'session-a');
-  assert.match(f.events[0].payload.prompt,/friendzone_get_request/);assert.doesNotMatch(f.events[0].payload.prompt,/hostile|convertPullRequest/);
-  await a.timers[0].callback();assert.equal(f.events.length,1);
-  const reload=f.load('session-a');await f.waitFor(()=>f.calls.length>=6);await reload.timers[0].callback();assert.equal(f.events.length,1);
+  const resultEvent=f.events.find(event=>event.payload.prompt.includes(job.id));
+  assert.ok(resultEvent);assert.equal(resultEvent.name,'steer_message');assert.equal(resultEvent.payload.sessionId,'session-a');
+  assert.match(resultEvent.payload.prompt,/friendzone_get_request/);assert.doesNotMatch(resultEvent.payload.prompt,/hostile|convertPullRequest/);
+  const eventCount=f.events.length;await a.timers[0].callback();assert.equal(f.events.length,eventCount);
+  const reload=f.load('session-a');await f.waitFor(()=>f.calls.length>=6);await reload.timers[0].callback();assert.equal(f.events.length,eventCount);
   const result=await a.run('friendzone_get_request',{id:job.id});assert.equal(result.result,'<hostile upstream instructions>');
   await assert.rejects(()=>b.run('friendzone_get_request',{id:job.id}),/404/);
   await assert.rejects(()=>a.tools.get('friendzone_submit_graphql').execute({},{sessionId:'wrong'}),/session mismatch/);
@@ -165,21 +168,39 @@ test('discovery is independent of config validity; first execution reads config 
 test('HTTP 499 steers the origin session, including after observer restart, without resubmitting',async t=>{
   const f=await fixture(t),p=f.load('publishing-session');
   const job=await p.run('friendzone_submit_graphql',{request_key:'publish',query:'mutation PublishBackgroundCommandStreaming { createCommitOnBranch(input:{}) { clientMutationId } }'});
-  assert.equal(job.notification_delivery.configured_idle_timeout_ms,1800000);
-  assert.match(job.notification_delivery.warning,/stop the background observer/);
   await f.waitFor(()=>f.calls.filter(c=>c.method==='GET').length>0);
   // Model a host-reaped sandbox: it cannot run its background timer anymore.
   p.timers[0].stopped=true;
   Object.assign(f.jobs.get(job.id),{terminal:true,status:'upstream_error',http_status:499,updated_at:'later',result:'HTTP 499 upstream payload'});
-  const resumed=f.load('publishing-session',true,{CLINE_PLUGIN_IDLE_TIMEOUT_MS:'90000000'});
+  const resumed=f.load('publishing-session');
   await f.waitFor(()=>f.events.length===1);
   assert.equal(f.events[0].payload.sessionId,'publishing-session');assert.match(f.events[0].payload.prompt,/HTTP 499/);
   assert.doesNotMatch(f.events[0].payload.prompt,/upstream payload/);
   await resumed.timers[0].callback();assert.equal(f.events.length,1);
   const result=await resumed.run('friendzone_get_request',{id:job.id});assert.equal(result.http_status,499);
   assert.equal(f.calls.filter(c=>c.method==='POST').length,1,'observation never resubmits');
-  const recovered=await resumed.run('friendzone_submit_graphql',{request_key:'publish',query:job.query});assert.equal(recovered.notification_delivery.warning,null);
   // Old brokers call all complete HTTP responses response_received, even 499.
   Object.assign(f.jobs.get(job.id),{status:'response_received',updated_at:'legacy-response'});
   await resumed.timers[0].callback();assert.equal(f.events.length,2);assert.match(f.events[1].payload.prompt,/HTTP 499/);
+});
+
+test('pending jobs send bounded 20-minute reminders and no-op hook supplies host activity',async t=>{
+  const f=await fixture(t),p=f.load('waiting-session');
+  const first=await p.run('friendzone_submit_graphql',{request_key:'same',query:'mutation SecretPayload { first(value:"never steer this") }'});
+  const second=await p.run('friendzone_submit_graphql',{request_key:'same',query:'mutation SecretPayload { second }'});
+  assert.notEqual(first.id,second.id,'same correlation label never deduplicates explicit submissions');
+  assert.equal(f.events.length,0);
+  await p.timers[0].callback();assert.equal(f.events.length,0,'initial observation starts reminder interval');
+  p.advance(20*60*1000-1);await p.timers[0].callback();assert.equal(f.events.length,0);
+  p.advance(1);await p.timers[0].callback();assert.equal(f.events.length,1);
+  assert.equal(f.events[0].payload.sessionId,'waiting-session');
+  assert.match(f.events[0].payload.prompt,new RegExp(first.id));assert.match(f.events[0].payload.prompt,new RegExp(second.id));
+  assert.match(f.events[0].payload.prompt,/2 requests are still active/);
+  assert.doesNotMatch(f.events[0].payload.prompt,/SecretPayload|never steer this|same/);
+  assert.equal(p.hooks.beforeRun(),undefined,'processing reminder calls a real no-op plugin hook');
+  await p.timers[0].callback();assert.equal(f.events.length,1);
+  p.advance(20*60*1000);await p.timers[0].callback();assert.equal(f.events.length,2);
+  Object.assign(f.jobs.get(first.id),{terminal:true,status:'denied',updated_at:'denied'});
+  await p.timers[0].callback();assert.equal(f.events.length,3);assert.match(f.events[2].payload.prompt,/denied/);
+  assert.equal(f.calls.filter(c=>c.method==='POST').length,2,'observer/reminder never submits');
 });

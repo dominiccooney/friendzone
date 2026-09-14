@@ -40,15 +40,31 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     $values=@{FZ_HOST=$origin.DnsSafeHost;FZ_BROKER=$Data.broker;HTTP_PROXY=$proxy;HTTPS_PROXY=$proxy}
     foreach($key in @('NODE_EXTRA_CA_CERTS','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','GIT_SSL_CAINFO','GIT_PROXY_SSL_CAINFO')) {$values[$key]=$cert}
     foreach($property in $Data.fakes.PSObject.Properties) {$values[$property.Name]=[string]$property.Value}
-    # Host-side Cline idle reaping otherwise kills the observer after 30m.
-    # 25h covers Friendzone's 24h review window plus result delivery.
-    $values.CLINE_PLUGIN_IDLE_TIMEOUT_MS='90000000'
     $values.NO_PROXY=$origin.DnsSafeHost+',localhost,127.0.0.1,::1,[::1]'
     $lines=@('# Friendzone guest environment')
+    $oldValuesPath=Join-Path $ConfigDirectory 'user-environment.json'
+    $legacyIdleMarker=Join-Path $ConfigDirectory 'remove-legacy-cline-idle-timeout'
+    $removeLegacyIdle=(Test-Path -LiteralPath $legacyIdleMarker)
+    $legacyIdlePrevious=$null
+    $backupPath=Join-Path $ConfigDirectory 'user-environment-backup.json'
+    if(Test-Path -LiteralPath $oldValuesPath){
+        try{$oldValues=Get-Content -Raw -LiteralPath $oldValuesPath|ConvertFrom-Json;$removeLegacyIdle=$removeLegacyIdle -or ($oldValues.CLINE_PLUGIN_IDLE_TIMEOUT_MS -ceq '90000000')}catch{}
+    }
+    if($removeLegacyIdle -and (Test-Path -LiteralPath $legacyIdleMarker)){
+        try{$legacyIdlePrevious=(Get-Content -Raw -LiteralPath $legacyIdleMarker|ConvertFrom-Json).previous}catch{}
+    }elseif($removeLegacyIdle -and (Test-Path -LiteralPath $backupPath)){
+        try{$saved=Get-Content -Raw -LiteralPath $backupPath|ConvertFrom-Json;$property=$saved.PSObject.Properties['CLINE_PLUGIN_IDLE_TIMEOUT_MS'];if($property.Value.applied -ceq '90000000'){$legacyIdlePrevious=$property.Value.previous}}catch{}
+    }
     foreach($key in $values.Keys) {
         if ($key -ne 'NO_PROXY') {$lines += '[Environment]::SetEnvironmentVariable('+(Quote-FzPowerShell $key)+','+(Quote-FzPowerShell $values[$key])+",'Process')"}
     }
     $lines += '$env:NO_PROXY = @(('+ (Quote-FzPowerShell $values.NO_PROXY) + ' + '','' + $env:NO_PROXY).Split('','') | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique) -join '','''
+    if($removeLegacyIdle){
+        if($null -eq $legacyIdlePrevious){$restoreIdle='Remove-Item Env:CLINE_PLUGIN_IDLE_TIMEOUT_MS'}
+        else{$restoreIdle="[Environment]::SetEnvironmentVariable('CLINE_PLUGIN_IDLE_TIMEOUT_MS',"+(Quote-FzPowerShell ([string]$legacyIdlePrevious))+",'Process')"}
+        $markerLiteral=Quote-FzPowerShell $legacyIdleMarker
+        $lines += "if (Test-Path -LiteralPath $markerLiteral) { if (`$env:CLINE_PLUGIN_IDLE_TIMEOUT_MS -ceq '90000000') { $restoreIdle }; Remove-Item -Force -LiteralPath $markerLiteral }"
+    }
     $provider=Join-Path $HomeDirectory '.cline/data/settings/providers.json'
     $providerJson=if($Data.fakes.CLINE_API_KEY){Get-FzProviderJson $provider $Data.fakes.CLINE_API_KEY}else{$null}
     if (-not $ClineDirectory) {$ClineDirectory=Join-Path $HomeDirectory '.cline'}
@@ -64,12 +80,14 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     foreach($path in @($pluginPath,$pluginConfig)){if((Test-Path -LiteralPath $path) -and -not (Test-Path -LiteralPath ($path+'.backup'))){Copy-Item -LiteralPath $path -Destination ($path+'.backup')}}
     Write-FzFile $pluginPath $plugin
     Write-FzFile $pluginConfig $pluginJson
+    if($removeLegacyIdle){Write-FzFile $legacyIdleMarker (ConvertTo-Json -InputObject @{previous=$legacyIdlePrevious})}
     Write-FzFile $cert $Data.ca
     Write-FzFile $envFile ($lines -join "`n")
     if($providerJson){Write-FzFile $provider $providerJson}
-    $valuesPath=Join-Path $ConfigDirectory 'user-environment.json'
+    $valuesPath=$oldValuesPath
     Write-FzFile $valuesPath (ConvertTo-Json -InputObject $values)
-    Invoke-FzUserEnvironment ([pscustomobject]$values) (Join-Path $ConfigDirectory 'user-environment-backup.json') $false
+    Invoke-FzUserEnvironment ([pscustomobject]$values) $backupPath $false
+    if($removeLegacyIdle){Remove-FzManagedUserValue 'CLINE_PLUGIN_IDLE_TIMEOUT_MS' '90000000' $backupPath}
     return $envFile
 }
 function Start-FzGuestSetup($Data) {

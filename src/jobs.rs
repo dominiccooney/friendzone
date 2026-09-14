@@ -107,21 +107,29 @@ mod tests {
             .unwrap();
         let id = Fixture::id(&accepted);
         assert_eq!(accepted["status"], "pending");
-        assert_eq!(
-            f.app
-                .jobs
-                .submit(&f.app, &f.settings, "guest", f.peer, input.clone())
-                .unwrap()["id"],
-            accepted["id"]
-        );
+        let retry = f
+            .app
+            .jobs
+            .submit(&f.app, &f.settings, "guest", f.peer, input.clone())
+            .unwrap();
+        assert_ne!(retry["id"], accepted["id"]);
+        assert_eq!(retry["request_key"], accepted["request_key"]);
+        let instance = f.app.async_identity("guest", f.peer).unwrap().0;
+        f.app
+            .jobs
+            .cancel("guest", instance, Fixture::id(&retry), "session")
+            .unwrap();
         let mut changed = input.clone();
         changed.query.push(' ');
-        assert!(
-            f.app
-                .jobs
-                .submit(&f.app, &f.settings, "guest", f.peer, changed)
-                .is_err()
-        );
+        let changed = f
+            .app
+            .jobs
+            .submit(&f.app, &f.settings, "guest", f.peer, changed)
+            .unwrap();
+        f.app
+            .jobs
+            .cancel("guest", instance, Fixture::id(&changed), "session")
+            .unwrap();
         let detail = f.app.jobs.inspect(id).unwrap();
         assert!(detail.body.len() > 65536);
         assert_eq!(detail.summary.status, Status::Pending);
@@ -478,6 +486,172 @@ mod tests {
         assert_eq!(facts.repositories, vec!["cline/cline"]);
         server.abort();
     }
+
+    #[tokio::test]
+    async fn publish_commit_then_create_pr_acceptance_never_replays_either_operation() {
+        let f = Fixture::new();
+        let received = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let observed = received.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/graphql", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/graphql",
+                    axum::routing::post(
+                        move |headers: axum::http::HeaderMap,
+                              axum::Json(body): axum::Json<serde_json::Value>| {
+                            let observed = observed.clone();
+                            async move {
+                                assert_eq!(headers["authorization"], "Bearer host-secret");
+                                observed.lock().unwrap().push(body.clone());
+                                match body["operationName"].as_str() {
+                                    Some("PublishCommit") => axum::Json(serde_json::json!({
+                                        "data":{"createCommitOnBranch":{"commit":{"oid":"new-commit","url":"https://github.test/commit/new-commit"}}}
+                                    })),
+                                    Some("CreatePullRequest") => axum::Json(serde_json::json!({
+                                        "data":{"createPullRequest":{"pullRequest":{"number":42,"url":"https://github.test/pull/42"}}}
+                                    })),
+                                    other => panic!("unexpected operation {other:?}"),
+                                }
+                            }
+                        },
+                    ),
+                ),
+            )
+            .await
+            .unwrap()
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let submit =
+            |request_key: &str, operation_name: &str, query: &str, variables: serde_json::Value| {
+                f.app
+                    .jobs
+                    .submit(
+                        &f.app,
+                        &f.settings,
+                        "guest",
+                        f.peer,
+                        Submission {
+                            request_key: request_key.into(),
+                            session_id: "session".into(),
+                            query: query.into(),
+                            variables,
+                            operation_name: Some(operation_name.into()),
+                        },
+                    )
+                    .unwrap()
+            };
+        let approve = |id: Uuid| {
+            let detail = f.app.jobs.inspect(id).unwrap();
+            f.app
+                .jobs
+                .decide(
+                    id,
+                    &detail.summary.fingerprint,
+                    crate::review::Decision::Approve,
+                )
+                .unwrap();
+        };
+        let contents = "YWJj".repeat(30_000);
+        let commit = submit(
+            "publish-files",
+            "PublishCommit",
+            "mutation PublishCommit($input:CreateCommitOnBranchInput!){createCommitOnBranch(input:$input){commit{oid url}}}",
+            serde_json::json!({"input":{
+                "branch":{"repositoryNameWithOwner":"cline/cline","branchName":"dpc/feature"},
+                "expectedHeadOid":"old-commit",
+                "message":{"headline":"Publish tested files"},
+                "fileChanges":{"additions":[{"path":"src/large.ts","contents":contents}]}
+            }}),
+        );
+        let commit_id = Fixture::id(&commit);
+        let facts = f
+            .app
+            .jobs
+            .inspect(commit_id)
+            .unwrap()
+            .summary
+            .facts
+            .unwrap();
+        assert_eq!(facts.operation_name.as_deref(), Some("PublishCommit"));
+        assert_eq!(facts.repositories, vec!["cline/cline"]);
+        assert_eq!(facts.targets, vec!["branch dpc/feature"]);
+        approve(commit_id);
+        f.app
+            .jobs
+            .tick(&f.app, &f.settings, &client, &endpoint)
+            .await
+            .unwrap();
+        let instance = f.app.async_identity("guest", f.peer).unwrap().0;
+        let commit_result = f
+            .app
+            .jobs
+            .get("guest", instance, commit_id, "session")
+            .unwrap();
+        assert_eq!(commit_result["status"], "response_received");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(commit_result["result"].as_str().unwrap())
+                .unwrap()["data"]["createCommitOnBranch"]["commit"]["oid"],
+            "new-commit"
+        );
+
+        let pull = submit(
+            "open-pr",
+            "CreatePullRequest",
+            "mutation CreatePullRequest($input:CreatePullRequestInput!){createPullRequest(input:$input){pullRequest{number url}}}",
+            serde_json::json!({"input":{
+                "repositoryId":"repository-node-id","baseRefName":"main",
+                "headRefName":"dpc/feature","title":"Tested PR","body":"Details"
+            }}),
+        );
+        let pull_id = Fixture::id(&pull);
+        assert_ne!(pull_id, commit_id);
+        approve(pull_id);
+        f.app
+            .jobs
+            .tick(&f.app, &f.settings, &client, &endpoint)
+            .await
+            .unwrap();
+        let pull_result = f
+            .app
+            .jobs
+            .get("guest", instance, pull_id, "session")
+            .unwrap();
+        assert_eq!(pull_result["status"], "response_received");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(pull_result["result"].as_str().unwrap())
+                .unwrap()["data"]["createPullRequest"]["pullRequest"]["number"],
+            42
+        );
+        f.app
+            .jobs
+            .tick(&f.app, &f.settings, &client, &endpoint)
+            .await
+            .unwrap();
+        let restarted = AppState::load(&f.dir).unwrap();
+        restarted
+            .jobs
+            .tick(&restarted, &f.settings, &client, &endpoint)
+            .await
+            .unwrap();
+        let requests = received.lock().unwrap();
+        assert_eq!(requests.len(), 2, "completed writes must never replay");
+        assert_eq!(
+            requests[0]["variables"]["input"]["expectedHeadOid"],
+            "old-commit"
+        );
+        assert_eq!(
+            requests[1]["variables"]["input"]["headRefName"],
+            "dpc/feature"
+        );
+        server.abort();
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -519,6 +693,7 @@ impl Job {
             outcome: Some(self.outcome.clone()),
             asynchronous: true,
             facts: self.facts.clone(),
+            request_key: Some(self.submission.request_key.clone()),
         }
     }
     fn terminal(&self) -> bool {
@@ -649,25 +824,6 @@ impl Jobs {
             .context("guest is not authorized")?;
         // Persist legacy guest incarnation before storing jobs owned by it.
         app.persist_guest_identity()?;
-        if let Some(existing) = self
-            .0
-            .data
-            .lock()
-            .expect("jobs lock")
-            .jobs
-            .values()
-            .find(|j| {
-                j.container == container
-                    && j.instance == instance
-                    && j.submission.request_key == input.request_key
-            })
-            .cloned()
-        {
-            if existing.body != body || existing.submission.session_id != input.session_id {
-                bail!("request_key already belongs to different content/session");
-            }
-            return Ok(Self::guest_value(&existing, false));
-        }
         let entries: Vec<_> = settings
             .entries()
             .into_iter()
@@ -714,18 +870,9 @@ impl Jobs {
             facts: detail.summary.facts,
         };
         self.transaction(|store| {
-            if let Some(existing) = store.jobs.values().find(|j| {
-                j.container == container
-                    && j.instance == instance
-                    && j.submission.request_key == job.submission.request_key
-            }) {
-                if existing.body != job.body
-                    || existing.submission.session_id != job.submission.session_id
-                {
-                    bail!("request_key conflict");
-                }
-                return Ok(Self::guest_value(existing, false));
-            }
+            // Every explicit POST is a distinct job. request_key is a human
+            // correlation label, never an idempotency/deduplication key.
+            // Workers execute by UUID and never submit/retry on their own.
             if store.jobs.len() >= MAX_JOBS
                 || store.jobs.values().filter(|j| !j.terminal()).count() >= 32
                 || store

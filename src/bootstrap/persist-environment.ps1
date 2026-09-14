@@ -11,6 +11,18 @@ function Save-FzBackup($Backup, [string]$Path) {
         else { [IO.File]::Move($temporary, $Path) }
     } finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
 }
+function Remove-FzManagedUserValue([string]$Name, [string]$AppliedValue, [string]$BackupFile) {
+    if (-not (Test-Path -LiteralPath $BackupFile)) { return }
+    $saved = Get-Content -Raw -Encoding UTF8 -LiteralPath $BackupFile | ConvertFrom-Json
+    $property = $saved.PSObject.Properties[$Name]
+    if ($null -eq $property -or $property.Value.applied -cne $AppliedValue) { return }
+    if ((Get-FzUserValue $Name) -ceq $AppliedValue) { Set-FzUserValue $Name $property.Value.previous }
+    else { Write-Warning "Preserving externally changed user variable $Name" }
+    $saved.PSObject.Properties.Remove($Name)
+    $replacement = @{}
+    foreach ($item in $saved.PSObject.Properties) { $replacement[$item.Name] = $item.Value }
+    Save-FzBackup $replacement $BackupFile
+}
 function Invoke-FzUserEnvironment($Values, [string]$BackupFile, [bool]$Undo) {
     $backup = @{}
     if (Test-Path -LiteralPath $BackupFile) {

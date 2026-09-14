@@ -12,8 +12,9 @@ const source = path.join(__dirname, '../src/plugin/friendzone.js');
 
 function validate(plugin) {
   assert.equal(plugin?.name, 'friendzone', 'Cline must receive the plugin, not an exports wrapper');
-  assert.deepEqual(plugin.manifest.capabilities, ['tools']);
+  assert.deepEqual(plugin.manifest.capabilities, ['tools','hooks']);
   assert.equal(typeof plugin.setup, 'function');
+  assert.equal(typeof plugin.hooks.beforeRun, 'function');
 }
 
 async function discover(plugin) {

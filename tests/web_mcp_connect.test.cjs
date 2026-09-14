@@ -169,9 +169,15 @@ test("compact overview puts operation repository and HTTP errors in one row with
   const job={...pendingRequest,status:'response_received',http_status:499,outcome:'Response received',updated_at:'2026-09-14T09:14:17Z',facts:{operation_name:'PublishBackgroundCommandStreaming',operation_type:'mutation',fields:['createCommitOnBranch'],repositories:['cline/cline'],targets:['branch feature'],more:false}};
   const markup=f.run(`reviewTable([${JSON.stringify(job)}],"empty")`);
   assert.match(markup,/<table/);assert.match(markup,/<td[^>]*>PublishBackgroundCommandStreaming<\/td>/);
-  assert.match(markup,/>cline\/cline<\/td>/);assert.match(markup,/HTTP error · HTTP 499/);
+  assert.match(markup,/>cline\/cline · branch feature<\/td>/);assert.match(markup,/>HTTP 499<\/span>/);
   assert.doesNotMatch(markup,/Response received|<article|<p>/);
   assert.match(markup,/createCommitOnBranch/);assert.match(markup,/&lt;script&gt;/);
+  f.run(`snapshot.pending_requests=[];snapshot.containers=[];renderPendingRequests()`);
+  assert.equal(f.sandbox.document.querySelector('#pending-section').hidden,true);
+  assert.equal(f.sandbox.document.querySelector('#attention-empty').hidden,false);
+  f.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)}];renderPendingRequests()`);
+  assert.equal(f.sandbox.document.querySelector('#pending-section').hidden,false);
+  assert.equal(f.sandbox.document.querySelector('#attention-empty').hidden,true);
 });
 
 test("large value references render exact content in arguments and variables without expanders",()=>{
@@ -259,7 +265,7 @@ test("review outcomes stay visible, survive reopening and never enable resolved 
   f.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)}]`);
   const opening=f.run('openRequestReview("request-id")');
   f.calls.at(-1).resolve({ok:true,json:async()=>pendingRequest}); await opening;
-  for (const [status,code,label] of [["approved",null,"Approved"],["sending",null,"Sending"],["response_received",201,"Response received · HTTP 201"],["graphql_error",200,"GraphQL error · HTTP 200"],["denied",null,"Denied"],["expired",null,"Expired"],["cancelled",null,"Cancelled"],["blocked",null,"Blocked"],["upstream_error",502,"HTTP error · HTTP 502"]]) {
+  for (const [status,code,label] of [["approved",null,"Approved"],["sending",null,"Sending"],["response_received",201,"Response received · HTTP 201"],["graphql_error",200,"GraphQL error · HTTP 200"],["denied",null,"Denied"],["expired",null,"Expired"],["cancelled",null,"Cancelled"],["blocked",null,"Blocked"],["upstream_error",502,"HTTP 502"]]) {
     const summary={...pendingRequest,status,http_status:code,outcome:"Exact outcome <script>",updated_at:"2099-01-01T00:00:00Z"};
     f.run(`snapshot.pending_requests=[];snapshot.recent_reviews=[${JSON.stringify(summary)}];renderPendingRequests()`);
     assert.equal(element("request-review-badge").textContent,label);

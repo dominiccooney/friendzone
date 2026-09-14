@@ -42,12 +42,13 @@ for common runtimes, and fake provider keys. NO_PROXY/no_proxy includes the
 broker host, localhost, 127.0.0.1, ::1 and [::1], preserving existing exclusions.
 Real credentials and OAuth refresh tokens never enter the script.
 
-Setup sets `CLINE_PLUGIN_IDLE_TIMEOUT_MS=90000000` (25 hours) so Cline does not
-reap the async-job observer after its default 30 idle minutes. This is a
-guest-wide Cline sandbox setting, not a broker or HTTP timeout. Existing hubs
-must restart from the activated environment; other plugin sandboxes in that
-guest receive the same lifetime. Closing Cline still stops updates, but results
-remain retrievable. Windows records the previous user value for rollback.
+Friendzone does not override Cline's global plugin sandbox lifetime. While a
+request remains pending, the plugin emits a grouped reminder every 20 minutes;
+an idle Cline session processes it through no-op Friendzone hooks, providing
+normal host-to-sandbox activity. Closed, failed or continuously busy sessions can
+still miss delivery; results remain retrievable. Rerunning setup removes the
+exact temporary 25-hour override written by Friendzone release `ebfa82b` when
+previous managed metadata proves ownership. User-authored values are preserved.
 
 If Cline credentials are configured on the broker, the script merges the fake
 key into the guest's `.cline/data/settings/providers.json`. **Close guest Cline

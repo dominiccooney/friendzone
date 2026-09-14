@@ -1752,8 +1752,10 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(repeated["id"], id);
-        assert_eq!(repeated["status"], "denied");
+        assert_ne!(repeated["id"], id);
+        assert_eq!(repeated["status"], "pending");
+        assert_eq!(repeated["request_key"], "large");
+        assert_eq!(app.view().pending_requests.len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

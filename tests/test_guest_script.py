@@ -45,7 +45,7 @@ class GuestScriptTests(unittest.TestCase):
         self.assertEqual((self.home / ".profile.friendzone-backup").read_text(), "# original\n")
         self.assertIn("/old hook.sh", (self.config / "bash-env.sh").read_text())
         self.assertIn(configure.MARKER, (self.home / "zsh/.zshenv").read_text())
-        self.assertIn("CLINE_PLUGIN_IDLE_TIMEOUT_MS=90000000", (self.config / "friendzone-env.sh").read_text())
+        self.assertNotIn("CLINE_PLUGIN_IDLE_TIMEOUT_MS", (self.config / "friendzone-env.sh").read_text())
 
     def test_plugin_install_is_idempotent_custom_home_and_preserves_other_plugins(self):
         cline = self.home / "custom Cline ü"
@@ -69,6 +69,23 @@ class GuestScriptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.apply({"CLINE_DIR": str(cline)})
         self.assertEqual((self.config / "friendzone-env.sh").read_bytes(), before)
+
+    def test_upgrade_removes_only_friendzones_legacy_idle_override(self):
+        self.config.mkdir()
+        env = self.config / "friendzone-env.sh"
+        env.write_text("# Friendzone guest environment\nexport CLINE_PLUGIN_IDLE_TIMEOUT_MS=90000000\n")
+        activation = self.apply({"CLINE_PLUGIN_IDLE_TIMEOUT_MS": "90000000"})
+        text = env.read_text()
+        self.assertNotIn("export CLINE_PLUGIN_IDLE_TIMEOUT_MS", text)
+        self.assertIn("unset CLINE_PLUGIN_IDLE_TIMEOUT_MS", text)
+        bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "/bin/bash"
+        command = '. "$1"; test -z "${CLINE_PLUGIN_IDLE_TIMEOUT_MS+x}"'
+        result = subprocess.run([bash,"--noprofile","--norc","-ec",command,"test",str(activation)],env=dict(os.environ,CLINE_PLUGIN_IDLE_TIMEOUT_MS="90000000"),capture_output=True)
+        self.assertEqual(result.returncode,0,result.stderr.decode())
+        # The one-shot marker is gone; a later user value is preserved.
+        self.assertFalse((self.config / "remove-legacy-cline-idle-timeout").exists())
+        self.apply({"CLINE_PLUGIN_IDLE_TIMEOUT_MS":"user-choice"})
+        self.assertNotIn("unset CLINE_PLUGIN_IDLE_TIMEOUT_MS",env.read_text())
 
     def test_provider_merge_keeps_model_other_credentials_and_rejects_invalid_before_writes(self):
         provider = self.home / ".cline/data/settings/providers.json"

@@ -231,6 +231,8 @@ Other origins remain logged and unpoliced.
 Pending/Recent use compact tables with operation, repository/target hint, guest,
 status, time and action. Missing repository information is labeled, not guessed.
 HTTP 4xx/5xx show as errors, including older retained 499 responses.
+Async `request_key` values are correlation labels, not deduplication keys. Every
+explicit submission is a distinct job requiring its own decision.
 Recent also includes [durable async jobs](ASYNC-GRAPHQL.md). For the proxy,
 it retains the last 100 reviewed requests and their redacted details for
 this broker session, separate from the busy traffic log. Open details stay

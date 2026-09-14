@@ -88,17 +88,22 @@ def configure(data, home, config, zdotdir, environ):
     previous = old_hook.read_text(encoding="utf-8") if old_hook.exists() else environ.get("BASH_ENV", "")
     if previous == str(wrapper):
         previous = ""
+    old_environment = env.read_text(encoding="utf-8") if env.exists() else ""
+    legacy_idle = "export CLINE_PLUGIN_IDLE_TIMEOUT_MS=90000000\n"
+    legacy_idle_marker = config / "remove-legacy-cline-idle-timeout"
+    # The old generated file proves ownership. Preserve any user-authored value.
+    remove_legacy_idle = legacy_idle_marker.exists() or (legacy_idle in old_environment and old_environment.count("CLINE_PLUGIN_IDLE_TIMEOUT_MS") == 1)
     origin = urllib.parse.urlsplit(data["broker"])
     proxy_host = "[" + origin.hostname + "]" if ":" in origin.hostname else origin.hostname
     proxy = "http://{}:x@{}:{}".format(urllib.parse.quote(data["container"], safe=""), proxy_host, data["proxy_port"])
     values = dict(data["fakes"])
     values.update(FZ_HOST=origin.hostname, FZ_BROKER=data["broker"], HTTP_PROXY=proxy, HTTPS_PROXY=proxy, http_proxy=proxy, https_proxy=proxy)
-    # Cline reaps idle plugin sandboxes after 30 minutes by default. Background
-    # polling is not a host tool call; allow the full 24h review window + margin.
-    values["CLINE_PLUGIN_IDLE_TIMEOUT_MS"] = "90000000"
     for key in ("NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "GIT_SSL_CAINFO", "GIT_PROXY_SSL_CAINFO"):
         values[key] = str(cert)
     content = "# Friendzone guest environment\n" + "".join(f"export {key}={shlex.quote(value)}\n" for key, value in values.items())
+    if remove_legacy_idle:
+        marker = shlex.quote(str(legacy_idle_marker))
+        content += "if [ -r {0} ]; then\n  if [ \"${{CLINE_PLUGIN_IDLE_TIMEOUT_MS-}}\" = 90000000 ]; then unset CLINE_PLUGIN_IDLE_TIMEOUT_MS; fi\n  rm -f -- {0}\nfi\n".format(marker)
     content += '''_fz_rest="$FZ_HOST,localhost,127.0.0.1,::1,[::1],${NO_PROXY:-},${no_proxy:-},"
 _fz_list=
 while [ -n "$_fz_rest" ]; do
@@ -111,7 +116,7 @@ export NO_PROXY="$_fz_list" no_proxy="$_fz_list"
 unset _fz_rest _fz_list _fz_item
 '''
     source = ". " + shlex.quote(str(env)) + "\n"
-    edits = [(cert, data["ca"]), (env, content), (old_hook, previous),
+    edits = ([(legacy_idle_marker, "Friendzone previously managed the exact value 90000000; activation removes only that value.\n")] if remove_legacy_idle else []) + [(cert, data["ca"]), (env, content), (old_hook, previous),
              (activation, source + "export BASH_ENV=" + shlex.quote(str(wrapper)) + "\n"),
              (wrapper, ("if [ -r {0} ]; then . {0}; fi\n".format(shlex.quote(previous)) if previous else "") + source)]
     profiles = {home / ".profile", home / ".bashrc", zdotdir / ".zshenv"}

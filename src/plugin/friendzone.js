@@ -10,14 +10,8 @@ const crypto = require('node:crypto');
 const MAX_UPLOAD = 10 * 1024 * 1024;
 const MAX_RESPONSE = 32 * 1024 * 1024; // up to 4 MiB result, JSON escaped by broker
 const observers = new Map();
-const REQUIRED_IDLE_MS = 90000000;
-function notificationDelivery(){
-  const value=Number(process.env.CLINE_PLUGIN_IDLE_TIMEOUT_MS);
-  const idle=Number.isInteger(value)&&value>0&&value<=2147483647?value:1800000;
-  const bridge=typeof globalThis.__clinePluginHost?.emitEvent==='function';
-  return {bridge_available:bridge,configured_idle_timeout_ms:idle,
-    warning:!bridge?'Cline steer bridge unavailable; retrieve results with friendzone_get_request.':idle<REQUIRED_IDLE_MS?'Cline may stop the background observer before review completes. Update guest setup and restart the guest hub; get/list still recover accepted requests.':null};
-}
+const REMINDER_MS = 20 * 60 * 1000;
+const POLL_MS = 15 * 1000;
 function atomic(file, value) {
   fs.mkdirSync(path.dirname(file), {recursive:true,mode:0o700});
   const temp=file+'.'+crypto.randomUUID()+'.tmp';
@@ -45,7 +39,7 @@ function request(config, method, route, body) {
         try{resolve(text?JSON.parse(text):null);}catch{reject(new Error('Invalid broker JSON response'));}
       });
     });
-    const timer=setTimeout(()=>req.destroy(new Error('Broker call timed out; use the same request_key to recover submission')),15000);
+    const timer=setTimeout(()=>req.destroy(new Error('Broker call timed out. List existing requests before explicitly retrying; every submission creates a new job.')),15000);
     req.on('close',()=>clearTimeout(timer));req.on('error',reject);
     req.end(payload);
   });
@@ -62,8 +56,11 @@ function createSessionRuntime(session,ctx){
   const base=(process.env.CLINE_DATA_DIR?.trim()||path.join(home,'data'));
   const key=crypto.createHash('sha256').update(JSON.stringify([origin.origin,config.container,session])).digest('hex');
   const file=path.join(base,'friendzone',key+'.json');
-  let seen=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{};
-  if(!seen||typeof seen!=='object'||Array.isArray(seen))throw new Error('Invalid Friendzone notification checkpoint');
+  let saved=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{};
+  if(!saved||typeof saved!=='object'||Array.isArray(saved))throw new Error('Invalid Friendzone notification checkpoint');
+  // Upgrade the previous flat terminal-checkpoint map.
+  if(saved.version!==2)saved={version:2,terminal:saved,lastReminderAt:0};
+  if(!saved.terminal||typeof saved.terminal!=='object'||Array.isArray(saved.terminal))throw new Error('Invalid Friendzone terminal checkpoint');
   const previous=observers.get(key);if(previous){previous.stopped=true;clearInterval(previous.timer);}
   const observer={stopped:false,timer:null};observers.set(key,observer);
   const suffix='?session_id='+encodeURIComponent(session);
@@ -76,30 +73,49 @@ function createSessionRuntime(session,ctx){
       const jobs=await request(config,'GET','/guest/jobs'+suffix);
       if(observer.stopped)return;
       const next={};
+      const active=[];
+      let emitted=false;
       for(const job of jobs){
-        if(job.session_id!==session||!job.terminal)continue;
+        if(job.session_id!==session)continue;
+        if(!job.terminal){active.push(job);continue;}
         const version=job.status+':'+job.updated_at;next[job.id]=version;
-        if(seen[job.id]===version)continue;
+        if(saved.terminal[job.id]===version)continue;
         // Fixed metadata only: never promote GitHub content into steer prompts.
         if(!/^[0-9a-f-]{36}$/i.test(job.id)||!['response_received','graphql_error','denied','cancelled','expired','blocked','unknown','upstream_error'].includes(job.status))continue;
         emit('steer_message',{sessionId:session,prompt:`Friendzone request ${job.id}: ${job.status}${Number.isInteger(job.http_status)?' (HTTP '+job.http_status+')':''}. Use friendzone_get_request to retrieve its result. Do not resubmit this operation automatically.`});
+        emitted=true;
       }
-      seen=next;atomic(file,seen);
+      const now=Date.now();
+      if(emitted)saved.lastReminderAt=now;
+      if(active.length && !saved.lastReminderAt){
+        // Start the interval when active work is first observed. Submitting a
+        // request already told the agent its ID; no immediate reminder.
+        saved.lastReminderAt=now;
+      }else if(active.length && now-saved.lastReminderAt>=REMINDER_MS){
+        const shown=active.slice(0,8).map(job=>`${job.id} (${job.status})`).join(', ');
+        const extra=active.length>8?` and ${active.length-8} more`:'';
+        // This is intentionally a real turn, not a sandbox-lifetime override.
+        // Cline invokes this plugin's beforeRun hook while processing it, which
+        // is a host-to-sandbox call and refreshes Cline's ordinary idle timer.
+        emit('steer_message',{sessionId:session,prompt:`Friendzone reminder: ${active.length} request${active.length===1?' is':'s are'} still active: ${shown}${extra}. Pending requests need host approval; approved/sending requests need no action yet. Do not resubmit them automatically.`});
+        saved.lastReminderAt=now;
+      }
+      if(!active.length)saved.lastReminderAt=0;
+      saved.terminal=next;atomic(file,saved);
     }catch(error){ctx.logger?.debug?.('Friendzone status poll unavailable',{message:String(error)});}
     finally{polling=false;}
   }
-  const timer=setInterval(poll,3000);observer.timer=timer;timer.unref?.();void poll();
+  const timer=setInterval(poll,POLL_MS);observer.timer=timer;timer.unref?.();void poll();
   // Sandboxed Cline kills the plugin child on session shutdown. No detached
   // process is launched; unref prevents an in-process host being kept alive.
   if(typeof globalThis.__clinePluginHost?.emitEvent!=='function')ctx.logger?.log?.('Friendzone automatic session updates unavailable; use get/list requests.');
-  const delivery=notificationDelivery();if(delivery.warning)ctx.logger?.log?.(delivery.warning);
   return {config,session,base,key,suffix,observer};
 }
 
 function sessionId(value){return typeof value==='string' && value.trim() && Buffer.byteLength(value)<=256 ? value : undefined;}
 function idRoute(id){if(typeof id!=='string'||!/^[0-9a-f-]{36}$/i.test(id))throw new Error('Invalid request ID');return '/guest/jobs/'+id;}
 
-const plugin={name:'friendzone',manifest:{capabilities:['tools']},setup(api,ctx={}){
+const plugin={name:'friendzone',manifest:{capabilities:['tools','hooks']},setup(api,ctx={}){
   const setupSession=sessionId(ctx?.session?.sessionId);
   const runtimes=new Map();
   function runtimeFor(context){
@@ -119,8 +135,8 @@ const plugin={name:'friendzone',manifest:{capabilities:['tools']},setup(api,ctx=
   const tool=(name,description,properties,required,execute)=>api.registerTool({name,description,inputSchema:{type:'object',properties,required,additionalProperties:false},timeoutMs:20000,retryable:false,execute:async(input,context)=>{
     return execute(input||{},runtimeFor(context));
   }});
-  tool('friendzone_submit_graphql','Submit GitHub GraphQL asynchronously. Returns immediately; mutations require host Inbox approval. Completion arrives as a steer message. Use the same request_key to recover a failed submission, never generate a new key to blindly retry a write. Large payloads: provide an absolute request_file containing {query,variables,operationName}.',{
-    request_key:{type:'string',description:'Stable unique key for this intended operation; reuse only with identical content.'},query:{type:'string'},variables:{type:['object','null']},operation_name:{type:['string','null']},request_file:{type:'string',description:'Absolute guest path to a GraphQL JSON envelope (up to 10 MiB); mutually exclusive with inline query/variables.'},
+  tool('friendzone_submit_graphql','Submit GitHub GraphQL asynchronously. Every call creates a distinct job. Returns immediately; mutations require host Inbox approval. Completion arrives as a steer message. Before retrying, list/get prior jobs and inspect upstream state. Large payloads: provide an absolute request_file containing {query,variables,operationName}.',{
+    request_key:{type:'string',description:'Human-readable correlation label. Not unique and does not deduplicate retries.'},query:{type:'string'},variables:{type:['object','null']},operation_name:{type:['string','null']},request_file:{type:'string',description:'Absolute guest path to a GraphQL JSON envelope (up to 10 MiB); mutually exclusive with inline query/variables.'},
   },['request_key'],async (input,{config,session})=>{
     if(typeof input.request_key!=='string'||!input.request_key)throw new Error('request_key required');
     let query=input.query,variables=input.variables??null,operation_name=input.operation_name??null;
@@ -136,7 +152,7 @@ const plugin={name:'friendzone',manifest:{capabilities:['tools']},setup(api,ctx=
     }
     if(typeof query!=='string'||!query)throw new Error('query required');
     const accepted=await request(config,'POST','/guest/jobs',{request_key:input.request_key,session_id:session,query,variables,operation_name});
-    return {...accepted,notification_delivery:notificationDelivery()};
+    return accepted;
   });
   tool('friendzone_get_request','Retrieve a submitted request result. Does not execute or retry it. Large results are saved to a guest file.',{id:{type:'string'}},['id'],async (input,{config,suffix,base,key})=>{
     const result=await request(config,'GET',idRoute(input.id)+suffix);
@@ -145,10 +161,15 @@ const plugin={name:'friendzone',manifest:{capabilities:['tools']},setup(api,ctx=
   });
   tool('friendzone_list_requests','List this guest/session’s submitted requests and statuses.',{},[],(_, {config,suffix})=>request(config,'GET','/guest/jobs'+suffix));
   tool('friendzone_cancel_request','Cancel a pending or queued job. Execution already started cannot be cancelled or undone.',{id:{type:'string'}},['id'],async (input,{config,suffix})=>{await request(config,'POST',idRoute(input.id)+'/cancel'+suffix);return {id:input.id,cancelled:true};});
-  tool('friendzone_remove_result','Remove a finished job and its deduplication key to release storage. Do not resubmit the removed operation.',{id:{type:'string'}},['id'],async (input,{config,suffix})=>{await request(config,'DELETE',idRoute(input.id)+suffix);return {id:input.id,removed:true};});
+  tool('friendzone_remove_result','Remove a finished job to release storage. This does not undo its upstream effect.',{id:{type:'string'}},['id'],async (input,{config,suffix})=>{await request(config,'DELETE',idRoute(input.id)+suffix);return {id:input.id,removed:true};});
   // A resumed session must recover notifications without submitting another job.
   // Bad configuration is an execution error, never a missing-tool/discovery error.
   if(setupSession){try{runtimeFor();}catch{ctx.logger?.log?.('Friendzone notifications could not start; tool execution will report configuration errors.');}}
+},hooks:{
+  // No-op by design. A pending reminder starts a Cline turn; this host call
+  // proves sandbox activity without extending global sandbox policy.
+  beforeRun(){return undefined;},beforeModel(){return undefined;},afterModel(){return undefined;},
+  beforeTool(){return undefined;},afterTool(){return undefined;},afterRun(){return undefined;}
 }};
 // Cline imports this CommonJS file through Jiti/dynamic import, which supplies
 // the default namespace wrapper. Export the plugin itself, not another wrapper.

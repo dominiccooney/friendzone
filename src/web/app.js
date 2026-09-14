@@ -171,6 +171,8 @@ function renderPendingRequests() {
   $("#inbox-count").textContent = pending.length + guestJoinRequests().length;
   const recent = snapshot.recent_reviews || [];
   $("#pending-count").textContent = pending.length;
+  $("#pending-section").hidden = pending.length === 0;
+  $("#attention-empty").hidden = pending.length !== 0 || guestJoinRequests().length !== 0;
   $("#recent-count").textContent = recent.length;
   const signature = JSON.stringify([pending, recent]);
   if (signature !== pendingSignature) {
@@ -196,9 +198,9 @@ const REVIEW_STATUSES = {
 };
 function reviewStatus(request) {
   const [label, color] = REVIEW_STATUSES[request.status || "pending"] || REVIEW_STATUSES.unavailable;
-  const observed = request.status === "unknown" && request.http_status ? "Response incomplete"
-    : request.http_status>=400 ? "HTTP error" : label;
-  return {label:observed + (request.http_status ? ` · HTTP ${request.http_status}` : ""), color:request.http_status>=400?"blocked":color};
+  const observed = request.status === "unknown" && request.http_status ? `Response incomplete · HTTP ${request.http_status}`
+    : request.http_status>=400 ? `HTTP ${request.http_status}` : label + (request.http_status ? ` · HTTP ${request.http_status}` : "");
+  return {label:observed, color:request.http_status>=400?"blocked":color};
 }
 function reviewOutcomeText(request) {
   // Explain the evidence, including older brokers' retained `unknown` records.
@@ -219,10 +221,10 @@ function reviewRow(request) {
   const outcome = reviewOutcomeText(request);
   const facts=request.facts;
   const operation=facts?.operation_name || facts?.fields?.join(", ") || `${request.method} ${request.url}`;
-  const repository=facts?.repositories?.join(", ") || facts?.targets?.join(", ") || "Not identified";
   const target=[...(facts?.repositories || []),...(facts?.targets || [])].join(" · ");
+  const repository=target || "Not identified";
   const description=[facts?.operation_type,...(facts?.fields || []),facts?.more?"More operations/targets in details":"",request.url].filter(Boolean).join(" · ");
-  return `<tr class="review-row"><td class="review-operation" title="${esc(description)}">${esc(operation)}</td><td class="review-target" title="${esc(target || 'Repository not identified; inspect request details')}">${esc(repository)}${facts?.more?" …":""}</td><td>${esc(request.container)}</td><td><span class="request-badge ${status.color}" title="${esc(outcome)}">${esc(status.label)}</span></td><td class="review-time" title="${pending?'Approval deadline':'Last update'}">${pending?'by ':''}${esc(displayTime(pending?request.expires_at:request.updated_at || request.created_at))}</td><td><button type="button" data-review="${esc(request.id)}">${pending?"Review":"Details"}</button></td></tr>`;
+  return `<tr class="review-row"><td class="review-operation" data-label="Operation" title="${esc(description)}">${esc(operation)}</td><td class="review-target" data-label="Target" title="${esc(target || 'Repository not identified; inspect request details')}">${esc(repository)}${facts?.more?" …":""}</td><td class="review-guest" data-label="Guest">${esc(request.container)}</td><td class="review-state" data-label="Status"><span class="request-badge ${status.color}" title="${esc(outcome)}">${esc(status.label)}</span></td><td class="review-time" data-label="Time" title="${pending?'Approval deadline':'Last update'}">${pending?'by ':''}${esc(displayTime(pending?request.expires_at:request.updated_at || request.created_at))}</td><td class="review-action"><button type="button" data-review="${esc(request.id)}">${pending?"Review":"Details"}</button></td></tr>`;
 }
 function applyReviewOutcome(summary) {
   if (!activeReview) return;
@@ -281,7 +283,7 @@ async function openRequestReview(id) {
     $("#request-review-title").textContent = `${detail.container} · ${detail.method}`;
     $("#request-review-url").textContent = detail.url;
     $("#request-review-reason").textContent = detail.reason;
-    $("#request-review-meta").textContent = `${detail.body_bytes} bytes · SHA-256 ${detail.fingerprint}`;
+    $("#request-review-meta").textContent = `${detail.request_key?`Correlation: ${detail.request_key} · `:""}${detail.body_bytes} bytes · SHA-256 ${detail.fingerprint}`;
     $("#request-review-headers").textContent = detail.headers.map(([name,value])=>`${name}: ${value}`).join("\n");
     $("#request-review-body").textContent = detail.body || "(empty body)";
     renderGraphqlReview(detail.graphql);

@@ -61,6 +61,14 @@ $payloadMatch=[regex]::Match($bootstrapText, '\$data=\[Text.Encoding\]::UTF8.Get
 if(-not $payloadMatch.Success){throw 'Could not find generated bootstrap payload'}
 $payload=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payloadMatch.Groups[1].Value)) | ConvertFrom-Json
 $data | Add-Member -NotePropertyName plugin -NotePropertyValue $payload.plugin
+# Model ebfa82b's exact managed value/metadata, then verify this upgrade removes
+# it without inventing a general environment cleanup policy.
+$legacyBackup=Join-Path $configDir 'user-environment-backup.json'
+[IO.Directory]::CreateDirectory($configDir)|Out-Null
+$script:fakeUser.CLINE_PLUGIN_IDLE_TIMEOUT_MS='90000000'
+[IO.File]::WriteAllText((Join-Path $configDir 'user-environment.json'),'{"CLINE_PLUGIN_IDLE_TIMEOUT_MS":"90000000"}')
+[IO.File]::WriteAllText($legacyBackup,'{"CLINE_PLUGIN_IDLE_TIMEOUT_MS":{"previous":"user-original","applied":"90000000"}}')
+$env:CLINE_PLUGIN_IDLE_TIMEOUT_MS='90000000'
 $otherPlugin=Join-Path $homeDir '.cline/plugins/other.js'
 Write-FzFile $otherPlugin '// unrelated plugin'
 $EnvironmentFile=Invoke-FzConfigure $data $homeDir $configDir
@@ -98,7 +106,9 @@ if ($env:FZ_HOST -ne '192.0.2.1') { throw 'wrong broker host' }
 if ($env:CLINE_API_KEY -cne "fake'`$(not-a-command)") { throw 'fake changed or evaluated' }
 if ($env:NO_PROXY -notmatch 'localhost' -or $env:NO_PROXY -notmatch '127.0.0.1') { throw 'loopback exclusions missing' }
 if($env:NODE_EXTRA_CA_CERTS -cne (Join-Path $configDir 'friendzone-ca.pem')){throw 'CA path with spaces/apostrophe did not survive activation'}
-if($env:CLINE_PLUGIN_IDLE_TIMEOUT_MS -ne '90000000' -or $script:fakeUser.CLINE_PLUGIN_IDLE_TIMEOUT_MS -ne '90000000'){throw 'plugin idle lifetime not persisted/activated'}
+if($env:CLINE_PLUGIN_IDLE_TIMEOUT_MS -ne 'user-original' -or $script:fakeUser.CLINE_PLUGIN_IDLE_TIMEOUT_MS -ne 'user-original'){throw "legacy managed idle override not restored (process='$($env:CLINE_PLUGIN_IDLE_TIMEOUT_MS)', user='$($script:fakeUser.CLINE_PLUGIN_IDLE_TIMEOUT_MS)')"}
+if((Get-Content -Raw -LiteralPath (Join-Path $configDir 'user-environment.json')) -match 'CLINE_PLUGIN_IDLE_TIMEOUT_MS'){throw 'legacy override retained in managed values'}
+if((Get-Content -Raw -LiteralPath $legacyBackup) -match 'CLINE_PLUGIN_IDLE_TIMEOUT_MS'){throw 'legacy backup entry retained'}
 foreach ($path in @($BootstrapScript,$BootstrapCommand)) {
     $tokens=$null; $errors=$null
     $null=[Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors)

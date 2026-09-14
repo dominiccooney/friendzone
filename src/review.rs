@@ -61,6 +61,8 @@ pub struct Summary {
     /// Durable plugin job vs a waiting proxy connection.
     pub asynchronous: bool,
     pub facts: Option<crate::graphql::Facts>,
+    /// Optional correlation label supplied by async clients. Not unique.
+    pub request_key: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -208,6 +210,7 @@ impl Detail {
                 outcome: None,
                 asynchronous: false,
                 facts: graphql.as_ref().and_then(crate::graphql::Review::facts),
+                request_key: None,
             },
             headers,
             body: body.into(),
