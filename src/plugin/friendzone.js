@@ -115,4 +115,6 @@ const plugin={name:'friendzone',manifest:{capabilities:['tools']},setup(api,ctx)
   tool('friendzone_remove_result','Remove a finished job and its deduplication key to release storage. Do not resubmit the removed operation.',{id:{type:'string'}},['id'],async input=>{await request(config,'DELETE',idRoute(input.id)+suffix);return {id:input.id,removed:true};});
   if(typeof globalThis.__clinePluginHost?.emitEvent!=='function')ctx.logger?.log?.('Friendzone automatic session updates unavailable; use get/list requests.');
 }};
-module.exports={default:plugin,plugin};
+// Cline imports this CommonJS file through Jiti/dynamic import, which supplies
+// the default namespace wrapper. Export the plugin itself, not another wrapper.
+module.exports=plugin;

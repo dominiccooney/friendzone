@@ -56,7 +56,12 @@ Contract checked against Cline commit `dd50b97192e21e08408ee2ad1c5190aaf56d610e`
 [discovery paths](https://github.com/cline/cline/blob/dd50b97192e21e08408ee2ad1c5190aaf56d610e/sdk/packages/shared/src/storage/paths.ts).
 The intended runtime is Cline's Node plugin sandbox on Linux/Windows; bridge
 delivery to an actual installed Cline session still requires guest acceptance
-testing. Tests execute the shipped module with the documented host contract.
+testing. Import-only tests now load the standalone file using native dynamic
+import and Cline's pinned `importPluginModule` under Node and Bun. The CommonJS
+export is `module.exports = plugin`: wrapping it in `{ default: plugin, plugin }`
+causes Cline to select an object without a `name` and reject the plugin before
+tool registration. A VM test which selects `module.exports.default` does not
+test this boundary.
 
 ## Limits and durability
 
@@ -123,3 +128,18 @@ Tests use isolated broker data/ports, fake GitHub tokens/local upstreams, explic
 temporary guest homes and mocked Windows user-environment writes. They do not
 install into the developer's Cline, restart a live broker, change host networking
 or send real GitHub mutations.
+
+`tests/plugin_loader.test.cjs` loads but never calls `setup` or an agent tool.
+Run it with `node --test` or `bun test`. The optional `FZ_CLINE_PLUGIN_IMPORT`
+points at Cline's actual `plugin-module-import.ts` with its dependencies present.
+`tests/fixtures/prepare_plugin_loader.ps1 -Directory <empty absolute temp path>`
+prepares the pinned loader and integrity-checked Jiti 2.7.0 for this check without
+installing Cline or running npm scripts. It requires Bun or Node with TypeScript
+stripping to import the upstream `.ts` file.
+
+For installed-artifact checks, set `FZ_PLUGIN_TEST_ARTIFACT_DIR` to an absolute
+temporary directory when running `cargo test --locked --release bootstrap::tests`,
+then run the import suite with the same variable. This exercises bytes extracted
+from the Linux bootstrap and written by the mocked Windows installer. Optionally
+set `FZ_TEST_PWSH` to the absolute PowerShell 7 executable to add it alongside
+PowerShell 5.1. Without those variables, the optional checks explicitly skip.

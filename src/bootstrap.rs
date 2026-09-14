@@ -165,6 +165,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fz-bootstrap-{}", uuid::Uuid::new_v4()));
         let settings = crate::settings::Settings::load(&dir).unwrap();
         for shell in [Shell::Sh, Shell::Powershell] {
+            let powershell = matches!(shell, Shell::Powershell);
             let text = script(
                 shell,
                 "http://[::1]:9082",
@@ -177,6 +178,34 @@ mod tests {
             assert!(!text.contains("bootstrap/fz"));
             assert!(!text.contains("fz setup"));
             assert!(!text.contains("guest'$(bad)"));
+            // Both installers carry exactly the shipped module, not a stale
+            // wrapper or a separately maintained plugin implementation.
+            let encoded = if powershell {
+                text.split("$data=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('")
+                    .nth(1)
+                    .unwrap()
+                    .split('\'')
+                    .next()
+                    .unwrap()
+            } else {
+                text.lines()
+                    .find_map(|line| {
+                        line.strip_prefix("python3 - '")
+                            .and_then(|line| line.split('\'').next())
+                    })
+                    .unwrap()
+            };
+            let payload: serde_json::Value =
+                serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+            let plugin = STANDARD
+                .decode(payload["plugin"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(plugin, include_bytes!("plugin/friendzone.js"));
+            if !powershell && let Some(dir) = std::env::var_os("FZ_PLUGIN_TEST_ARTIFACT_DIR") {
+                let dir = std::path::PathBuf::from(dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("linux-script.js"), plugin).unwrap();
+            }
         }
         let cmds = commands("http://host:9082", "guest").unwrap();
         assert!(cmds["sh"].as_str().unwrap().starts_with("curl "));
@@ -226,33 +255,55 @@ mod tests {
         )
         .unwrap();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let inline = format!(
-            "& ([scriptblock]::Create([IO.File]::ReadAllText({}))) -Implementation {} -TemporaryDirectory {} -BootstrapScript {} -BootstrapCommand {}",
-            ps_quote(
-                &root
-                    .join("tests/fixtures/test_user_environment.ps1")
-                    .to_string_lossy()
-            ),
-            ps_quote(
-                &root
-                    .join("src/bootstrap/persist-environment.ps1")
-                    .to_string_lossy()
-            ),
-            ps_quote(&dir.to_string_lossy()),
-            ps_quote(&script_path.to_string_lossy()),
-            ps_quote(&command.to_string_lossy())
-        );
-        let output =
-            std::process::Command::new("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+        let mut runtimes = vec![(
+            "powershell51",
+            std::path::PathBuf::from("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"),
+        )];
+        // Optional extra runtime, supplied explicitly by validation, never
+        // installed/downloaded or discovered through an untrusted guest PATH.
+        if let Some(path) = std::env::var_os("FZ_TEST_PWSH") {
+            runtimes.push(("powershell7", path.into()));
+        }
+        for (runtime, executable) in runtimes {
+            let home = dir.join(runtime);
+            std::fs::create_dir_all(&home).unwrap();
+            let inline = format!(
+                "& ([scriptblock]::Create([IO.File]::ReadAllText({}))) -Implementation {} -TemporaryDirectory {} -BootstrapScript {} -BootstrapCommand {}",
+                ps_quote(
+                    &root
+                        .join("tests/fixtures/test_user_environment.ps1")
+                        .to_string_lossy()
+                ),
+                ps_quote(
+                    &root
+                        .join("src/bootstrap/persist-environment.ps1")
+                        .to_string_lossy()
+                ),
+                ps_quote(&home.to_string_lossy()),
+                ps_quote(&script_path.to_string_lossy()),
+                ps_quote(&command.to_string_lossy())
+            );
+            let output = std::process::Command::new(executable)
                 .args(["-NoProfile", "-NonInteractive", "-Command", &inline])
                 .output()
                 .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+            assert!(
+                output.status.success(),
+                "{runtime}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if let Some(artifacts) = std::env::var_os("FZ_PLUGIN_TEST_ARTIFACT_DIR") {
+                let artifacts = std::path::PathBuf::from(artifacts);
+                std::fs::create_dir_all(&artifacts).unwrap();
+                // Use the bytes actually written by Invoke-FzConfigure, not source.
+                std::fs::copy(
+                    home.join("Guest space ' ü/.cline/plugins/friendzone.js"),
+                    artifacts.join(format!("windows-{runtime}.js")),
+                )
+                .unwrap();
+            }
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -99,6 +99,42 @@ write failure, completed writes are rolled back. To undo in the guest:
 Rollback preserves externally changed variables with a warning. Start a fresh
 session afterward; already-inherited environment values do not disappear.
 
+## First Windows guest acceptance
+
+Do this in the **new Windows guest**, not the broker host. Keep the hypervisor
+console and a clean snapshot available. These checks do not replace the
+host-enforced network isolation in [NETWORK-ISOLATION.md](NETWORK-ISOLATION.md).
+
+1. In a non-elevated PowerShell, confirm `curl.exe --version` and
+   `cline --version`. Fetch the setup script using the **current** broker address
+   shown in Settings; do not reuse an old downloaded script or assume that a
+   Hyper-V Default Switch address survived a reboot.
+2. Close guest Cline before running setup. Use the same guest Windows account
+   that will run Cline. Execution policy still applies: do not use Bypass or
+   change machine-wide policy to force installation.
+3. Approve the new guest in Inbox. Check that `$env:FZ_BROKER` and
+   `$env:HTTP_PROXY` point at the current host, and `$env:NO_PROXY` includes the
+   host and loopback addresses. User environment values affect new launchers;
+   old Cline hubs and already-running applications retain their old environment.
+4. Verify the installed module **without executing it**. Use
+   `(Get-Content -LiteralPath "$env:USERPROFILE/.cline/plugins/friendzone.js" -Tail 1)`;
+   expect `module.exports=plugin;`. Substitute `$env:CLINE_DIR` for the `.cline`
+   directory if configured. If Node is installed, dynamic import of that absolute
+   path via `pathToFileURL` should yield `default.name === 'friendzone'`.
+5. Restart the guest Cline hub/session after activation. Confirm all five
+   `friendzone_*` tools are registered before asking the agent to use them.
+   Then run a small inference prompt, followed by a read-only GraphQL query and
+   result retrieval. Verify the session receives the completion update.
+6. Only after those pass, try a deliberate low-impact mutation with manual
+   approval. Check that the submitted ID, Inbox decision and returned result
+   agree. Don't use a real GitHub write as the first connectivity test.
+
+Tests cover PowerShell installation into temporary paths with spaces/apostrophes
+and Unicode, exact plugin bytes, idempotence, backups, unmanaged-file rejection,
+and **mocked** user-environment writes. Actual Windows guest inference, proxy/CA
+behavior, hub restart and steer-message delivery are acceptance checks—not claims
+implied by those installer tests.
+
 ## Script endpoint
 
 `GET /bootstrap/setup?shell=sh&container=NAME` serves a shell script;

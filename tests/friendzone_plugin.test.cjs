@@ -38,7 +38,8 @@ async function fixture(t){
       process:{env:{CLINE_DIR:home,CLINE_DATA_DIR:path.join(home,'data'),HTTP_PROXY:'http://127.0.0.1:1'}}};
     if(bridge)sandbox.__clinePluginHost={emitEvent:(name,payload)=>events.push({name,payload})};
     vm.runInNewContext(source,sandbox,{filename:'friendzone.js'});
-    sandbox.module.exports.default.setup({registerTool:tool=>tools.set(tool.name,tool)},{session:{sessionId:session}});
+    assert.equal(sandbox.module.exports.name,'friendzone');
+    sandbox.module.exports.setup({registerTool:tool=>tools.set(tool.name,tool)},{session:{sessionId:session}});
     return {tools,timers,run:(name,args)=>tools.get(name).execute(args,{sessionId:session})};
   }
   async function waitFor(predicate){for(let i=0;i<100;i++){if(predicate())return;await new Promise(r=>setTimeout(r,10));}throw new Error('fixture timeout');}

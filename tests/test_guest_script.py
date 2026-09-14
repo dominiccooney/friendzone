@@ -47,13 +47,15 @@ class GuestScriptTests(unittest.TestCase):
         self.assertIn(configure.MARKER, (self.home / "zsh/.zshenv").read_text())
 
     def test_plugin_install_is_idempotent_custom_home_and_preserves_other_plugins(self):
-        cline = self.home / "custom-cline"
+        cline = self.home / "custom Cline ü"
         (cline / "plugins").mkdir(parents=True)
         other = cline / "plugins/other.js"
         other.write_text("other plugin")
         self.apply({"CLINE_DIR": str(cline)})
         plugin = cline / "plugins/friendzone.js"
         original = plugin.read_bytes()
+        self.assertEqual(original, base64.b64decode(self.data["plugin"]))
+        self.assertIn(b"module.exports=plugin;", original)
         self.apply({"CLINE_DIR": str(cline)})
         self.assertEqual(plugin.read_bytes(), original)
         self.assertEqual(other.read_text(), "other plugin")

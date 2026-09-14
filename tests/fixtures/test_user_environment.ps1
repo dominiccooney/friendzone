@@ -48,23 +48,45 @@ if ($script:fakeUser.HTTP_PROXY -cne $originalProxy -or $script:fakeUser.NO_PROX
 . ([scriptblock]::Create([IO.File]::ReadAllText($BootstrapScript).TrimStart([char]0xfeff)))
 function Get-FzUserValue([string]$Name) { $script:fakeUser[$Name] }
 function Set-FzUserValue([string]$Name, $Value) { $script:fakeUser[$Name]=$Value }
-$homeDir=Join-Path $TemporaryDirectory 'guest-home'
-$configDir=Join-Path $TemporaryDirectory 'config'
+$homeDir=Join-Path $TemporaryDirectory ("Guest space ' " + [char]0x00fc)
+$configDir=Join-Path $TemporaryDirectory "Config space '"
 $provider=Join-Path $homeDir '.cline/data/settings/providers.json'
 [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($provider)) | Out-Null
 [IO.File]::WriteAllText($provider,'{"version":1,"lastUsedProvider":"other","modes":{},"providers":{"cline":{"settings":{"provider":"cline","model":"keep","auth":{"refreshToken":"stale"}}},"other":{"settings":{"key":"preserved"}}}}')
 $data=[pscustomobject]@{broker='http://192.0.2.1:9082';container='guest';proxy_port=9080;ca='CERTIFICATE';fakes=[pscustomobject]@{CLINE_API_KEY="fake'`$(not-a-command)"}}
-$repoRoot=Split-Path (Split-Path (Split-Path $Implementation))
-$data | Add-Member -NotePropertyName plugin -NotePropertyValue ([Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $repoRoot 'src/plugin/friendzone.js'))))
+# Extract the exact payload emitted by the Rust bootstrap endpoint. Do not
+# substitute the source file here: that previously missed packaging failures.
+$bootstrapText=[IO.File]::ReadAllText($BootstrapScript)
+$payloadMatch=[regex]::Match($bootstrapText, '\$data=\[Text.Encoding\]::UTF8.GetString\(\[Convert\]::FromBase64String\(''([A-Za-z0-9+/=]+)''\)\)')
+if(-not $payloadMatch.Success){throw 'Could not find generated bootstrap payload'}
+$payload=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payloadMatch.Groups[1].Value)) | ConvertFrom-Json
+$data | Add-Member -NotePropertyName plugin -NotePropertyValue $payload.plugin
+$otherPlugin=Join-Path $homeDir '.cline/plugins/other.js'
+Write-FzFile $otherPlugin '// unrelated plugin'
 $EnvironmentFile=Invoke-FzConfigure $data $homeDir $configDir
 $EnvironmentFile=Invoke-FzConfigure $data $homeDir $configDir
 $plugin=Join-Path $homeDir '.cline/plugins/friendzone.js'
-if(-not ([IO.File]::ReadAllText($plugin).Contains('steer_message'))){throw 'plugin not installed'}
+if([Convert]::ToBase64String([IO.File]::ReadAllBytes($plugin)) -cne $payload.plugin){throw 'installed plugin differs from bootstrap payload'}
+if(-not ([IO.File]::ReadAllText($plugin).Contains('module.exports=plugin;'))){throw 'plugin export wrapper regressed'}
+if([IO.File]::ReadAllText($otherPlugin) -cne '// unrelated plugin'){throw 'unrelated plugin changed'}
 $pluginConfig=Get-Content -Raw -LiteralPath (Join-Path $homeDir '.cline/friendzone.json') | ConvertFrom-Json
 if($pluginConfig.broker -ne $data.broker -or $pluginConfig.container -ne 'guest'){throw 'wrong plugin configuration'}
-$customCline=Join-Path $TemporaryDirectory 'custom-cline'
+$customCline=Join-Path $TemporaryDirectory 'Custom Cline space'
 $null=Invoke-FzConfigure $data $homeDir $configDir $customCline
 if(-not (Test-Path -LiteralPath (Join-Path $customCline 'plugins/friendzone.js'))){throw 'custom Cline path ignored'}
+# Managed upgrade keeps the first backup; unmanaged collision must fail before
+# any environment write. Both paths remain inside this temporary guest.
+$firstBackup=[IO.File]::ReadAllText($plugin+'.backup')
+Write-FzFile $plugin "// Friendzone managed plugin v1. previous revision"
+$null=Invoke-FzConfigure $data $homeDir $configDir
+if([Convert]::ToBase64String([IO.File]::ReadAllBytes($plugin)) -cne $payload.plugin){throw 'managed plugin upgrade failed'}
+if([IO.File]::ReadAllText($plugin+'.backup') -cne $firstBackup){throw 'first plugin backup overwritten'}
+$beforeEnv=[IO.File]::ReadAllText($EnvironmentFile)
+$beforeRegistry=ConvertTo-Json $script:fakeUser -Compress
+Write-FzFile $plugin '// unmanaged plugin'
+try {Invoke-FzConfigure $data $homeDir $configDir;throw 'expected unmanaged plugin failure'} catch {if($_.Exception.Message -eq 'expected unmanaged plugin failure'){throw}}
+if([IO.File]::ReadAllText($EnvironmentFile) -cne $beforeEnv -or (ConvertTo-Json $script:fakeUser -Compress) -cne $beforeRegistry){throw 'unmanaged collision changed environment'}
+Write-FzFile $plugin ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload.plugin)))
 $root=Get-Content -Raw -Encoding UTF8 -LiteralPath $provider | ConvertFrom-Json
 if($root.providers.cline.settings.model -ne 'keep' -or $root.providers.cline.settings.auth -or $root.providers.other.settings.key -ne 'preserved' -or $root.lastUsedProvider -ne 'other'){throw 'Provider merge failed'}
 $beforeEnv=[IO.File]::ReadAllText($EnvironmentFile)
@@ -75,6 +97,7 @@ if([IO.File]::ReadAllText($EnvironmentFile) -cne $beforeEnv){throw 'wrote config
 if ($env:FZ_HOST -ne '192.0.2.1') { throw 'wrong broker host' }
 if ($env:CLINE_API_KEY -cne "fake'`$(not-a-command)") { throw 'fake changed or evaluated' }
 if ($env:NO_PROXY -notmatch 'localhost' -or $env:NO_PROXY -notmatch '127.0.0.1') { throw 'loopback exclusions missing' }
+if($env:NODE_EXTRA_CA_CERTS -cne (Join-Path $configDir 'friendzone-ca.pem')){throw 'CA path with spaces/apostrophe did not survive activation'}
 foreach ($path in @($BootstrapScript,$BootstrapCommand)) {
     $tokens=$null; $errors=$null
     $null=[Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors)
