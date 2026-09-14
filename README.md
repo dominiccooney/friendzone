@@ -228,6 +228,9 @@ No general approve-for-session/always rules or MCP write approval are added here
 Other origins remain logged and unpoliced.
 
 **Outcomes in Inbox:** Pending contains only requests needing a decision.
+Pending/Recent use compact tables with operation, repository/target hint, guest,
+status, time and action. Missing repository information is labeled, not guessed.
+HTTP 4xx/5xx show as errors, including older retained 499 responses.
 Recent also includes [durable async jobs](ASYNC-GRAPHQL.md). For the proxy,
 it retains the last 100 reviewed requests and their redacted details for
 this broker session, separate from the busy traffic log. Open details stay

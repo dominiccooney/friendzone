@@ -55,6 +55,22 @@ bridge. The prompt contains only the job ID/status and a get-result instruction:
 no query, file content, GitHub message or token is promoted into a steer prompt.
 The result is fetched as tool output, which remains untrusted upstream content.
 
+**Cline sandbox lifetime matters:** Cline's default plugin idle timeout is 30
+minutes, measured from host calls into the sandbox. Our status polling does not
+reset it. Guest setup now sets `CLINE_PLUGIN_IDLE_TIMEOUT_MS=90000000` (25 hours),
+covering the 24-hour approval window plus delivery. This affects all plugins in
+that guest's Cline sandbox. Reloading a plugin alone cannot change a hub's
+inherited environment: restart the **guest hub** from the activated environment.
+An explicit SDK `idleTimeoutMs` option takes precedence over the environment.
+
+Submission returns `notification_delivery` with bridge availability, configured
+idle timeout and a warning when too short. This is a configuration diagnostic,
+not proof of receipt by the agent. Closing the session/hub still stops polling.
+Get/list recover the accepted job; they never resubmit. HTTP 4xx/5xx (including
+499), GraphQL errors and other terminal states all trigger the same observer.
+New 4xx/5xx outcomes are stored as `upstream_error`; older `response_received`
+records containing those codes remain terminal and display as HTTP errors.
+
 Notification checkpoints persist per broker/guest/session in Cline's data
 directory (`CLINE_DATA_DIR` respected). Resuming the same session discovers
 completed jobs; a different session never receives its updates. The bridge has
@@ -95,8 +111,9 @@ This is separate from the **unchanged 64 KiB, 120-second proxy review**:
 | Active requests | at most 32 globally / 8 per guest, further limited by storage reservation |
 | Durable store | 256 MiB including reserved response space |
 
-The existing lexical/nesting/display budgets still apply. Very large arguments
-can exceed structured-display limits: raw input is retained without truncation,
+Lexical/nesting/structural display budgets still apply. Large strings such as
+base64 file contents are shared by display reference instead of repeatedly
+copied into the structural expansion budget. The original input is retained
 and mutations still require approval. This is not a staged-file/diff publication
 UI or a binary Git push implementation.
 

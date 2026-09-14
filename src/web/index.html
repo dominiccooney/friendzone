@@ -211,6 +211,7 @@
           <p>Linux profile hooks are added once, with backups. Windows writes user—not machine—environment values and records previous values for rollback. Non-interactive bash inherits BASH_ENV from an activated parent; zsh reads .zshenv. Plain sh and services need an activated launcher.</p>
           <p>The script does not change firewall rules or install the CA in a system trust store. It uses runtime CA variables instead. Bootstrap trusts the host/network on first download; inspect the script if unsure. Windows execution policy is not changed.</p>
           <p>The Friendzone plugin adds async GitHub GraphQL tools. Requests return immediately; completion updates steer the originating Cline session. Requires a Cline build with the plugin host bridge. Restart guest Cline after setup; other plugins are preserved.</p>
+          <p>Setup keeps the guest Cline plugin sandbox alive for 25 hours via CLINE_PLUGIN_IDLE_TIMEOUT_MS, covering the approval window. Restart the guest hub from the activated environment. Closing Cline still stops updates; results remain retrievable.</p>
         </details>
         <details id="guest-preapprove"><summary>Advanced: preapprove a name</summary>
           <p>Normally, run setup and approve the guest's observed IP in Inbox. Preapproval allows this name from any IP before it connects; it does not configure the guest.</p>

@@ -413,6 +413,71 @@ mod tests {
         assert!(f.app.jobs.get("guest", instance, id, "session").is_err());
         server.abort();
     }
+
+    #[tokio::test]
+    async fn http_499_is_terminal_error_with_result_and_survives_restart_without_retry() {
+        let f = Fixture::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/graphql", listener.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = count.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/graphql",
+                    axum::routing::post(move || {
+                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        async {
+                            (
+                                axum::http::StatusCode::from_u16(499).unwrap(),
+                                "upstream closed request",
+                            )
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap()
+        });
+        let accepted=f.submit("499","mutation PublishBackgroundCommandStreaming { createCommitOnBranch(input:{branch:{repositoryNameWithOwner:\"cline/cline\",branchName:\"feature\"}}){clientMutationId} }");
+        let id = Fixture::id(&accepted);
+        let detail = f.app.jobs.inspect(id).unwrap();
+        f.app
+            .jobs
+            .decide(
+                id,
+                &detail.summary.fingerprint,
+                crate::review::Decision::Approve,
+            )
+            .unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        f.app
+            .jobs
+            .tick(&f.app, &f.settings, &client, &endpoint)
+            .await
+            .unwrap();
+        let instance = f.app.async_identity("guest", f.peer).unwrap().0;
+        let result = f.app.jobs.get("guest", instance, id, "session").unwrap();
+        assert_eq!(result["status"], "upstream_error");
+        assert_eq!(result["http_status"], 499);
+        assert_eq!(result["terminal"], true);
+        assert_eq!(result["result"], "upstream closed request");
+        let restarted = AppState::load(&f.dir).unwrap();
+        restarted
+            .jobs
+            .tick(&restarted, &f.settings, &client, &endpoint)
+            .await
+            .unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let facts = restarted.jobs.inspect(id).unwrap().summary.facts.unwrap();
+        assert_eq!(facts.repositories, vec!["cline/cline"]);
+        server.abort();
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -433,6 +498,8 @@ struct Job {
     http_status: Option<u16>,
     outcome: String,
     result: Option<String>,
+    #[serde(default)]
+    facts: Option<crate::graphql::Facts>,
 }
 impl Job {
     fn summary(&self) -> Summary {
@@ -451,6 +518,7 @@ impl Job {
             http_status: self.http_status,
             outcome: Some(self.outcome.clone()),
             asynchronous: true,
+            facts: self.facts.clone(),
         }
     }
     fn terminal(&self) -> bool {
@@ -512,6 +580,12 @@ impl Jobs {
             bail!("unsupported async job store");
         }
         for job in saved.jobs.values_mut() {
+            if job.facts.is_none() {
+                job.facts =
+                    crate::graphql::inspect_with_limit(&job.body, "application/json", MAX_PAYLOAD)
+                        .1
+                        .facts();
+            }
             match job.status {
                 Status::Sending=>job.set(Status::Unknown,"Broker restarted during execution. Not retried; inspect upstream state."),
                 Status::Pending | Status::Approved=>job.set(Status::Cancelled,"Broker restarted before execution. Not sent; submit a new request if still needed."),
@@ -637,6 +711,7 @@ impl Jobs {
             }
             .into(),
             result: None,
+            facts: detail.summary.facts,
         };
         self.transaction(|store| {
             if let Some(existing) = store.jobs.values().find(|j| {
@@ -943,18 +1018,23 @@ impl Jobs {
                             .and_then(|v| v.get("errors"))
                             .is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty()));
                         (
-                            if errors {
+                            if http >= 400 {
+                                Status::UpstreamError
+                            } else if errors {
                                 Status::GraphqlError
                             } else {
                                 Status::ResponseReceived
                             },
                             Some(http),
-                            if errors {
-                                "GraphQL errors returned"
+                            if http >= 400 {
+                                format!(
+                                    "GitHub returned HTTP {http}; inspect the response before retrying"
+                                )
+                            } else if errors {
+                                "GraphQL errors returned".into()
                             } else {
-                                "Response received"
-                            }
-                            .into(),
+                                "Response received".into()
+                            },
                             Some(String::from_utf8_lossy(&bytes).into_owned()),
                         )
                     }

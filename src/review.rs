@@ -60,6 +60,7 @@ pub struct Summary {
     pub outcome: Option<String>,
     /// Durable plugin job vs a waiting proxy connection.
     pub asynchronous: bool,
+    pub facts: Option<crate::graphql::Facts>,
 }
 
 #[derive(Clone, Serialize)]
@@ -206,6 +207,7 @@ impl Detail {
                 http_status: None,
                 outcome: None,
                 asynchronous: false,
+                facts: graphql.as_ref().and_then(crate::graphql::Review::facts),
             },
             headers,
             body: body.into(),
@@ -608,7 +610,7 @@ mod tests {
         assert!(
             !serde_json::to_string(&detail.summary)
                 .unwrap()
-                .contains("pullRequest"),
+                .contains("number:$n"),
             "parsed bodies must not leak into SSE/notifications"
         );
         let repeated =
@@ -783,7 +785,14 @@ mod tests {
         assert!(last.comment_context.is_none());
         let json = serde_json::to_string(&queue.view()).unwrap();
         assert!(!json.contains("guest-secret"));
-        assert!(!json.contains("addComment"), "history SSE carries no body");
+        assert!(
+            !json.contains("clientMutationId"),
+            "history SSE carries no body or response selection"
+        );
+        assert!(
+            json.contains("addComment"),
+            "overview carries the actual operation field"
+        );
         let ticket = queue.enqueue(detail("new")).unwrap();
         assert_eq!(queue.view().0.len(), 1);
         drop(ticket);

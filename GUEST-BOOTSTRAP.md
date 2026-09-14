@@ -42,6 +42,13 @@ for common runtimes, and fake provider keys. NO_PROXY/no_proxy includes the
 broker host, localhost, 127.0.0.1, ::1 and [::1], preserving existing exclusions.
 Real credentials and OAuth refresh tokens never enter the script.
 
+Setup sets `CLINE_PLUGIN_IDLE_TIMEOUT_MS=90000000` (25 hours) so Cline does not
+reap the async-job observer after its default 30 idle minutes. This is a
+guest-wide Cline sandbox setting, not a broker or HTTP timeout. Existing hubs
+must restart from the activated environment; other plugin sandboxes in that
+guest receive the same lifetime. Closing Cline still stops updates, but results
+remain retrievable. Windows records the previous user value for rollback.
+
 If Cline credentials are configured on the broker, the script merges the fake
 key into the guest's `.cline/data/settings/providers.json`. **Close guest Cline
 before running the script** because it writes this same file. The merge keeps

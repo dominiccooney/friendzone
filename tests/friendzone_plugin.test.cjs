@@ -55,10 +55,10 @@ async function fixture(t){
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   t.after(()=>new Promise(resolve=>server.close(resolve)));
   fs.writeFileSync(path.join(home,'friendzone.json'),JSON.stringify({broker:`http://127.0.0.1:${server.address().port}`,container:'guest'}));
-  function load(session,bridge=true){
+  function load(session,bridge=true,environment={}){
     const timers=[],tools=new Map(),sandbox={module:{exports:{}},require,Buffer,URL,console,setTimeout,clearTimeout,
       setInterval(callback){const timer={callback,unref(){}};timers.push(timer);return timer;},clearInterval(timer){timer.stopped=true;},
-      process:{env:{CLINE_DIR:home,CLINE_DATA_DIR:path.join(home,'data'),HTTP_PROXY:'http://127.0.0.1:1'}}};
+      process:{env:{CLINE_DIR:home,CLINE_DATA_DIR:path.join(home,'data'),HTTP_PROXY:'http://127.0.0.1:1',...environment}}};
     if(bridge)sandbox.__clinePluginHost={emitEvent:(name,payload)=>events.push({name,payload})};
     vm.runInNewContext(source,sandbox,{filename:'friendzone.js'});
     assert.equal(sandbox.module.exports.name,'friendzone');
@@ -160,4 +160,26 @@ test('discovery is independent of config validity; first execution reads config 
   assert.equal((await plugin.run('friendzone_list_requests',{},'session-a')).length,0);
   assert.equal((await bound.run('friendzone_list_requests',{})).length,0);
   assert.equal(plugin.timers.length,1);assert.equal(bound.timers.length,1);
+});
+
+test('HTTP 499 steers the origin session, including after observer restart, without resubmitting',async t=>{
+  const f=await fixture(t),p=f.load('publishing-session');
+  const job=await p.run('friendzone_submit_graphql',{request_key:'publish',query:'mutation PublishBackgroundCommandStreaming { createCommitOnBranch(input:{}) { clientMutationId } }'});
+  assert.equal(job.notification_delivery.configured_idle_timeout_ms,1800000);
+  assert.match(job.notification_delivery.warning,/stop the background observer/);
+  await f.waitFor(()=>f.calls.filter(c=>c.method==='GET').length>0);
+  // Model a host-reaped sandbox: it cannot run its background timer anymore.
+  p.timers[0].stopped=true;
+  Object.assign(f.jobs.get(job.id),{terminal:true,status:'upstream_error',http_status:499,updated_at:'later',result:'HTTP 499 upstream payload'});
+  const resumed=f.load('publishing-session',true,{CLINE_PLUGIN_IDLE_TIMEOUT_MS:'90000000'});
+  await f.waitFor(()=>f.events.length===1);
+  assert.equal(f.events[0].payload.sessionId,'publishing-session');assert.match(f.events[0].payload.prompt,/HTTP 499/);
+  assert.doesNotMatch(f.events[0].payload.prompt,/upstream payload/);
+  await resumed.timers[0].callback();assert.equal(f.events.length,1);
+  const result=await resumed.run('friendzone_get_request',{id:job.id});assert.equal(result.http_status,499);
+  assert.equal(f.calls.filter(c=>c.method==='POST').length,1,'observation never resubmits');
+  const recovered=await resumed.run('friendzone_submit_graphql',{request_key:'publish',query:job.query});assert.equal(recovered.notification_delivery.warning,null);
+  // Old brokers call all complete HTTP responses response_received, even 499.
+  Object.assign(f.jobs.get(job.id),{status:'response_received',updated_at:'legacy-response'});
+  await resumed.timers[0].callback();assert.equal(f.events.length,2);assert.match(f.events[1].payload.prompt,/HTTP 499/);
 });

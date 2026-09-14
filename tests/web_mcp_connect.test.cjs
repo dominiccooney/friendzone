@@ -164,6 +164,28 @@ test("review timing distinguishes broker expiry from early cancellation without 
   assert.equal(f.run(`reviewTiming({status:"cancelled",created_at:"${created}",updated_at:"2026-09-10T00:00:00Z"})`),"");
 });
 
+test("compact overview puts operation repository and HTTP errors in one row without repeated prose",()=>{
+  const f=fixture();
+  const job={...pendingRequest,status:'response_received',http_status:499,outcome:'Response received',updated_at:'2026-09-14T09:14:17Z',facts:{operation_name:'PublishBackgroundCommandStreaming',operation_type:'mutation',fields:['createCommitOnBranch'],repositories:['cline/cline'],targets:['branch feature'],more:false}};
+  const markup=f.run(`reviewTable([${JSON.stringify(job)}],"empty")`);
+  assert.match(markup,/<table/);assert.match(markup,/<td[^>]*>PublishBackgroundCommandStreaming<\/td>/);
+  assert.match(markup,/>cline\/cline<\/td>/);assert.match(markup,/HTTP error · HTTP 499/);
+  assert.doesNotMatch(markup,/Response received|<article|<p>/);
+  assert.match(markup,/createCommitOnBranch/);assert.match(markup,/&lt;script&gt;/);
+});
+
+test("large value references render exact content in arguments and variables without expanders",()=>{
+  const f=fixture(),text='<script> & '+"long content ".repeat(10000);
+  const value={kind:'reference',value:'content-hash'};
+  const graph={status:'parsed',analysis:{...parsedGraphql.analysis,large_values:{'content-hash':text},effective_variables:[{name:'body',declared_type:'String!',source:'supplied',value}],fields:[{field:'createCommitOnBranch',response_name:'createCommitOnBranch',path:['createCommitOnBranch'],parent:null,arguments:{contents:value},conditions_text:[]}]}};
+  f.run(`renderGraphqlReview(${JSON.stringify(graph)})`);
+  const fields=f.sandbox.document.querySelector('#request-graphql-fields').innerHTML;
+  assert.ok(fields.includes(text.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')));
+  assert.doesNotMatch(fields,/<details|<script>/);
+  assert.doesNotMatch(f.sandbox.document.querySelector('#request-graphql-effective').innerHTML,/Missing value/);
+  assert.doesNotMatch(f.sandbox.document.querySelector('#request-graphql-warning').textContent,/Structured review unavailable|budget/);
+});
+
 test("async jobs keep normal approval controls without claiming a live waiting client", async () => {
   const f=fixture();
   const job={...pendingRequest,asynchronous:true,status:"pending",outcome:"Awaiting host approval",created_at:"2026-09-11T05:00:00Z"};
@@ -237,7 +259,7 @@ test("review outcomes stay visible, survive reopening and never enable resolved 
   f.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)}]`);
   const opening=f.run('openRequestReview("request-id")');
   f.calls.at(-1).resolve({ok:true,json:async()=>pendingRequest}); await opening;
-  for (const [status,code,label] of [["approved",null,"Approved"],["sending",null,"Sending"],["response_received",201,"Response received · HTTP 201"],["graphql_error",200,"GraphQL error · HTTP 200"],["denied",null,"Denied"],["expired",null,"Expired"],["cancelled",null,"Cancelled"],["blocked",null,"Blocked"],["upstream_error",502,"Upstream error · HTTP 502"]]) {
+  for (const [status,code,label] of [["approved",null,"Approved"],["sending",null,"Sending"],["response_received",201,"Response received · HTTP 201"],["graphql_error",200,"GraphQL error · HTTP 200"],["denied",null,"Denied"],["expired",null,"Expired"],["cancelled",null,"Cancelled"],["blocked",null,"Blocked"],["upstream_error",502,"HTTP error · HTTP 502"]]) {
     const summary={...pendingRequest,status,http_status:code,outcome:"Exact outcome <script>",updated_at:"2099-01-01T00:00:00Z"};
     f.run(`snapshot.pending_requests=[];snapshot.recent_reviews=[${JSON.stringify(summary)}];renderPendingRequests()`);
     assert.equal(element("request-review-badge").textContent,label);

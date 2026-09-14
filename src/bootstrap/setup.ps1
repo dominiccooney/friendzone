@@ -40,6 +40,9 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     $values=@{FZ_HOST=$origin.DnsSafeHost;FZ_BROKER=$Data.broker;HTTP_PROXY=$proxy;HTTPS_PROXY=$proxy}
     foreach($key in @('NODE_EXTRA_CA_CERTS','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','GIT_SSL_CAINFO','GIT_PROXY_SSL_CAINFO')) {$values[$key]=$cert}
     foreach($property in $Data.fakes.PSObject.Properties) {$values[$property.Name]=[string]$property.Value}
+    # Host-side Cline idle reaping otherwise kills the observer after 30m.
+    # 25h covers Friendzone's 24h review window plus result delivery.
+    $values.CLINE_PLUGIN_IDLE_TIMEOUT_MS='90000000'
     $values.NO_PROXY=$origin.DnsSafeHost+',localhost,127.0.0.1,::1,[::1]'
     $lines=@('# Friendzone guest environment')
     foreach($key in $values.Keys) {

@@ -88,6 +88,7 @@ pub fn script(
                     "SSL_CERT_FILE",
                     "GIT_SSL_CAINFO",
                     "GIT_PROXY_SSL_CAINFO",
+                    "CLINE_PLUGIN_IDLE_TIMEOUT_MS",
                 ]
                 .iter()
                 .any(|key| name.eq_ignore_ascii_case(key))

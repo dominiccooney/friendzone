@@ -175,8 +175,8 @@ function renderPendingRequests() {
   const signature = JSON.stringify([pending, recent]);
   if (signature !== pendingSignature) {
     pendingSignature = signature;
-    $("#pending-requests").innerHTML = pending.map(reviewRow).join("") || '<p>No pending requests.</p>';
-    $("#recent-reviews").innerHTML = recent.map(reviewRow).join("") || '<p>No recent reviews.</p>';
+    $("#pending-requests").innerHTML = reviewTable(pending, "No pending requests.");
+    $("#recent-reviews").innerHTML = reviewTable(recent, "No recent reviews.");
     document.querySelectorAll("[data-review]").forEach(button=>button.onclick=()=>openRequestReview(button.dataset.review));
   }
   if (activeReview) {
@@ -196,7 +196,8 @@ const REVIEW_STATUSES = {
 };
 function reviewStatus(request) {
   const [label, color] = REVIEW_STATUSES[request.status || "pending"] || REVIEW_STATUSES.unavailable;
-  const observed = request.status === "unknown" && request.http_status ? "Response incomplete" : label;
+  const observed = request.status === "unknown" && request.http_status ? "Response incomplete"
+    : request.http_status>=400 ? "HTTP error" : label;
   return {label:observed + (request.http_status ? ` · HTTP ${request.http_status}` : ""), color:request.http_status>=400?"blocked":color};
 }
 function reviewOutcomeText(request) {
@@ -205,12 +206,23 @@ function reviewOutcomeText(request) {
   if (request.status === "unknown") return request.http_status
     ? "The server replied, but Friendzone did not observe the complete response. This does not mean the operation failed."
     : "Friendzone did not receive a reply after approval. The operation may have completed.";
+  if(request.http_status>=400 && request.status!=="unknown")return request.outcome && !/^Response received\.?$/.test(request.outcome)
+    ? request.outcome : `Upstream returned HTTP ${request.http_status}. Inspect the result before retrying.`;
   return request.outcome || "";
+}
+function reviewTable(requests, empty) {
+  if(!requests.length)return `<p>${esc(empty)}</p>`;
+  return `<div class="review-table-scroll"><table class="review-table"><thead><tr><th scope="col">Operation</th><th scope="col">Repository / target</th><th scope="col">Guest</th><th scope="col">Status</th><th scope="col">Time</th><th scope="col"><span class="sr-only">Action</span></th></tr></thead><tbody>${requests.map(reviewRow).join("")}</tbody></table></div>`;
 }
 function reviewRow(request) {
   const status = reviewStatus(request), pending = !request.status || request.status === "pending";
   const outcome = reviewOutcomeText(request);
-  return `<article class="pending-request"><div class="request-row-heading"><span class="request-badge ${status.color}">${esc(status.label)}</span><strong>${esc(request.container)}</strong><span class="meta">${pending?`expires ${esc(displayTime(request.expires_at))}`:esc(displayTime(request.updated_at || request.created_at))}</span><button type="button" data-review="${esc(request.id)}">${pending?"Review":"Details"}</button></div><div class="request-destination"><span class="method">${esc(request.method)}</span> <code>${esc(request.url)}</code></div>${outcome?`<p class="meta">${esc(outcome)}</p>`:""}</article>`;
+  const facts=request.facts;
+  const operation=facts?.operation_name || facts?.fields?.join(", ") || `${request.method} ${request.url}`;
+  const repository=facts?.repositories?.join(", ") || facts?.targets?.join(", ") || "Not identified";
+  const target=[...(facts?.repositories || []),...(facts?.targets || [])].join(" · ");
+  const description=[facts?.operation_type,...(facts?.fields || []),facts?.more?"More operations/targets in details":"",request.url].filter(Boolean).join(" · ");
+  return `<tr class="review-row"><td class="review-operation" title="${esc(description)}">${esc(operation)}</td><td class="review-target" title="${esc(target || 'Repository not identified; inspect request details')}">${esc(repository)}${facts?.more?" …":""}</td><td>${esc(request.container)}</td><td><span class="request-badge ${status.color}" title="${esc(outcome)}">${esc(status.label)}</span></td><td class="review-time" title="${pending?'Approval deadline':'Last update'}">${pending?'by ':''}${esc(displayTime(pending?request.expires_at:request.updated_at || request.created_at))}</td><td><button type="button" data-review="${esc(request.id)}">${pending?"Review":"Details"}</button></td></tr>`;
 }
 function applyReviewOutcome(summary) {
   if (!activeReview) return;
@@ -344,30 +356,31 @@ function renderCommentPermissions() {
 
 // Values come from the broker's typed AST, never reparse GraphQL or use these
 // display rows as approval input. Expand every input, including unknown fields.
-function graphqlValueRows(value, path, labels = {}, rows = []) {
+function graphqlValueRows(value, path, labels = {}, rows = [], largeValues = {}) {
   if (value?.kind === "object" && Object.keys(value.value).length) {
-    for (const [name, child] of Object.entries(value.value)) graphqlValueRows(child, path ? `${path}.${name}` : name, labels, rows);
+    for (const [name, child] of Object.entries(value.value)) graphqlValueRows(child, path ? `${path}.${name}` : name, labels, rows, largeValues);
   } else if (value?.kind === "list" && value.value.length) {
-    value.value.forEach((child,index)=>graphqlValueRows(child, `${path}[${index}]`, labels, rows));
+    value.value.forEach((child,index)=>graphqlValueRows(child, `${path}[${index}]`, labels, rows, largeValues));
   } else {
     const kind = value?.kind || "unknown";
-    const text = kind === "null" ? "null" : kind === "object" ? "{}" : kind === "list" ? "[]"
+    const text = kind === "reference" ? (Object.hasOwn(largeValues,value.value)?largeValues[value.value]:`Missing value ${value.value}; inspect the raw request`)
+      : kind === "null" ? "null" : kind === "object" ? "{}" : kind === "list" ? "[]"
       : kind === "missing_variable" ? `Not supplied ($${value.value})` : kind === "variable" ? `Unresolved $${value.value}`
       : kind === "string" && value.value === "" ? "(empty string)"
       : value?.value === undefined ? JSON.stringify(value) : String(value.value);
-    rows.push({path, label:labels[path] || path, kind, text});
+    rows.push({path, label:labels[path] || path, kind:kind==="reference"?"string":kind, text});
   }
   return rows;
 }
 function graphqlValuesMarkup(rows) {
   return `<dl class="graphql-values">${rows.map(row=>`<div class="graphql-value"><dt>${esc(row.label)}${row.label!==row.path?` <code>${esc(row.path)}</code>`:""}<small>${esc(row.kind)}</small></dt><dd><pre>${esc(row.text)}</pre></dd></div>`).join("")}</dl>`;
 }
-function graphqlFieldMarkup(field) {
+function graphqlFieldMarkup(field, largeValues = {}) {
   const target = field.target, conditions = field.conditions_text || [];
   const inputs = field.mutation_inputs || [];
   const labels = Object.fromEntries(inputs.map(input=>[input.path, input.label]));
   if (field.comment_body !== null && field.comment_body !== undefined) labels["input.body"] = "Comment text";
-  const rows = Object.entries(field.arguments || {}).flatMap(([name,value])=>graphqlValueRows(value, name, labels));
+  const rows = Object.entries(field.arguments || {}).flatMap(([name,value])=>graphqlValueRows(value, name, labels, [], largeValues));
   // Compatibility with older snapshots without typed arguments: never hide the
   // broker's text representation or recognized values just because it is unknown.
   if (!rows.length) {
@@ -402,12 +415,12 @@ function renderGraphqlReview(graphql) {
   $("#request-graphql-warning").textContent = (analysis.warnings || []).filter(warning=>!genericNotes.some(prefix=>warning.startsWith(prefix))).join("\n");
   $("#request-graphql-document").textContent = analysis.formatted_document;
   $("#request-graphql-variables").textContent = analysis.supplied_variables;
-  $("#request-graphql-data").textContent = JSON.stringify({version:analysis.version, effective_variables:analysis.effective_variables, fields:analysis.fields},null,2);
+  $("#request-graphql-data").textContent = JSON.stringify({version:analysis.version, effective_variables:analysis.effective_variables, fields:analysis.fields, large_values:analysis.large_values || {}},null,2);
   const hasInputs = field => field.parent === null || Object.keys(field.arguments || {}).length || field.arguments_text || field.target || (field.conditions_text || []).length;
-  $("#request-graphql-fields").innerHTML = analysis.fields.filter(hasInputs).map(graphqlFieldMarkup).join("");
+  $("#request-graphql-fields").innerHTML = analysis.fields.filter(hasInputs).map(field=>graphqlFieldMarkup(field,analysis.large_values || {})).join("");
   $("#request-graphql-response").textContent = analysis.fields.filter(field=>!hasInputs(field)).map(field=>`${field.path.join(" → ")}${field.response_name !== field.field?` (${field.field})`:""}`).join("\n") || "(none)";
   const variables = analysis.effective_variables || [];
-  $("#request-graphql-effective").innerHTML = variables.map(variable=>`<section class="graphql-variable"><h5>$${esc(variable.name)} <span class="meta">${esc(variable.declared_type)} · ${esc(variable.source)}</span></h5>${graphqlValuesMarkup(graphqlValueRows(variable.value, `$${variable.name}`))}</section>`).join("");
+  $("#request-graphql-effective").innerHTML = variables.map(variable=>`<section class="graphql-variable"><h5>$${esc(variable.name)} <span class="meta">${esc(variable.declared_type)} · ${esc(variable.source)}</span></h5>${graphqlValuesMarkup(graphqlValueRows(variable.value, `$${variable.name}`, {}, [], analysis.large_values || {}))}</section>`).join("");
   $("#request-graphql-variables-panel").hidden = !variables.length && (!analysis.supplied_variables || analysis.supplied_variables === "{}");
 }
 

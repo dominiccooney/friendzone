@@ -98,6 +98,7 @@ if ($env:FZ_HOST -ne '192.0.2.1') { throw 'wrong broker host' }
 if ($env:CLINE_API_KEY -cne "fake'`$(not-a-command)") { throw 'fake changed or evaluated' }
 if ($env:NO_PROXY -notmatch 'localhost' -or $env:NO_PROXY -notmatch '127.0.0.1') { throw 'loopback exclusions missing' }
 if($env:NODE_EXTRA_CA_CERTS -cne (Join-Path $configDir 'friendzone-ca.pem')){throw 'CA path with spaces/apostrophe did not survive activation'}
+if($env:CLINE_PLUGIN_IDLE_TIMEOUT_MS -ne '90000000' -or $script:fakeUser.CLINE_PLUGIN_IDLE_TIMEOUT_MS -ne '90000000'){throw 'plugin idle lifetime not persisted/activated'}
 foreach ($path in @($BootstrapScript,$BootstrapCommand)) {
     $tokens=$null; $errors=$null
     $null=[Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors)

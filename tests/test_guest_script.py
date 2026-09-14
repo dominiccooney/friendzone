@@ -45,6 +45,7 @@ class GuestScriptTests(unittest.TestCase):
         self.assertEqual((self.home / ".profile.friendzone-backup").read_text(), "# original\n")
         self.assertIn("/old hook.sh", (self.config / "bash-env.sh").read_text())
         self.assertIn(configure.MARKER, (self.home / "zsh/.zshenv").read_text())
+        self.assertIn("CLINE_PLUGIN_IDLE_TIMEOUT_MS=90000000", (self.config / "friendzone-env.sh").read_text())
 
     def test_plugin_install_is_idempotent_custom_home_and_preserves_other_plugins(self):
         cline = self.home / "custom Cline ü"

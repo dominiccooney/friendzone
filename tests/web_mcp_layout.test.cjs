@@ -370,9 +370,19 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
       assert.equal(await evaluate("document.querySelector('#request-review-badge').textContent"),expected);
       assert.equal(await evaluate("document.querySelector('#recent-reviews .request-badge').textContent"),expected);
       assert.equal(await evaluate("document.querySelector('#request-review-actions').hidden"),true);
-      assert.equal(await evaluate("document.querySelector('#request-review-outcome').textContent===document.querySelector('#recent-reviews .pending-request>p').textContent"),true);
+      assert.equal(await evaluate("document.querySelector('#request-review-outcome').textContent===document.querySelector('#recent-reviews .request-badge').title"),true);
     }
     const now=Date.now();
+    const overview={...detail,status:'response_received',http_status:499,outcome:'Response received',facts:{operation_name:'PublishBackgroundCommandStreaming',operation_type:'mutation',fields:['createCommitOnBranch'],repositories:['cline/cline'],targets:['branch feature'],more:false}};
+    await evaluate(`activeReview=null;snapshot.pending_requests=[];snapshot.recent_reviews=[${JSON.stringify(overview)}];renderPendingRequests();document.querySelector('#request-review').hidden=true;window.scrollTo(0,0)`);
+    for(const width of [1058,480]){
+      await send('Emulation.setDeviceMetricsOverride',{width,height:1000,deviceScaleFactor:1,mobile:false});
+      const layout=await evaluate(`(()=>{const row=document.querySelector('#recent-reviews tbody tr');return {height:row.getBoundingClientRect().height,text:row.textContent,operation:row.cells[0].textContent,repository:row.cells[1].textContent,paragraphs:row.querySelectorAll('p').length,page:document.documentElement.scrollWidth,scroll:document.querySelector('#recent-reviews .review-table-scroll').scrollWidth};})()`);
+      assert.equal(layout.operation,'PublishBackgroundCommandStreaming');assert.equal(layout.repository,'cline/cline');assert.equal(layout.paragraphs,0);assert.ok(layout.height<50);assert.match(layout.text,/HTTP error · HTTP 499/);assert.doesNotMatch(layout.text,/Response received/);assert.ok(layout.page<=width+1);
+      assert.equal(await evaluate("(() => {const cell=document.querySelector('#recent-reviews tbody tr').lastElementChild;return cell.querySelector('button').getBoundingClientRect().right<=cell.getBoundingClientRect().right;})()"),true,'action must fit inside its cell');
+      if(process.env.FZ_SCREENSHOT_DIR){const shot=await send('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(process.env.FZ_SCREENSHOT_DIR,`request-table-${width}.png`),Buffer.from(shot.data,'base64'));}
+    }
+    await evaluate("document.querySelector('#request-review').hidden=false");
     const draft={...detail,url:"https://api.github.com/graphql",status:"pending",outcome:null,http_status:null,created_at:new Date(now-25000).toISOString(),updated_at:new Date(now-25000).toISOString(),expires_at:new Date(now+95000).toISOString(),graphql:{status:"parsed",analysis:{...detail.graphql.analysis,operation_name:null,effective_variables:[{name:"id",declared_type:"ID!",source:"supplied",value:{kind:"string",value:"PR_fixture_opaque"}}],
       fields:[{field:"convertPullRequestToDraft",response_name:"convertPullRequestToDraft",path:["convertPullRequestToDraft"],parent:null,arguments:{input:{kind:"object",value:{pullRequestId:{kind:"string",value:"PR_fixture_opaque"},note:{kind:"string",value:"first line\n<img src=x onerror=window.pwned=true>\nlast line"},count:{kind:"int",value:"9007199254740993"}}}},conditions_text:[],mutation_inputs:[]},
         {field:"number",response_name:"number",path:["convertPullRequestToDraft","pullRequest","number"],parent:0,arguments:{},conditions_text:[]}]}}};

@@ -49,12 +49,24 @@ envelopes, URL query parameters, other media types, type-system definitions
 and unsupported language extensions fall back to a visible raw-review
 diagnostic. Unknown JSON envelope fields are not silently discarded.
 
-Parser limits: 64 KiB request body, 8,192 lexical tokens and 32 nesting
-levels. Display limits: 256 expanded fields, 1,024 selection visits and a
-256 KiB expansion budget. Over-limit displays yield no partial analysis,
+Parser limits: 64 KiB proxy body or 10 MiB async-job body, 8,192 lexical tokens
+and 32 nesting levels. Display limits: 256 expanded fields, 1,024 selection
+visits and a 256 KiB structural expansion budget. Strings over 4 KiB are stored
+once in `analysis.large_values`; typed display values reference that table by
+SHA-256. The UI resolves the references to exact content without truncation.
+File contents no longer consume the structural budget at every reuse. This
+display representation is never used by the narrow comment-permission matcher.
+Over-limit structural displays yield no partial analysis,
 but a successfully classified query still flows when only display expansion
 fails. Formatting normalizes whitespace/string escapes and omits comments;
 the raw body is retained for queued requests.
+
+The overview includes bounded operation names, actual root fields, repository
+and target hints from this same selected-operation parse. Repository names are
+shown when present in supported repository/branch arguments, not guessed from
+unrelated variables or decoded opaque IDs. These hints remain unverified until
+an explicit host lookup; they never authorize an operation. Summary metadata,
+but not input bodies, is included in host UI state updates.
 
 **This is not schema validation.** The broker does not know all GitHub
 types, validate field merges, coerce custom inputs or evaluate directives.

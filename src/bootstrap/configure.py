@@ -93,6 +93,9 @@ def configure(data, home, config, zdotdir, environ):
     proxy = "http://{}:x@{}:{}".format(urllib.parse.quote(data["container"], safe=""), proxy_host, data["proxy_port"])
     values = dict(data["fakes"])
     values.update(FZ_HOST=origin.hostname, FZ_BROKER=data["broker"], HTTP_PROXY=proxy, HTTPS_PROXY=proxy, http_proxy=proxy, https_proxy=proxy)
+    # Cline reaps idle plugin sandboxes after 30 minutes by default. Background
+    # polling is not a host tool call; allow the full 24h review window + margin.
+    values["CLINE_PLUGIN_IDLE_TIMEOUT_MS"] = "90000000"
     for key in ("NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "GIT_SSL_CAINFO", "GIT_PROXY_SSL_CAINFO"):
         values[key] = str(cert)
     content = "# Friendzone guest environment\n" + "".join(f"export {key}={shlex.quote(value)}\n" for key, value in values.items())

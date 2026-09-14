@@ -10,6 +10,14 @@ const crypto = require('node:crypto');
 const MAX_UPLOAD = 10 * 1024 * 1024;
 const MAX_RESPONSE = 32 * 1024 * 1024; // up to 4 MiB result, JSON escaped by broker
 const observers = new Map();
+const REQUIRED_IDLE_MS = 90000000;
+function notificationDelivery(){
+  const value=Number(process.env.CLINE_PLUGIN_IDLE_TIMEOUT_MS);
+  const idle=Number.isInteger(value)&&value>0&&value<=2147483647?value:1800000;
+  const bridge=typeof globalThis.__clinePluginHost?.emitEvent==='function';
+  return {bridge_available:bridge,configured_idle_timeout_ms:idle,
+    warning:!bridge?'Cline steer bridge unavailable; retrieve results with friendzone_get_request.':idle<REQUIRED_IDLE_MS?'Cline may stop the background observer before review completes. Update guest setup and restart the guest hub; get/list still recover accepted requests.':null};
+}
 function atomic(file, value) {
   fs.mkdirSync(path.dirname(file), {recursive:true,mode:0o700});
   const temp=file+'.'+crypto.randomUUID()+'.tmp';
@@ -84,6 +92,7 @@ function createSessionRuntime(session,ctx){
   // Sandboxed Cline kills the plugin child on session shutdown. No detached
   // process is launched; unref prevents an in-process host being kept alive.
   if(typeof globalThis.__clinePluginHost?.emitEvent!=='function')ctx.logger?.log?.('Friendzone automatic session updates unavailable; use get/list requests.');
+  const delivery=notificationDelivery();if(delivery.warning)ctx.logger?.log?.(delivery.warning);
   return {config,session,base,key,suffix,observer};
 }
 
@@ -126,7 +135,8 @@ const plugin={name:'friendzone',manifest:{capabilities:['tools']},setup(api,ctx=
       }finally{fs.closeSync(fd);}
     }
     if(typeof query!=='string'||!query)throw new Error('query required');
-    return request(config,'POST','/guest/jobs',{request_key:input.request_key,session_id:session,query,variables,operation_name});
+    const accepted=await request(config,'POST','/guest/jobs',{request_key:input.request_key,session_id:session,query,variables,operation_name});
+    return {...accepted,notification_delivery:notificationDelivery()};
   });
   tool('friendzone_get_request','Retrieve a submitted request result. Does not execute or retry it. Large results are saved to a guest file.',{id:{type:'string'}},['id'],async (input,{config,suffix,base,key})=>{
     const result=await request(config,'GET',idRoute(input.id)+suffix);

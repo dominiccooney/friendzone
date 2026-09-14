@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
+use sha2::{Digest, Sha256};
 
 const MAX_TOKENS: usize = 8192;
 const MAX_DEPTH: usize = 32;
@@ -26,12 +27,16 @@ pub enum Value {
     Null,
     List(Vec<Value>),
     Object(BTreeMap<String, Value>),
+    /// Display-only reference to an exact large string in Analysis.large_values.
+    /// Never present in the parser or inputs to semantic authorization.
+    Reference(String),
 }
 
 impl Value {
     fn format(&self) -> String {
         match self {
             Self::Variable(name) => format!("${name}"),
+            Self::Reference(id) => format!("<value {id}>"),
             Self::MissingVariable(name) => format!("<missing ${name}>"),
             Self::Int(value) | Self::Float(value) | Self::Enum(value) => value.clone(),
             Self::String(value) => serde_json::to_string(value).expect("string"),
@@ -923,6 +928,8 @@ pub struct Analysis {
     pub supplied_variables: String,
     pub effective_variables: Vec<VariableView>,
     pub fields: Vec<FieldView>,
+    /// Large strings are stored once, not expanded into every occurrence.
+    pub large_values: BTreeMap<String, String>,
     pub warnings: Vec<String>,
     /// Not deserialized from UI data. A strict, reconstructable command,
     /// independent of the advisory field/target summaries above.
@@ -1111,6 +1118,114 @@ fn comment_plan(
 pub enum Review {
     Parsed { analysis: Box<Analysis> },
     Unavailable { message: String },
+}
+
+/// Bounded overview metadata derived from the selected AST, not arbitrary
+/// strings in variables or aliases. Advisory only; never used for admission.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Facts {
+    pub operation_name: Option<String>,
+    pub operation_type: String,
+    pub fields: Vec<String>,
+    pub repositories: Vec<String>,
+    pub targets: Vec<String>,
+    pub more: bool,
+}
+impl Review {
+    pub fn facts(&self) -> Option<Facts> {
+        let Self::Parsed { analysis } = self else {
+            return None;
+        };
+        let mut facts = Facts {
+            operation_name: analysis.operation_name.as_ref().map(|s| short_fact(s)),
+            operation_type: analysis.operation_type.clone(),
+            ..Default::default()
+        };
+        for field in &analysis.fields {
+            if field.parent.is_none() {
+                push_fact(&mut facts.fields, &field.field, &mut facts.more);
+            }
+            if analysis.operation_type == "query"
+                && field.parent.is_none()
+                && field.field == "repository"
+                && let (Some(owner), Some(name)) = (
+                    field.arguments.get("owner").and_then(Value::string),
+                    field.arguments.get("name").and_then(Value::string),
+                )
+            {
+                push_fact(
+                    &mut facts.repositories,
+                    &format!("{owner}/{name}"),
+                    &mut facts.more,
+                );
+            }
+            if analysis.operation_type == "mutation"
+                && field.parent.is_none()
+                && field.field == "createCommitOnBranch"
+                && let Some(branch) = field
+                    .arguments
+                    .get("input")
+                    .and_then(|v| v.member("branch"))
+            {
+                if let Some(repo) = branch
+                    .member("repositoryNameWithOwner")
+                    .and_then(Value::string)
+                {
+                    push_fact(&mut facts.repositories, repo, &mut facts.more);
+                }
+                if let Some(name) = branch.member("branchName").and_then(Value::string) {
+                    push_fact(
+                        &mut facts.targets,
+                        &format!("branch {name}"),
+                        &mut facts.more,
+                    );
+                }
+            }
+            if let Some(target) = &field.target {
+                match target {
+                    Target::RepositoryNumber {
+                        owner,
+                        repository,
+                        number,
+                        ..
+                    } => {
+                        push_fact(
+                            &mut facts.repositories,
+                            &format!("{owner}/{repository}"),
+                            &mut facts.more,
+                        );
+                        push_fact(&mut facts.targets, &format!("#{number}"), &mut facts.more);
+                    }
+                    Target::NodeId {
+                        id, expected_type, ..
+                    } => push_fact(
+                        &mut facts.targets,
+                        &format!("{expected_type} ID {id}"),
+                        &mut facts.more,
+                    ),
+                }
+            }
+        }
+        Some(facts)
+    }
+}
+fn short_fact(value: &str) -> String {
+    let mut chars = value.chars();
+    let mut value: String = chars.by_ref().take(160).collect();
+    if chars.next().is_some() {
+        value.push('…');
+    }
+    value
+}
+fn push_fact(values: &mut Vec<String>, value: &str, more: &mut bool) {
+    let value = short_fact(value);
+    if !values.contains(&value) {
+        if values.len() < 8 {
+            values.push(value);
+        } else {
+            *more = true;
+        }
+    }
 }
 
 /// JSON duplicate keys are ambiguous across upstream parsers. Reject them
@@ -1403,6 +1518,16 @@ fn analyze_parsed(parsed: &ParsedRequest) -> Result<Analysis> {
     if supplied.keys().any(|name| !variables.contains_key(name)) {
         warnings.push("Supplied variables include names not declared by the selected operation. They are not used to infer targets.".into());
     }
+    // Authorization consumes original values. Compact only display variables,
+    // once before expansion, so repeated fragments do not rehash/copy large data.
+    let comment = comment_plan(document, selected, &variables, supplied);
+    let mut large_values = BTreeMap::new();
+    for value in variables.values_mut() {
+        compact_value(value, &mut large_values);
+    }
+    for variable in &mut effective_variables {
+        compact_value(&mut variable.value, &mut large_values);
+    }
     let mut expander = Expander {
         document,
         variables: &variables,
@@ -1410,6 +1535,7 @@ fn analyze_parsed(parsed: &ParsedRequest) -> Result<Analysis> {
         fields: Vec::new(),
         remaining: MAX_EXPANDED_BYTES,
         steps: 0,
+        large_values,
     };
     let conditions = expander.conditions(&selected.directives, &[])?;
     expander.expand(&selected.selections, None, &[], &conditions, 0)?;
@@ -1422,8 +1548,9 @@ fn analyze_parsed(parsed: &ParsedRequest) -> Result<Analysis> {
         supplied_variables: serde_json::to_string_pretty(&supplied).expect("JSON"),
         effective_variables,
         fields: expander.fields,
+        large_values: expander.large_values,
         warnings,
-        comment: comment_plan(document, selected, &variables, supplied),
+        comment,
     })
 }
 
@@ -1496,6 +1623,30 @@ struct Expander<'a> {
     fields: Vec<FieldView>,
     remaining: usize,
     steps: usize,
+    large_values: BTreeMap<String, String>,
+}
+
+fn compact_value(value: &mut Value, large: &mut BTreeMap<String, String>) {
+    match value {
+        Value::String(text) if text.len() > 4096 => {
+            let id = format!("{:x}", Sha256::digest(text.as_bytes()));
+            if !large.contains_key(&id) {
+                large.insert(id.clone(), text.clone());
+            }
+            *value = Value::Reference(id);
+        }
+        Value::List(values) => {
+            for v in values {
+                compact_value(v, large);
+            }
+        }
+        Value::Object(values) => {
+            for v in values.values_mut() {
+                compact_value(v, large);
+            }
+        }
+        _ => {}
+    }
 }
 impl Expander<'_> {
     fn charge(&mut self, bytes: usize) -> Result<()> {
@@ -1531,6 +1682,12 @@ impl Expander<'_> {
                     })
                     .collect::<Result<_>>()?,
             ),
+            Value::String(text) if text.len() > 4096 => {
+                let mut value = Value::String(text.clone());
+                compact_value(&mut value, &mut self.large_values);
+                self.charge(96)?;
+                value
+            }
             _ => {
                 self.charge(value.format().len())?;
                 value.clone()
@@ -2370,11 +2527,13 @@ mod tests {
         query.push_str(" fragment F15 on Query { a }");
         assert!(parse(&query, Json::Null, None).is_err());
         let query = "query($large:String){f(a:$large,b:$large,c:$large,d:$large)}";
-        assert!(
-            parse(query, json!({"large":"x".repeat(45000)}), None)
-                .unwrap_err()
-                .contains("budget")
+        let reused = parse(query, json!({"large":"x".repeat(45000)}), None).unwrap();
+        assert_eq!(
+            reused.large_values.len(),
+            1,
+            "repeated values must not exhaust expansion budget"
         );
+        assert_eq!(reused.fields[0].arguments.len(), 4);
         let result = std::panic::catch_unwind(|| {
             for n in 0..1024 {
                 let query = format!("{{f(v: \"\\u{:04x}\")}}", n);
@@ -2382,5 +2541,94 @@ mod tests {
             }
         });
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn publication_sized_values_are_exact_shared_and_leave_operation_repo_and_inputs_visible() {
+        let contents = "YWJj".repeat(28000);
+        let input = json!({"branch":{"repositoryNameWithOwner":"cline/cline","branchName":"feature"},"expectedHeadOid":"abc","message":{"headline":"publish"},"fileChanges":{"additions":[{"path":"one","contents":contents},{"path":"two","contents":contents},{"path":"three","contents":contents}],"deletions":[{"path":"old"}]}});
+        let body=json!({"operationName":"PublishBackgroundCommandStreaming","query":"mutation PublishBackgroundCommandStreaming($input:CreateCommitOnBranchInput!){createCommitOnBranch(input:$input){commit{oid url} ref{name}}}","variables":{"input":input}}).to_string();
+        assert!(body.len() > 330000);
+        let (read, review) =
+            inspect_with_limit(&body, "application/json", crate::jobs::MAX_PAYLOAD);
+        assert!(!read);
+        let facts = review.facts().unwrap();
+        assert_eq!(
+            facts.operation_name.as_deref(),
+            Some("PublishBackgroundCommandStreaming")
+        );
+        assert_eq!(facts.repositories, vec!["cline/cline"]);
+        assert_eq!(facts.fields, vec!["createCommitOnBranch"]);
+        let Review::Parsed { analysis } = review else {
+            panic!("publication not parsed")
+        };
+        assert_eq!(analysis.large_values.len(), 1);
+        assert_eq!(analysis.large_values.values().next().unwrap(), &contents);
+        let Value::List(additions) = analysis.fields[0].arguments["input"]
+            .member("fileChanges")
+            .unwrap()
+            .member("additions")
+            .unwrap()
+        else {
+            panic!("file list")
+        };
+        for file in additions {
+            let Value::Reference(id) = file.member("contents").unwrap() else {
+                panic!("shared reference")
+            };
+            assert_eq!(analysis.large_values[id], contents);
+        }
+        assert!(analysis.comment.is_none());
+        // Compact display must not change what the strict comment permission
+        // resolver reconstructs from its original parsed values.
+        let text = "comment ".repeat(1000);
+        let comment = parse(
+            "mutation($i:AddCommentInput!){addComment(input:$i){clientMutationId}}",
+            json!({"i":{"subjectId":"id","body":text}}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(comment.comment.unwrap().body, text);
+    }
+
+    #[test]
+    fn overview_facts_do_not_guess_repo_from_arbitrary_variables_or_unselected_operations() {
+        let review=review(&json!({"query":"query Read { viewer { login } } mutation Write { createCommitOnBranch(input:{branch:{repositoryNameWithOwner:\"evil/repo\"}}){clientMutationId} }","operationName":"Read","variables":{"repository":"fake/repo"}}).to_string(),"application/json");
+        let facts = review.facts().unwrap();
+        assert_eq!(facts.fields, vec!["viewer"]);
+        assert!(facts.repositories.is_empty());
+        let graph = inspect(
+            "mutation($i:AddCommentInput!){addComment(input:$i){clientMutationId}}",
+            "application/graphql",
+        )
+        .1;
+        assert!(graph.facts().is_none());
+    }
+
+    #[test]
+    #[ignore = "opt-in local captured request; does not send or execute it"]
+    fn captured_publication_can_be_reviewed_without_changing_payload() {
+        let path = std::env::var("FZ_GRAPHQL_REQUEST_FIXTURE").expect("absolute fixture path");
+        let body = std::fs::read_to_string(path).unwrap();
+        let (read, view) = inspect_with_limit(&body, "application/json", crate::jobs::MAX_PAYLOAD);
+        assert!(!read);
+        let facts = view
+            .facts()
+            .expect("actual captured request should have structured review");
+        assert_eq!(
+            facts.operation_name.as_deref(),
+            Some("PublishBackgroundCommandStreaming")
+        );
+        assert_eq!(facts.repositories, vec!["cline/cline"]);
+        let Review::Parsed { analysis } = view else {
+            panic!("expected parsed request")
+        };
+        assert!(
+            analysis
+                .fields
+                .iter()
+                .any(|f| f.field == "createCommitOnBranch")
+        );
+        assert!(!analysis.large_values.is_empty());
     }
 }
