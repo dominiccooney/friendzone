@@ -63,6 +63,10 @@ pub struct Summary {
     pub facts: Option<crate::graphql::Facts>,
     /// Optional correlation label supplied by async clients. Not unique.
     pub request_key: Option<String>,
+    /// Safe, bounded transport metadata for durable async jobs. Request
+    /// content, credentials and arbitrary response headers are never included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<crate::jobs::UpstreamDiagnostics>,
 }
 
 #[derive(Clone, Serialize)]
@@ -211,6 +215,7 @@ impl Detail {
                 asynchronous: false,
                 facts: graphql.as_ref().and_then(crate::graphql::Review::facts),
                 request_key: None,
+                upstream: None,
             },
             headers,
             body: body.into(),

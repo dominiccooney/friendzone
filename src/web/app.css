@@ -12,6 +12,7 @@
 .review-table th:nth-child(5) { width:10%; }
 .review-table th:nth-child(6) { width:9%; }
 .review-operation { font-weight:600; }
+.review-target a { color:var(--blue); text-decoration:underline; text-underline-offset:2px; }
 .review-table td:last-child { padding:4px; }
 .review-table .request-badge { font-size:11px; padding:3px 5px; white-space:nowrap; max-width:100%; overflow:hidden; text-overflow:ellipsis; vertical-align:middle; }
 .review-table button { font-size:12px; padding:5px 7px; }

@@ -1129,7 +1129,17 @@ pub struct Facts {
     pub fields: Vec<String>,
     pub repositories: Vec<String>,
     pub targets: Vec<String>,
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactFact>,
     pub more: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactFact {
+    pub repository: String,
+    pub number: String,
+    /// `issue`, `pull_request`, or `issue_or_pull_request`.
+    pub kind: String,
 }
 impl Review {
     pub fn facts(&self) -> Option<Facts> {
@@ -1187,14 +1197,25 @@ impl Review {
                         owner,
                         repository,
                         number,
-                        ..
+                        expected_type,
                     } => {
-                        push_fact(
-                            &mut facts.repositories,
-                            &format!("{owner}/{repository}"),
+                        let repository = format!("{owner}/{repository}");
+                        push_fact(&mut facts.repositories, &repository, &mut facts.more);
+                        push_fact(&mut facts.targets, &format!("#{number}"), &mut facts.more);
+                        push_artifact(
+                            &mut facts.artifacts,
+                            ArtifactFact {
+                                repository,
+                                number: number.clone(),
+                                kind: match *expected_type {
+                                    "Issue" => "issue",
+                                    "PullRequest" => "pull_request",
+                                    _ => "issue_or_pull_request",
+                                }
+                                .into(),
+                            },
                             &mut facts.more,
                         );
-                        push_fact(&mut facts.targets, &format!("#{number}"), &mut facts.more);
                     }
                     Target::NodeId {
                         id, expected_type, ..
@@ -1219,6 +1240,15 @@ fn short_fact(value: &str) -> String {
 }
 fn push_fact(values: &mut Vec<String>, value: &str, more: &mut bool) {
     let value = short_fact(value);
+    if !values.contains(&value) {
+        if values.len() < 8 {
+            values.push(value);
+        } else {
+            *more = true;
+        }
+    }
+}
+fn push_artifact(values: &mut Vec<ArtifactFact>, value: ArtifactFact, more: &mut bool) {
     if !values.contains(&value) {
         if values.len() < 8 {
             values.push(value);
@@ -2244,6 +2274,34 @@ mod tests {
             .collect();
         assert_eq!(targets.len(), 2);
         assert_ne!(targets[0], targets[1]);
+        let pull = review(
+            r#"{"query":"{ repository(owner:\"cline\",name:\"cline\"){pullRequest(number:1234){id}} }"}"#,
+            "application/json",
+        )
+        .facts()
+        .unwrap();
+        assert_eq!(
+            pull.artifacts,
+            vec![ArtifactFact {
+                repository: "cline/cline".into(),
+                number: "1234".into(),
+                kind: "pull_request".into(),
+            }]
+        );
+        let issue = review(
+            r#"{"query":"{ repository(owner:\"cline\",name:\"cline\"){issue(number:1234){id}} }"}"#,
+            "application/json",
+        )
+        .facts()
+        .unwrap();
+        assert_eq!(issue.artifacts[0].kind, "issue");
+        let either = review(
+            r#"{"query":"{ repository(owner:\"cline\",name:\"cline\"){issueOrPullRequest(number:1234){id}} }"}"#,
+            "application/json",
+        )
+        .facts()
+        .unwrap();
+        assert_eq!(either.artifacts[0].kind, "issue_or_pull_request");
     }
 
     #[test]

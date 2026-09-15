@@ -13,6 +13,7 @@ use std::{
     net::IpAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 use uuid::Uuid;
 
@@ -21,6 +22,104 @@ const MAX_RESULT: usize = 4 * 1024 * 1024;
 const MAX_STORAGE: usize = 256 * 1024 * 1024;
 const MAX_JOBS: usize = 100;
 const REVIEW_HOURS: i64 = 24;
+
+/// Bounded metadata retained to distinguish approval/queue time, transport
+/// failures, and responses from GitHub or an intervening edge. Only explicitly
+/// allowlisted response headers are copied; request headers and bodies never are.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpstreamDiagnostics {
+    pub approved_at: Option<DateTime<Utc>>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub headers_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub accepted_to_approval_ms: Option<u64>,
+    pub approval_to_admission_ms: Option<u64>,
+    pub accepted_to_admission_ms: Option<u64>,
+    pub time_to_headers_ms: Option<u64>,
+    pub total_ms: Option<u64>,
+    pub remote_addr: Option<String>,
+    pub http_version: Option<String>,
+    pub response_headers: Vec<(String, String)>,
+    pub response_bytes: Option<u64>,
+    pub response_complete: Option<bool>,
+    pub transport_error: Option<String>,
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    start.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+fn wall_elapsed_ms(start: DateTime<Utc>, end: DateTime<Utc>) -> u64 {
+    end.signed_duration_since(start).num_milliseconds().max(0) as u64
+}
+
+fn transport_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection_failed"
+    } else if error.is_body() {
+        "body_transfer_failed"
+    } else if error.is_request() {
+        "request_failed"
+    } else {
+        "transport_failed"
+    }
+}
+
+fn diagnostic_response_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    // These identify protocol/edge behavior or carry provider correlation and
+    // rate-limit facts. Never broaden this to cookies, auth, or arbitrary X-*.
+    const SAFE: &[&str] = &[
+        "date",
+        "server",
+        "via",
+        "content-type",
+        "content-length",
+        "x-github-request-id",
+        "x-github-media-type",
+        "x-github-api-version-selected",
+        "x-request-id",
+        "x-correlation-id",
+        "x-trace-id",
+        "traceparent",
+        "x-fastly-request-id",
+        "x-timer",
+        "x-served-by",
+        "x-cache",
+        "x-cache-hits",
+        "cf-ray",
+        "x-amz-cf-id",
+        "x-amz-request-id",
+        "x-azure-ref",
+        "x-envoy-upstream-service-time",
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+        "x-ratelimit-resource",
+        "x-ratelimit-used",
+    ];
+    let mut result = Vec::new();
+    let mut total = 0usize;
+    for name in SAFE {
+        for value in headers.get_all(*name) {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            if value.len() > 1024 || value.chars().any(char::is_control) {
+                continue;
+            }
+            let size = name.len() + value.len();
+            if total + size > 8192 || result.len() >= 32 {
+                return result;
+            }
+            total += size;
+            result.push(((*name).to_owned(), value.to_owned()));
+        }
+    }
+    result
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -439,7 +538,11 @@ mod tests {
                         async {
                             (
                                 axum::http::StatusCode::from_u16(499).unwrap(),
-                                "upstream closed request",
+                                [
+                                    ("x-github-request-id", "GITHUB-CORRELATION-123"),
+                                    ("x-secret-internal", "must-not-be-retained"),
+                                ],
+                                "",
                             )
                         }
                     }),
@@ -474,7 +577,25 @@ mod tests {
         assert_eq!(result["status"], "upstream_error");
         assert_eq!(result["http_status"], 499);
         assert_eq!(result["terminal"], true);
-        assert_eq!(result["result"], "upstream closed request");
+        assert_eq!(result["result"], "");
+        assert_eq!(result["upstream"]["response_bytes"], 0);
+        assert_eq!(result["upstream"]["response_complete"], true);
+        assert!(result["upstream"]["started_at"].is_string());
+        assert!(result["upstream"]["headers_at"].is_string());
+        assert!(result["upstream"]["finished_at"].is_string());
+        assert!(result["upstream"]["time_to_headers_ms"].is_number());
+        assert!(result["upstream"]["total_ms"].is_number());
+        assert!(result["upstream"]["remote_addr"].is_string());
+        assert!(
+            result["upstream"]["response_headers"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!([
+                    "x-github-request-id",
+                    "GITHUB-CORRELATION-123"
+                ]))
+        );
+        assert!(!result.to_string().contains("must-not-be-retained"));
         let restarted = AppState::load(&f.dir).unwrap();
         restarted
             .jobs
@@ -485,6 +606,49 @@ mod tests {
         let facts = restarted.jobs.inspect(id).unwrap().summary.facts.unwrap();
         assert_eq!(facts.repositories, vec!["cline/cline"]);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn transport_failure_records_safe_diagnostics_without_replaying() {
+        let f = Fixture::new();
+        // Keep a listening socket open without accepting. The client can
+        // connect, then deterministically times out waiting for HTTP headers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/graphql", listener.local_addr().unwrap());
+        let read = f.submit("connection", "query { viewer { id } }");
+        let id = Fixture::id(&read);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        f.app
+            .jobs
+            .tick(&f.app, &f.settings, &client, &endpoint)
+            .await
+            .unwrap();
+        let instance = f.app.async_identity("guest", f.peer).unwrap().0;
+        let result = f.app.jobs.get("guest", instance, id, "session").unwrap();
+        assert_eq!(result["status"], "unknown");
+        assert!(result["http_status"].is_null());
+        assert_eq!(result["upstream"]["transport_error"], "timeout");
+        assert_eq!(result["upstream"]["response_bytes"], 0);
+        assert_eq!(result["upstream"]["response_complete"], false);
+        assert!(
+            result["upstream"]["response_headers"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        f.app
+            .jobs
+            .tick(&f.app, &f.settings, &client, &endpoint)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.app.jobs.get("guest", instance, id, "session").unwrap()["status"],
+            "unknown"
+        );
     }
 
     #[tokio::test]
@@ -674,6 +838,8 @@ struct Job {
     result: Option<String>,
     #[serde(default)]
     facts: Option<crate::graphql::Facts>,
+    #[serde(default)]
+    upstream: Option<UpstreamDiagnostics>,
 }
 impl Job {
     fn summary(&self) -> Summary {
@@ -694,6 +860,7 @@ impl Job {
             asynchronous: true,
             facts: self.facts.clone(),
             request_key: Some(self.submission.request_key.clone()),
+            upstream: self.upstream.clone(),
         }
     }
     fn terminal(&self) -> bool {
@@ -868,6 +1035,7 @@ impl Jobs {
             .into(),
             result: None,
             facts: detail.summary.facts,
+            upstream: None,
         };
         self.transaction(|store| {
             // Every explicit POST is a distinct job. request_key is a human
@@ -890,7 +1058,19 @@ impl Jobs {
         })
     }
     fn guest_value(job: &Job, result: bool) -> serde_json::Value {
-        serde_json::json!({"id":job.id,"request_key":job.submission.request_key,"session_id":job.submission.session_id,"status":job.status,"updated_at":job.updated_at,"http_status":job.http_status,"outcome":job.outcome,"terminal":job.terminal(),"result":if result {job.result.as_deref()}else{None}})
+        serde_json::json!({
+            "id":job.id,
+            "request_key":job.submission.request_key,
+            "session_id":job.submission.session_id,
+            "status":job.status,
+            "created_at":job.created_at,
+            "updated_at":job.updated_at,
+            "http_status":job.http_status,
+            "outcome":job.outcome,
+            "terminal":job.terminal(),
+            "upstream":job.upstream,
+            "result":if result {job.result.as_deref()}else{None}
+        })
     }
     pub fn list(&self, container: &str, instance: Uuid, session: &str) -> Vec<serde_json::Value> {
         self.0
@@ -1021,7 +1201,13 @@ impl Jobs {
             }
             match decision {
                 crate::review::Decision::Approve => {
-                    job.set(Status::Approved, "Approved; queued for execution")
+                    let approved_at = Utc::now();
+                    job.set(Status::Approved, "Approved; queued for execution");
+                    job.upstream = Some(UpstreamDiagnostics {
+                        approved_at: Some(approved_at),
+                        accepted_to_approval_ms: Some(wall_elapsed_ms(job.created_at, approved_at)),
+                        ..Default::default()
+                    });
                 }
                 crate::review::Decision::Deny => {
                     job.set(Status::Denied, "Denied by host. Not sent.")
@@ -1103,6 +1289,14 @@ impl Jobs {
             };
             // Shared policy lock is the admission boundary, just like proxy
             // review admission. Persist Sending BEFORE the first upstream byte.
+            let started_at = Utc::now();
+            let mut sending_diagnostics = job.upstream.clone().unwrap_or_default();
+            sending_diagnostics.started_at = Some(started_at);
+            sending_diagnostics.accepted_to_admission_ms =
+                Some(wall_elapsed_ms(job.created_at, started_at));
+            sending_diagnostics.approval_to_admission_ms = sending_diagnostics
+                .approved_at
+                .map(|approved_at| wall_elapsed_ms(approved_at, started_at));
             let admitted =
                 app.with_async_identity(&job.container, job.peer, job.instance, job.epoch, || {
                     self.transaction(|d| {
@@ -1113,12 +1307,21 @@ impl Jobs {
                             return Ok(false);
                         }
                         j.set(Status::Sending, "Executing on GitHub");
+                        j.upstream = Some(sending_diagnostics.clone());
                         Ok(true)
                     })
                 })?;
             if !admitted {
                 continue;
             }
+            let transfer_started = Instant::now();
+            tracing::info!(
+                request_id = %job.id,
+                body_bytes = job.body.len(),
+                accepted_to_approval_ms = sending_diagnostics.accepted_to_approval_ms,
+                approval_to_admission_ms = sending_diagnostics.approval_to_admission_ms,
+                "async GraphQL request sending"
+            );
             let response = client
                 .post(endpoint)
                 .header("authorization", &credential.header_value)
@@ -1127,36 +1330,115 @@ impl Jobs {
                 .body(job.body.clone())
                 .send()
                 .await;
-            let (status, http, outcome, result) = match response {
-                Err(_) => (
-                    Status::Unknown,
-                    None,
-                    "No reply after sending; not automatically retried".to_owned(),
-                    None,
-                ),
+            let (status, http, outcome, result, diagnostics) = match response {
+                Err(error) => {
+                    let finished_at = Utc::now();
+                    let error_kind = transport_error_kind(&error);
+                    let mut diagnostics = sending_diagnostics.clone();
+                    diagnostics.finished_at = Some(finished_at);
+                    diagnostics.total_ms = Some(elapsed_ms(transfer_started));
+                    diagnostics.response_bytes = Some(0);
+                    diagnostics.response_complete = Some(false);
+                    diagnostics.transport_error = Some(error_kind.into());
+                    tracing::warn!(
+                        request_id = %job.id,
+                        transport_error = error_kind,
+                        total_ms = diagnostics.total_ms.unwrap_or_default(),
+                        "async GraphQL transport failed"
+                    );
+                    (
+                        Status::Unknown,
+                        None,
+                        format!("No reply after sending ({error_kind}); not automatically retried"),
+                        None,
+                        diagnostics,
+                    )
+                }
                 Ok(mut response) => {
+                    let headers_at = Utc::now();
                     let http = response.status().as_u16();
+                    let time_to_headers_ms = elapsed_ms(transfer_started);
+                    let remote_addr = response.remote_addr().map(|address| address.to_string());
+                    let http_version = format!("{:?}", response.version());
+                    let response_headers = diagnostic_response_headers(response.headers());
+                    tracing::info!(
+                        request_id = %job.id,
+                        http_status = http,
+                        time_to_headers_ms,
+                        remote_addr = remote_addr.as_deref().unwrap_or("unknown"),
+                        github_request_id = response_headers
+                            .iter()
+                            .find(|(name, _)| name == "x-github-request-id")
+                            .map(|(_, value)| value.as_str())
+                            .unwrap_or("absent"),
+                        server = response_headers
+                            .iter()
+                            .find(|(name, _)| name == "server")
+                            .map(|(_, value)| value.as_str())
+                            .unwrap_or("absent"),
+                        via = response_headers
+                            .iter()
+                            .find(|(name, _)| name == "via")
+                            .map(|(_, value)| value.as_str())
+                            .unwrap_or("absent"),
+                        "async GraphQL response headers received"
+                    );
                     let mut bytes = Vec::new();
+                    let mut observed_bytes = 0u64;
                     let mut complete = true;
+                    let mut body_error = None;
                     loop {
                         match response.chunk().await {
                             Ok(Some(chunk)) if bytes.len() + chunk.len() <= MAX_RESULT => {
+                                observed_bytes = observed_bytes.saturating_add(chunk.len() as u64);
                                 bytes.extend_from_slice(&chunk)
                             }
                             Ok(None) => break,
-                            _ => {
+                            Err(error) => {
                                 complete = false;
+                                body_error = Some(transport_error_kind(&error).to_owned());
+                                break;
+                            }
+                            Ok(Some(chunk)) => {
+                                observed_bytes = observed_bytes.saturating_add(chunk.len() as u64);
+                                complete = false;
+                                body_error = Some("response_too_large".into());
                                 break;
                             }
                         }
                     }
+                    let finished_at = Utc::now();
+                    let total_ms = elapsed_ms(transfer_started);
+                    let mut diagnostics = sending_diagnostics.clone();
+                    diagnostics.headers_at = Some(headers_at);
+                    diagnostics.finished_at = Some(finished_at);
+                    diagnostics.time_to_headers_ms = Some(time_to_headers_ms);
+                    diagnostics.total_ms = Some(total_ms);
+                    diagnostics.remote_addr = remote_addr;
+                    diagnostics.http_version = Some(http_version);
+                    diagnostics.response_headers = response_headers;
+                    diagnostics.response_bytes = Some(observed_bytes);
+                    diagnostics.response_complete = Some(complete);
+                    diagnostics.transport_error = body_error.clone();
+                    tracing::info!(
+                        request_id = %job.id,
+                        http_status = http,
+                        response_bytes = observed_bytes,
+                        response_complete = complete,
+                        total_ms,
+                        body_error = body_error.as_deref().unwrap_or("none"),
+                        "async GraphQL request completed"
+                    );
                     if !complete {
                         (
                             Status::Unknown,
                             Some(http),
-                            "Response incomplete or over 4 MiB; inspect upstream before retrying"
-                                .into(),
+                            format!(
+                                "Response incomplete ({}) or over 4 MiB; inspect upstream before retrying",
+                                body_error.as_deref().unwrap_or("body transfer failed")
+                            ),
                             None,
+                            diagnostics,
                         )
                     } else {
                         let json = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
@@ -1175,7 +1457,7 @@ impl Jobs {
                             Some(http),
                             if http >= 400 {
                                 format!(
-                                    "GitHub returned HTTP {http}; inspect the response before retrying"
+                                    "Upstream endpoint returned HTTP {http}; inspect the response before retrying"
                                 )
                             } else if errors {
                                 "GraphQL errors returned".into()
@@ -1183,6 +1465,7 @@ impl Jobs {
                                 "Response received".into()
                             },
                             Some(String::from_utf8_lossy(&bytes).into_owned()),
+                            diagnostics,
                         )
                     }
                 }
@@ -1195,6 +1478,7 @@ impl Jobs {
                 j.set(status, &outcome);
                 j.http_status = http;
                 j.result = result;
+                j.upstream = Some(diagnostics);
                 Ok(())
             })?;
         }

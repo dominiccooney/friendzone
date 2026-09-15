@@ -15,7 +15,10 @@ the integration after restarting Cline; it does not cancel submitted jobs.
 - For large content, pass an **absolute guest `request_file` path** instead of
   inline GraphQL. File shape: `{"query":"…","variables":{},"operationName":null}`.
 - `friendzone_get_request`: status, HTTP status, and the upstream response string.
-  Large results return a preview plus an absolute guest result-file path.
+  It also returns bounded transport diagnostics: admission/header/completion
+  timing, connected peer, body completeness, transport error category, and an
+  allowlist of provider/edge correlation headers. Large results return a preview
+  plus an absolute guest result-file path.
 - `friendzone_list_requests`: outstanding and completed requests for this session.
 - `friendzone_cancel_request`: cancels pending/queued work, not a running mutation.
 - `friendzone_remove_result`: removes a finished job and releases storage. It
@@ -121,6 +124,15 @@ This is separate from the **unchanged 64 KiB, 120-second proxy review**:
 | Retained jobs | 100; explicit removal, no automatic eviction of keys |
 | Active requests | at most 32 globally / 8 per guest, further limited by storage reservation |
 | Durable store | 256 MiB including reserved response space |
+
+The 90-second execution limit starts at admission, after approval and queueing.
+`upstream.accepted_to_approval_ms` and `approval_to_admission_ms` separate human
+review from later queueing; `time_to_headers_ms` and `total_ms` measure only the
+admitted upstream request. Friendzone logs the same phase boundaries under the
+durable request ID.
+Diagnostic headers are a fixed allowlist (for example `x-github-request-id`,
+`server`, `via`, tracing and rate-limit fields); credentials, cookies, request
+content, and arbitrary response headers are excluded.
 
 Lexical/nesting/structural display budgets still apply. Large strings such as
 base64 file contents are shared by display reference instead of repeatedly

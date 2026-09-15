@@ -212,19 +212,52 @@ function reviewOutcomeText(request) {
     ? request.outcome : `Upstream returned HTTP ${request.http_status}. Inspect the result before retrying.`;
   return request.outcome || "";
 }
+function upstreamDiagnostics(request) {
+  const upstream=request.upstream;
+  if(!upstream)return "";
+  const lines=[];
+  if(Number.isFinite(upstream.accepted_to_approval_ms))lines.push(`Accepted → approval: ${upstream.accepted_to_approval_ms} ms`);
+  if(Number.isFinite(upstream.approval_to_admission_ms))lines.push(`Approval → admission: ${upstream.approval_to_admission_ms} ms`);
+  else if(Number.isFinite(upstream.accepted_to_admission_ms))lines.push(`Accepted → admission: ${upstream.accepted_to_admission_ms} ms`);
+  if(Number.isFinite(upstream.time_to_headers_ms))lines.push(`Admission → response headers: ${upstream.time_to_headers_ms} ms`);
+  if(Number.isFinite(upstream.total_ms))lines.push(`Admission → completion: ${upstream.total_ms} ms`);
+  if(upstream.remote_addr)lines.push(`Connected peer: ${upstream.remote_addr}`);
+  if(upstream.http_version)lines.push(`HTTP version: ${upstream.http_version}`);
+  if(Number.isFinite(upstream.response_bytes))lines.push(`Observed response body: ${upstream.response_bytes} bytes${upstream.response_complete===false?' (incomplete)':''}`);
+  if(upstream.transport_error)lines.push(`Transport result: ${upstream.transport_error}`);
+  for(const pair of upstream.response_headers || [])if(Array.isArray(pair)&&pair.length===2)lines.push(`${pair[0]}: ${pair[1]}`);
+  return lines.join("\n");
+}
 function reviewTable(requests, empty) {
   if(!requests.length)return `<p>${esc(empty)}</p>`;
   return `<div class="review-table-scroll"><table class="review-table"><thead><tr><th scope="col">Operation</th><th scope="col">Repository / target</th><th scope="col">Guest</th><th scope="col">Status</th><th scope="col">Time</th><th scope="col"><span class="sr-only">Action</span></th></tr></thead><tbody>${requests.map(reviewRow).join("")}</tbody></table></div>`;
+}
+function reviewTarget(facts) {
+  const repositories=Array.isArray(facts?.repositories)?facts.repositories:[];
+  const targets=Array.isArray(facts?.targets)?facts.targets:[];
+  const text=[...repositories,...targets].join(" · ");
+  if(repositories.length===1&&targets.length===1){
+    const repository=/^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100})$/.exec(repositories[0]);
+    const number=/^#([1-9][0-9]*)$/.exec(targets[0]);
+    if(repository&&number){
+      const artifacts=Array.isArray(facts?.artifacts)?facts.artifacts:[];
+      const artifact=artifacts.length===1&&artifacts[0]?.repository===repositories[0]&&String(artifacts[0]?.number)===number[1]?artifacts[0]:null;
+      const segment=artifact?.kind==="pull_request"?"pull":"issues";
+      const label=`${repositories[0]} ${targets[0]}`;
+      const url=`https://github.com/${encodeURIComponent(repository[1])}/${encodeURIComponent(repository[2])}/${segment}/${number[1]}`;
+      return {text:label,markup:`<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`};
+    }
+  }
+  return {text,markup:esc(text||"Not identified")};
 }
 function reviewRow(request) {
   const status = reviewStatus(request), pending = !request.status || request.status === "pending";
   const outcome = reviewOutcomeText(request);
   const facts=request.facts;
   const operation=facts?.operation_name || facts?.fields?.join(", ") || `${request.method} ${request.url}`;
-  const target=[...(facts?.repositories || []),...(facts?.targets || [])].join(" · ");
-  const repository=target || "Not identified";
+  const target=reviewTarget(facts);
   const description=[facts?.operation_type,...(facts?.fields || []),facts?.more?"More operations/targets in details":"",request.url].filter(Boolean).join(" · ");
-  return `<tr class="review-row"><td class="review-operation" data-label="Operation" title="${esc(description)}">${esc(operation)}</td><td class="review-target" data-label="Target" title="${esc(target || 'Repository not identified; inspect request details')}">${esc(repository)}${facts?.more?" …":""}</td><td class="review-guest" data-label="Guest">${esc(request.container)}</td><td class="review-state" data-label="Status"><span class="request-badge ${status.color}" title="${esc(outcome)}">${esc(status.label)}</span></td><td class="review-time" data-label="Time" title="${pending?'Approval deadline':'Last update'}">${pending?'by ':''}${esc(displayTime(pending?request.expires_at:request.updated_at || request.created_at))}</td><td class="review-action"><button type="button" data-review="${esc(request.id)}">${pending?"Review":"Details"}</button></td></tr>`;
+  return `<tr class="review-row"><td class="review-operation" data-label="Operation" title="${esc(description)}">${esc(operation)}</td><td class="review-target" data-label="Target" title="${esc(target.text || 'Repository not identified; inspect request details')}">${target.markup}${facts?.more?" …":""}</td><td class="review-guest" data-label="Guest">${esc(request.container)}</td><td class="review-state" data-label="Status"><span class="request-badge ${status.color}" title="${esc(outcome)}">${esc(status.label)}</span></td><td class="review-time" data-label="Time" title="${pending?'Approval deadline':'Last update'}">${pending?'by ':''}${esc(displayTime(pending?request.expires_at:request.updated_at || request.created_at))}</td><td class="review-action"><button type="button" data-review="${esc(request.id)}">${pending?"Review":"Details"}</button></td></tr>`;
 }
 function applyReviewOutcome(summary) {
   if (!activeReview) return;
@@ -238,6 +271,7 @@ function applyReviewOutcome(summary) {
   $("#request-review-badge").textContent = status.label;
   $("#request-review-badge").className = `request-badge ${status.color}`;
   $("#request-review-outcome").textContent = reviewOutcomeText(activeReview) || (waiting ? "Waiting for your decision." : "");
+  $("#request-review-upstream").textContent = upstreamDiagnostics(activeReview);
   $("#request-review-actions").hidden = !waiting;
   $("#request-approve").disabled = !waiting || decisionInFlight === activeReview.id;
   $("#request-deny").disabled = !waiting || decisionInFlight === activeReview.id;
@@ -247,9 +281,17 @@ function applyReviewOutcome(summary) {
 let reviewClock = null;
 function reviewTiming(request, now = Date.now()) {
   const created = Date.parse(request.created_at), expires = Date.parse(request.expires_at);
-  if (request.asynchronous) return (request.status || "pending") === "pending"
-    ? `Async job · review by ${new Date(request.expires_at).toLocaleString()}. Client does not need to wait.`
-    : "Async job · result available to the submitting Cline session.";
+  if (request.asynchronous) {
+    if ((request.status || "pending") === "pending") return `Async job · review by ${new Date(request.expires_at).toLocaleString()}. Client does not need to wait.`;
+    const upstream=request.upstream;
+    if(upstream?.started_at){
+      const approved=Number.isFinite(upstream.accepted_to_approval_ms)?`${upstream.accepted_to_approval_ms} ms to approval`:"approved";
+      const admitted=Number.isFinite(upstream.approval_to_admission_ms)?`${upstream.approval_to_admission_ms} ms approval to admission`:"admitted";
+      const transfer=Number.isFinite(upstream.total_ms)?`${upstream.total_ms} ms in upstream transport`:"upstream transport finished";
+      return `Async job · ${approved} · ${admitted} · ${transfer}. Result available to the submitting Cline session.`;
+    }
+    return "Async job · result available to the submitting Cline session.";
+  }
   if ((request.status || "pending") === "pending") {
     if (!Number.isFinite(expires)) return "Client may stop waiting before the broker deadline.";
     const remaining = Math.max(0, Math.ceil((expires - now) / 1000));

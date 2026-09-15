@@ -164,6 +164,21 @@ test("review timing distinguishes broker expiry from early cancellation without 
   assert.equal(f.run(`reviewTiming({status:"cancelled",created_at:"${created}",updated_at:"2026-09-10T00:00:00Z"})`),"");
 });
 
+test("async upstream diagnostics separate approval latency and retain only broker-supplied safe metadata", async () => {
+  const f=fixture();
+  const upstream={approved_at:"2026-09-15T01:20:18Z",started_at:"2026-09-15T01:20:20Z",headers_at:"2026-09-15T01:20:27Z",finished_at:"2026-09-15T01:20:27Z",accepted_to_approval_ms:12917,approval_to_admission_ms:2000,accepted_to_admission_ms:14917,time_to_headers_ms:7000,total_ms:7001,remote_addr:"140.82.112.5:443",http_version:"HTTP/2.0",response_headers:[["x-github-request-id","ABC1:DEF2:3"],["server","GitHub.com"]],response_bytes:0,response_complete:true,transport_error:null};
+  const job={...pendingRequest,asynchronous:true,status:"upstream_error",http_status:499,outcome:"GitHub returned HTTP 499",created_at:"2026-09-15T01:20:05Z",updated_at:"2026-09-15T01:20:27Z",upstream};
+  const opening=f.run('openRequestReview("request-id")');
+  f.calls.at(-1).resolve({ok:true,json:async()=>job});await opening;
+  assert.match(f.sandbox.document.querySelector("#request-review-timing").textContent,/12917 ms to approval.*2000 ms approval to admission.*7001 ms in upstream transport/);
+  const detail=f.sandbox.document.querySelector("#request-review-upstream").textContent;
+  assert.match(detail,/Accepted → approval: 12917 ms/);
+  assert.match(detail,/Approval → admission: 2000 ms/);
+  assert.match(detail,/Admission → response headers: 7000 ms/);
+  assert.match(detail,/x-github-request-id: ABC1:DEF2:3/);
+  assert.match(detail,/Observed response body: 0 bytes/);
+});
+
 test("compact overview puts operation repository and HTTP errors in one row without repeated prose",()=>{
   const f=fixture();
   const job={...pendingRequest,status:'response_received',http_status:499,outcome:'Response received',updated_at:'2026-09-14T09:14:17Z',facts:{operation_name:'PublishBackgroundCommandStreaming',operation_type:'mutation',fields:['createCommitOnBranch'],repositories:['cline/cline'],targets:['branch feature'],more:false}};
@@ -178,6 +193,25 @@ test("compact overview puts operation repository and HTTP errors in one row with
   f.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)}];renderPendingRequests()`);
   assert.equal(f.sandbox.document.querySelector('#pending-section').hidden,false);
   assert.equal(f.sandbox.document.querySelector('#attention-empty').hidden,true);
+});
+
+test("compact numbered targets link to the specific GitHub issue or pull request",()=>{
+  const f=fixture();
+  const facts={operation_name:"Inspect",operation_type:"query",fields:["repository"],repositories:["cline/cline"],targets:["#1234"],more:false};
+  const markup=f.run(`reviewTable([{...${JSON.stringify(pendingRequest)},facts:${JSON.stringify(facts)}}],"empty")`);
+  assert.match(markup,/<a href="https:\/\/github\.com\/cline\/cline\/issues\/1234" target="_blank" rel="noopener noreferrer">cline\/cline #1234<\/a>/);
+  assert.doesNotMatch(markup,/cline\/cline · #1234/);
+  const pull=f.run(`reviewTarget({...${JSON.stringify(facts)},artifacts:[{repository:"cline/cline",number:"1234",kind:"pull_request"}]}).markup`);
+  assert.match(pull,/href="https:\/\/github\.com\/cline\/cline\/pull\/1234"/);
+  const issue=f.run(`reviewTarget({...${JSON.stringify(facts)},artifacts:[{repository:"cline/cline",number:"1234",kind:"issue"}]}).markup`);
+  assert.match(issue,/href="https:\/\/github\.com\/cline\/cline\/issues\/1234"/);
+
+  const branch=f.run(`reviewTarget({repositories:["cline/cline"],targets:["branch feature"]}).markup`);
+  assert.equal(branch,"cline/cline · branch feature");
+  const ambiguous=f.run(`reviewTarget({repositories:["one/repo","two/repo"],targets:["#12"]}).markup`);
+  assert.doesNotMatch(ambiguous,/<a/);
+  const hostile=f.run(`reviewTarget({repositories:["cline/<script>"],targets:["#12"]}).markup`);
+  assert.doesNotMatch(hostile,/<a|<script>/);assert.match(hostile,/&lt;script&gt;/);
 });
 
 test("large value references render exact content in arguments and variables without expanders",()=>{
