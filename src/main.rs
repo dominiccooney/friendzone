@@ -13,6 +13,7 @@ mod oauth;
 mod policy;
 mod proxy;
 mod proxy_server;
+mod pushes;
 mod review;
 mod settings;
 mod state;
@@ -144,9 +145,22 @@ async fn run_broker(
             }
         }
     };
+    // Keep the large Git validation/publishing future off the Windows main
+    // thread's small stack. The task owns the future on Tokio's heap-backed
+    // scheduler; this select holds only its join handle.
+    let push_worker = {
+        let pushes = state.pushes.clone();
+        let state = state.clone();
+        let settings = settings.clone();
+        tokio::spawn(async move { pushes.run(state, settings).await })
+    };
 
     tokio::select! {
         _ = state.jobs.run(state.clone(), settings.clone()) => unreachable!("job worker never returns"),
+        result = push_worker => match result {
+            Ok(()) => anyhow::bail!("Git push worker stopped unexpectedly"),
+            Err(error) => Err(error).context("Git push worker stopped"),
+        },
         _ = refresher => unreachable!("refresher loop never returns"),
         result = proxy_server::serve(proxy_addr, state.clone(), issuer, settings.clone(), ui_addr.port(), bootstrap_addr.port()) => result,
         result = web::serve_ui(ui_addr, state.clone(), settings.clone(), registry, bootstrap_addr) => result,

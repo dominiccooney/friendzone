@@ -46,6 +46,7 @@ class GuestScriptTests(unittest.TestCase):
         self.assertIn("/old hook.sh", (self.config / "bash-env.sh").read_text())
         self.assertIn(configure.MARKER, (self.home / "zsh/.zshenv").read_text())
         self.assertNotIn("CLINE_PLUGIN_IDLE_TIMEOUT_MS", (self.config / "friendzone-env.sh").read_text())
+        self.assertIn("export CARGO_HTTP_CAINFO=", (self.config / "friendzone-env.sh").read_text())
 
     def test_plugin_install_is_idempotent_custom_home_and_preserves_other_plugins(self):
         cline = self.home / "custom Cline ü"
@@ -115,7 +116,7 @@ class GuestScriptTests(unittest.TestCase):
         env = dict(os.environ, HOME=str(self.home), NO_PROXY="existing.test", no_proxy="existing.test,second.test")
         env.pop("BASH_ENV", None)
         env.pop("ENV", None)
-        command = '. "$1"; . "$1"; test "$NO_PROXY" = "192.0.2.1,localhost,127.0.0.1,::1,[::1],existing.test,second.test"; bash --noprofile --norc -c \'test "$PREVIOUS_HOOK" = preserved && test "$HTTP_PROXY" = http://guest:x@192.0.2.1:9080\''
+        command = '. "$1"; . "$1"; test "$NO_PROXY" = "192.0.2.1,localhost,127.0.0.1,::1,[::1],existing.test,second.test"; bash --noprofile --norc -c \'test "$PREVIOUS_HOOK" = preserved && test "$HTTP_PROXY" = http://192.0.2.1:9080\''
         result = subprocess.run([bash, "--noprofile", "--norc", "-ec", command, "test", str(activation)], env=env, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr.decode())
 
@@ -169,7 +170,7 @@ class GuestScriptTests(unittest.TestCase):
                 mock.patch.dict(os.environ, environment, clear=True), contextlib.redirect_stdout(io.StringIO()) as output:
             configure.main(encoded)
         self.assertEqual(requests, ["/bootstrap/hello?container=guest"])
-        self.assertIn("Approve it in the host Inbox", output.getvalue())
+        self.assertIn("Approve + pin IP in the host Inbox", output.getvalue())
         self.assertEqual((self.home / "xdg/friendzone/friendzone-ca.pem").read_text(), "CERTIFICATE")
 
 

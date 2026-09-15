@@ -95,10 +95,10 @@ def configure(data, home, config, zdotdir, environ):
     remove_legacy_idle = legacy_idle_marker.exists() or (legacy_idle in old_environment and old_environment.count("CLINE_PLUGIN_IDLE_TIMEOUT_MS") == 1)
     origin = urllib.parse.urlsplit(data["broker"])
     proxy_host = "[" + origin.hostname + "]" if ":" in origin.hostname else origin.hostname
-    proxy = "http://{}:x@{}:{}".format(urllib.parse.quote(data["container"], safe=""), proxy_host, data["proxy_port"])
+    proxy = "http://{}:{}".format(proxy_host, data["proxy_port"])
     values = dict(data["fakes"])
     values.update(FZ_HOST=origin.hostname, FZ_BROKER=data["broker"], HTTP_PROXY=proxy, HTTPS_PROXY=proxy, http_proxy=proxy, https_proxy=proxy)
-    for key in ("NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "GIT_SSL_CAINFO", "GIT_PROXY_SSL_CAINFO"):
+    for key in ("NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "GIT_SSL_CAINFO", "GIT_PROXY_SSL_CAINFO", "CARGO_HTTP_CAINFO"):
         values[key] = str(cert)
     content = "# Friendzone guest environment\n" + "".join(f"export {key}={shlex.quote(value)}\n" for key, value in values.items())
     if remove_legacy_idle:
@@ -180,6 +180,6 @@ def main(encoded):
     home = Path.home()
     config = Path(os.environ.get("XDG_CONFIG_HOME", str(home / ".config"))) / "friendzone"
     activation = configure(data, home, config, os.environ.get("ZDOTDIR", str(home)), os.environ)
-    print("Configured guest " + data["container"] + ". " + ("Approved." if approval.get("approved") else "Approve it in the host Inbox."))
-    print("Installed the Friendzone Cline plugin for async GraphQL and session updates.")
+    print("Configured guest " + data["container"] + ". " + ("Approved." if approval.get("approved") else "Use Approve + pin IP in the host Inbox."))
+    print("Installed the Friendzone Cline plugin for async GraphQL, reviewed Git publication, and session updates.")
     print("Activate this terminal, then restart guest Cline so it inherits the environment:\n  . " + shlex.quote(str(activation)))

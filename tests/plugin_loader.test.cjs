@@ -35,8 +35,14 @@ async function discover(plugin) {
   }
   assert.deepEqual(tools.map(tool=>tool.name).sort(),[
     'friendzone_cancel_request','friendzone_get_request','friendzone_list_requests',
-    'friendzone_remove_result','friendzone_submit_graphql',
+    'friendzone_remove_result','friendzone_submit_git_bundle','friendzone_submit_graphql',
   ]);
+  const description=tools.find(tool=>tool.name==='friendzone_submit_git_bundle').description;
+  assert.match(description,/GITHUB_TOKEN is Friendzone's fake escrow token/);
+  assert.match(description,/git -c credential\.helper= -c 'credential\.helper=!f\(\) \{/);
+  assert.match(description,/username=x-access-token/);assert.match(description,/password=\$GITHUB_TOKEN/);
+  assert.match(description,/Ordinary git push remains blocked/);
+  assert.doesNotMatch(description,/git config --global|https:\/\/[^ ]*\$GITHUB_TOKEN/);
   for(const tool of tools){
     assert.equal(typeof tool.execute,'function');
     assert.equal(tool.inputSchema.type,'object');

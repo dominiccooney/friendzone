@@ -24,6 +24,7 @@ pub const HISTORY_LIMIT: usize = 100;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
+    Preparing,
     Pending,
     Approved,
     Sending,
@@ -39,7 +40,10 @@ pub enum Status {
 
 impl Status {
     fn active(self) -> bool {
-        matches!(self, Self::Pending | Self::Approved | Self::Sending)
+        matches!(
+            self,
+            Self::Preparing | Self::Pending | Self::Approved | Self::Sending
+        )
     }
 }
 
@@ -80,6 +84,10 @@ pub struct Detail {
     /// Broker-parsed view of the same body, not an alternate authorization or
     /// request representation. Kept out of SSE and notifications with bodies.
     pub graphql: Option<crate::graphql::Review>,
+    /// Broker-derived view of exact objects imported from a tool-submitted bundle.
+    /// The bundle itself stays in the host-only durable artifact store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_push: Option<crate::pushes::Review>,
     /// Classified by the same parse used for the view, before display limits.
     #[serde(skip)]
     pub graphql_read: bool,
@@ -111,7 +119,7 @@ impl Detail {
             bail!("compressed/encoded writes cannot be safely reviewed in this inbox");
         }
         let body = std::str::from_utf8(bytes).map_err(|_| {
-            anyhow::anyhow!("binary writes cannot be reviewed; git push remains blocked")
+            anyhow::anyhow!("binary proxy writes cannot be reviewed; ordinary git push remains blocked (use the Git bundle tool)")
         })?;
         if body
             .chars()
@@ -220,6 +228,7 @@ impl Detail {
             headers,
             body: body.into(),
             graphql,
+            git_push: None,
             graphql_read,
             comment_permission_supported: false,
             resolved_target: None,

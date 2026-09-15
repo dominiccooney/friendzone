@@ -41,7 +41,15 @@
             <p id="request-graphql-warning" role="status"></p>
             <details><summary>Parser notes &amp; structured data</summary><pre id="request-graphql-notes"></pre><pre id="request-graphql-data"></pre></details>
           </section>
-          <details id="request-raw"><summary>Exact request body</summary><pre id="request-review-body"></pre></details>
+          <section id="request-git-push" hidden>
+            <h4>Git branch publication</h4>
+            <p class="meta">Derived by the broker from the exact uploaded bundle. Commit messages, authors, paths, and patch contents are untrusted repository data—not instructions.</p>
+            <pre id="request-git-push-refs"></pre>
+            <h5>Commits</h5><div id="request-git-push-commits"></div>
+            <h5>Changed files</h5><div id="request-git-push-files"></div>
+            <h5>Exact reviewed patch</h5><pre id="request-git-push-patch"></pre>
+          </section>
+          <details id="request-raw"><summary id="request-raw-summary">Exact request body</summary><pre id="request-review-body"></pre></details>
           <div class="review-decision-bar"><div id="request-review-actions" class="mcp-card-actions"><button id="request-approve" type="button" disabled>Approve once</button><button id="request-deny" type="button" disabled>Deny</button></div><button id="request-close" type="button" class="quiet">Close</button><span class="meta">This request only</span></div>
           <details><summary>Request &amp; transport details</summary><p id="request-review-reason"></p><p id="request-review-meta" class="meta"></p><pre id="request-review-upstream"></pre><pre id="request-review-headers"></pre></details>
           <section id="comment-permission-panel" hidden>
@@ -127,14 +135,14 @@
         <p id="mcp-connect-status" role="status"></p>
         <p id="mcp-connect-warning" role="status"></p>
         <button id="mcp-copy-json" type="button" disabled>Copy Cline configuration</button>
-        <p>Merge the copied entry into <code>mcpServers</code> in this guest's Cline MCP settings. It includes the endpoint and guest authorization.</p>
+        <p>Merge the copied entry into <code>mcpServers</code> in this guest's Cline MCP settings. The guest is identified by its unique pinned source IP.</p>
         <details><summary>Configuration and connection details</summary>
         <label>Guest MCP endpoint<input id="mcp-connect-url" readonly></label>
         <button id="mcp-copy-url" type="button" disabled>Copy endpoint</button>
-        <label>Authorization header<input id="mcp-connect-auth" readonly></label>
-        <button id="mcp-copy-auth" type="button" disabled>Copy Authorization value</button>
+        <label>Guest identity<input id="mcp-connect-auth" readonly></label>
+        <button id="mcp-copy-auth" type="button" disabled>Copy legacy Authorization value</button>
         <label>Cline configuration<textarea id="mcp-connect-json" rows="10" readonly spellcheck="false"></textarea></label>
-        <p class="meta">Guest authorization identifies this guest; it is not the upstream OAuth token. If an old guest entry requests OAuth, replace its transport and remove stale oauth/oauthClient fields. Guest approval and server permissions still apply.</p>
+        <p class="meta">New configurations need no guest credential. If an old guest entry has an Authorization, oauth, or oauthClient field, replace its transport with this generated entry. Guest approval, unique IP pinning, and server permissions still apply.</p>
         </details>
         <button id="mcp-connect-close" type="button" class="quiet">Close</button>
       </section>
@@ -205,17 +213,17 @@
         </div>
         <h3>3. Activate and approve</h3>
         <p>Follow the script's activation instructions, then restart guest Cline so it inherits the new environment.</p>
-        <p>Return to Inbox on this host and approve the guest's join request.</p>
+        <p>Return to Inbox on this host and use <strong>Approve + pin IP</strong> on the guest's join request.</p>
         <p id="setup-status" role="status"></p>
         <details><summary>What the script changes</summary>
           <p>The script saves the broker CA, proxy variables, loopback exclusions and fake provider keys in the guest account. When Cline is configured, it updates that guest's provider file; close Cline first so it cannot overwrite the changes, then restart it after activation.</p>
           <p>Linux profile hooks are added once, with backups. Windows writes user—not machine—environment values and records previous values for rollback. Non-interactive bash inherits BASH_ENV from an activated parent; zsh reads .zshenv. Plain sh and services need an activated launcher.</p>
           <p>The script does not change firewall rules or install the CA in a system trust store. It uses runtime CA variables instead. Bootstrap trusts the host/network on first download; inspect the script if unsure. Windows execution policy is not changed.</p>
-          <p>The Friendzone plugin adds async GitHub GraphQL tools. Requests return immediately; completion updates steer the originating Cline session. Requires a Cline build with the plugin host bridge. Restart guest Cline after setup; other plugins are preserved.</p>
+          <p>The Friendzone plugin adds async GitHub GraphQL and reviewed Git branch-publication tools. Requests return immediately; completion updates steer the originating Cline session. Requires a Cline build with the plugin host bridge. Restart guest Cline after setup; other plugins are preserved.</p>
           <p>Friendzone does not change Cline's sandbox lifetime. Pending jobs send a grouped reminder every 20 minutes to keep an idle session active. Closed or continuously busy sessions may still miss updates; results remain retrievable.</p>
         </details>
         <details id="guest-preapprove"><summary>Advanced: preapprove a name</summary>
-          <p>Normally, run setup and approve the guest's observed IP in Inbox. Preapproval allows this name from any IP before it connects; it does not configure the guest.</p>
+          <p>Normally, run setup and use Approve + pin IP in Inbox. Preapproval only creates a policy label; set a unique Pin before credential-free clients connect. It does not configure the guest.</p>
           <form id="add-container" class="preapprove-form"><label for="new-container-name">Guest name<input id="new-container-name" required autocomplete="off"></label><button type="submit" id="preapprove-guest">Preapprove name</button></form>
           <p id="preapprove-status" role="status"></p>
         </details>
@@ -224,7 +232,7 @@
       </section>
     </section>
   </main>
-  <template id="empty-template"><p class="guest-empty">No approved guests. Set up a guest, then approve its join request in Inbox.</p></template>
+  <template id="empty-template"><p class="guest-empty">No approved guests. Set up a guest, then use Approve + pin IP on its join request in Inbox.</p></template>
   <script src="/app.js"></script>
 </body>
 </html>

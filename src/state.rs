@@ -30,7 +30,7 @@ pub struct RequestEvent {
     pub verdict: Verdict,
     /// Upstream HTTP status, once the response was seen.
     pub status: Option<u16>,
-    /// Parsed summary for known providers, e.g. token counts.
+    /// Optional broker diagnostic detail; response bodies are never buffered to derive it.
     pub detail: Option<String>,
 }
 
@@ -197,6 +197,7 @@ pub struct AppState {
     pub reviews: crate::review::Queue,
     pub github: crate::github::Client,
     pub jobs: crate::jobs::Jobs,
+    pub pushes: crate::pushes::Pushes,
 }
 
 impl Default for AppState {
@@ -208,6 +209,7 @@ impl Default for AppState {
             reviews: crate::review::Queue::new(changes.clone()),
             github: crate::github::Client::default(),
             jobs: crate::jobs::Jobs::new(changes.clone()),
+            pushes: crate::pushes::Pushes::new(changes.clone()),
             changes,
         }
     }
@@ -276,6 +278,7 @@ impl AppState {
             reviews: crate::review::Queue::new(changes.clone()),
             github: crate::github::Client::default(),
             jobs: crate::jobs::Jobs::load(data_dir, changes.clone())?,
+            pushes: crate::pushes::Pushes::load(data_dir, changes.clone())?,
             changes,
         })
     }
@@ -345,6 +348,17 @@ impl AppState {
 
     pub fn record(&self, container: String, method: String, url: String, verdict: Verdict) -> Uuid {
         self.record_activity(container, method, url, verdict, true)
+    }
+    /// Logs traffic whose source could not be mapped to a guest without
+    /// manufacturing a pending guest identity from attacker-controlled data.
+    pub fn record_unattributed(
+        &self,
+        label: String,
+        method: String,
+        url: String,
+        verdict: Verdict,
+    ) -> Uuid {
+        self.record_activity(label, method, url, verdict, false)
     }
     fn record_activity(
         &self,
@@ -756,6 +770,67 @@ impl AppState {
         verdict
     }
 
+    /// Resolves and authorizes proxy traffic under one lock. Explicit names are
+    /// legacy compatibility only and must agree with an existing unique owner.
+    /// Credential-free traffic requires one explicit IP pin, except that one
+    /// uniquely announced pending guest may reach the ordinary approval denial.
+    pub fn authorize_proxy_peer(
+        &self,
+        peer: IpAddr,
+        presented: Option<&str>,
+    ) -> Result<(String, Authorization)> {
+        let mut state = self.data.write().expect("state lock poisoned");
+        let pinned: Vec<_> = state
+            .containers
+            .iter()
+            .filter(|(_, record)| record.pinned_ip == Some(peer))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let name = if let Some(name) = presented {
+            if pinned.len() > 1 {
+                anyhow::bail!("multiple guests are pinned to source address {peer}");
+            }
+            if pinned.first().is_some_and(|owner| owner != name) {
+                anyhow::bail!("presented guest does not own source address {peer}");
+            }
+            name.to_owned()
+        } else if let [owner] = pinned.as_slice() {
+            owner.clone()
+        } else if !pinned.is_empty() {
+            anyhow::bail!("multiple guests are pinned to source address {peer}");
+        } else {
+            let pending: Vec<_> = state
+                .containers
+                .iter()
+                .filter(|(_, record)| !record.approved && record.last_ip == Some(peer))
+                .map(|(name, _)| name.clone())
+                .collect();
+            match pending.as_slice() {
+                [candidate] => candidate.clone(),
+                [] => anyhow::bail!(
+                    "source address {peer} has no unique IP pin; run setup and use Approve + pin IP"
+                ),
+                _ => {
+                    anyhow::bail!("multiple pending guests were observed at source address {peer}")
+                }
+            }
+        };
+        state.touch_container(&name, Some(peer));
+        let record = state.containers.get(&name).expect("just touched");
+        let verdict = if !record.approved {
+            Authorization::Pending
+        } else if record.pinned_ip.is_some_and(|pin| pin != peer) {
+            Authorization::IpMismatch
+        } else if presented.is_none() && record.pinned_ip != Some(peer) {
+            anyhow::bail!("source address {peer} has no explicit pin; use Approve + pin IP");
+        } else {
+            Authorization::Allowed
+        };
+        drop(state);
+        self.notify();
+        Ok((name, verdict))
+    }
+
     /// Registers a pre-approved container from the UI (wildcard IP
     /// until pinned).
     pub fn add_container(&self, name: &str) -> Result<()> {
@@ -771,9 +846,29 @@ impl AppState {
     /// last connected from.
     pub fn approve_container(&self, name: &str, pin_to_last_ip: bool) -> Result<()> {
         self.update_policy(|containers, _| {
-            let record = containers.get_mut(name).context("unknown container; no approval changed")?;
-            if pin_to_last_ip {
-                record.pinned_ip = Some(record.last_ip.context("no guest address observed this session; set an explicit IP pin or wait for the guest to connect")?);
+            let pin = if pin_to_last_ip {
+                Some(
+                    containers
+                        .get(name)
+                        .context("unknown container; no approval changed")?
+                        .last_ip
+                        .context("no guest address observed this session; set an explicit IP pin or wait for the guest to connect")?,
+                )
+            } else {
+                None
+            };
+            if let Some(pin) = pin
+                && let Some((other, _)) = containers
+                    .iter()
+                    .find(|(other, record)| other.as_str() != name && record.pinned_ip == Some(pin))
+            {
+                anyhow::bail!("source address {pin} is already pinned to guest {other}");
+            }
+            let record = containers
+                .get_mut(name)
+                .context("unknown container; no approval changed")?;
+            if pin.is_some() {
+                record.pinned_ip = pin;
             }
             record.approved = true;
             record.managed = true;
@@ -784,6 +879,13 @@ impl AppState {
     /// Sets or clears (None = wildcard) a container's pinned IP.
     pub fn set_pinned_ip(&self, name: &str, ip: Option<IpAddr>) -> Result<()> {
         self.update_policy(|containers, _| {
+            if let Some(ip) = ip
+                && let Some((other, _)) = containers
+                    .iter()
+                    .find(|(other, record)| other.as_str() != name && record.pinned_ip == Some(ip))
+            {
+                anyhow::bail!("source address {ip} is already pinned to guest {other}");
+            }
             let record = containers
                 .get_mut(name)
                 .context("unknown container; no IP pin changed")?;
@@ -861,6 +963,9 @@ impl AppState {
         let (pending_jobs, recent_jobs) = self.jobs.summaries();
         pending_requests.extend(pending_jobs);
         recent_reviews.extend(recent_jobs);
+        let (pending_pushes, recent_pushes) = self.pushes.summaries();
+        pending_requests.extend(pending_pushes);
+        recent_reviews.extend(recent_pushes);
         pending_requests.sort_by_key(|s| s.created_at);
         recent_reviews.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
         StateView {
@@ -1218,6 +1323,35 @@ mod tests {
         // UI-added containers are pre-approved with wildcard IP.
         state.add_container("reviewer").unwrap();
         assert_eq!(state.authorize("reviewer", ip2), Authorization::Allowed);
+    }
+
+    #[test]
+    fn source_ip_identity_requires_unique_explicit_pin_and_rejects_spoofed_names() {
+        let state = AppState::default();
+        let ip1: IpAddr = "10.0.0.5".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.6".parse().unwrap();
+        state.authorize("guest", ip1);
+        assert_eq!(
+            state.authorize_proxy_peer(ip1, None).unwrap(),
+            ("guest".into(), Authorization::Pending)
+        );
+        state.approve_container("guest", true).unwrap();
+        assert_eq!(
+            state.authorize_proxy_peer(ip1, None).unwrap(),
+            ("guest".into(), Authorization::Allowed)
+        );
+        assert_eq!(
+            state.authorize_proxy_peer(ip1, Some("guest")).unwrap(),
+            ("guest".into(), Authorization::Allowed)
+        );
+        assert!(state.authorize_proxy_peer(ip1, Some("other")).is_err());
+        assert!(state.authorize_proxy_peer(ip2, None).is_err());
+
+        state.add_container("wildcard").unwrap();
+        assert!(state.authorize_proxy_peer(ip2, None).is_err());
+        assert!(state.set_pinned_ip("wildcard", Some(ip1)).is_err());
+        state.authorize("second-pending", ip1);
+        assert!(state.approve_container("second-pending", true).is_err());
     }
 
     #[test]

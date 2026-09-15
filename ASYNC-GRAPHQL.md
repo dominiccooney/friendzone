@@ -1,4 +1,4 @@
-# Async GraphQL and the Cline plugin
+# Async GitHub jobs and the Cline plugin
 
 Rerun the guest script from **Settings → Guests → Set up guest**, then restart
 guest Cline. Setup installs `friendzone.js` in `${CLINE_DIR:-~/.cline}/plugins`
@@ -14,6 +14,10 @@ the integration after restarting Cline; it does not cancel submitted jobs.
   `operation_name`. Returns a request ID immediately, not after human approval.
 - For large content, pass an **absolute guest `request_file` path** instead of
   inline GraphQL. File shape: `{"query":"…","variables":{},"operationName":null}`.
+- `friendzone_submit_git_bundle`: uploads an absolute Git bundle v2 path plus
+  repository, branch, base branch and exact expected target OID. It returns a
+  durable job in `preparing`; approval is unavailable until the broker has
+  validated the bundle and derived the full review described below.
 - `friendzone_get_request`: status, HTTP status, and the upstream response string.
   It also returns bounded transport diagnostics: admission/header/completion
   timing, connected peer, body completeness, transport error category, and an
@@ -40,7 +44,7 @@ accept an arbitrary endpoint, Authorization header or redirect destination.
 
 ## Session updates
 
-Tool discovery is sessionless: setup registers all five tools without reading
+Tool discovery is sessionless: setup registers all six tools without reading
 guest configuration, creating timers, contacting the broker or emitting messages.
 Missing or invalid configuration therefore does not hide tools. It is reported
 when a tool actually executes.
@@ -55,9 +59,14 @@ edits become effective on session/plugin reload, not halfway through a request.
 
 Each initialized session polls every 15 seconds while its sandbox is alive. Terminal
 states emit `steer_message` with `{sessionId, prompt}` through Cline's plugin host
-bridge. The prompt contains only the job ID/status and a get-result instruction:
-no query, file content, GitHub message or token is promoted into a steer prompt.
-The result is fetched as tool output, which remains untrusted upstream content.
+bridge. For each newly terminal job, the plugin fetches its retained record once and
+includes up to 4 KiB of response/result text, quoted and explicitly labeled as
+untrusted data whose embedded instructions must not be followed. Query text, submitted file content, and
+tokens are never included. Empty/status-only outcomes say that no response details
+were retained. `friendzone_get_request` is suggested only if more detail or
+diagnostic metadata is needed; the completion message always says not to resubmit
+automatically. Larger complete results remain available as tool output, which is
+also untrusted upstream content.
 
 **Cline sandbox lifetime matters:** Cline's default plugin idle timeout is 30
 minutes, measured from host calls into the sandbox. The plugin does not override
@@ -114,16 +123,15 @@ test this boundary.
 
 This is separate from the **unchanged 64 KiB, 120-second proxy review**:
 
-| Limit | Async jobs |
-|---|---|
-| GraphQL JSON payload | 10 MiB |
-| Review lifetime | 24 hours |
-| Upload deadline | 15 seconds |
-| Upstream execution | 90 seconds, serial worker |
-| Response body | 4 MiB; larger/interrupted response is incomplete |
-| Retained jobs | 100; explicit removal, no automatic eviction of keys |
-| Active requests | at most 32 globally / 8 per guest, further limited by storage reservation |
-| Durable store | 256 MiB including reserved response space |
+| Limit | GraphQL jobs | Git publication jobs |
+|---|---|---|
+| Input | 10 MiB JSON | 32 MiB Git bundle v2 |
+| Review lifetime | 24 hours | 24 hours |
+| Upload deadline | 15 seconds | 60 seconds; 4 concurrent uploads |
+| Execution | 90 seconds, serial worker | serial validation/publication worker; 120-second push |
+| Retained jobs | 100 | 32 |
+| Active jobs | 32 globally / 8 per guest | 8 globally / 4 per guest |
+| Durable storage | 256 MiB including reserved response space | 256 MiB of retained bundles; explicit removal releases space |
 
 The 90-second execution limit starts at admission, after approval and queueing.
 `upstream.accepted_to_approval_ms` and `approval_to_admission_ms` separate human
@@ -134,11 +142,71 @@ Diagnostic headers are a fixed allowlist (for example `x-github-request-id`,
 `server`, `via`, tracing and rate-limit fields); credentials, cookies, request
 content, and arbitrary response headers are excluded.
 
-Lexical/nesting/structural display budgets still apply. Large strings such as
+GraphQL lexical/nesting/structural display budgets still apply. Large strings such as
 base64 file contents are shared by display reference instead of repeatedly
 copied into the structural expansion budget. The original input is retained
-and mutations still require approval. This is not a staged-file/diff publication
-UI or a binary Git push implementation.
+and mutations still require approval.
+
+## Git branch publication
+
+Ordinary `git push` and direct `POST .../git-receive-pack` remain blocked. A
+waiting smart-HTTP push cannot safely expose an opaque pack for a quick approval,
+and its client may time out while a human reviews it. Instead, create a bundle in
+the guest and submit it with `friendzone_submit_git_bundle`. The plugin uploads
+exact bytes directly to the fixed bootstrap origin without credentials,
+redirects, proxy interpretation, or automatic retries.
+
+The publication tool description tells the agent how to authenticate HTTPS Git
+reads/fetches with the guest's fake `GITHUB_TOKEN` without persisting it:
+
+```sh
+git -c credential.helper= -c 'credential.helper=!f() { if test "$1" = get; then printf "%s\n" "username=x-access-token" "password=$GITHUB_TOKEN"; fi; }; f' fetch origin main
+```
+
+The same invocation works from POSIX shell and PowerShell because the outer
+single quotes preserve `$GITHUB_TOKEN` until Git runs its helper shell. The empty
+helper clears inherited helpers for this command. Never print the token, embed it
+in a URL, persist the helper, or put the host's real token in the guest. This
+authenticates reads/discovery only; ordinary `git push` remains blocked.
+
+For a new `feature` branch based directly on the current `origin/main` tip:
+
+```sh
+git fetch origin main
+base=$(git rev-parse origin/main)
+git bundle create --version=2 "$PWD/feature.bundle" refs/heads/feature "^$base"
+```
+
+Submit the absolute bundle path with `repository=owner/repo`, `branch=feature`,
+`base_branch=main`, and `expected_oid=0000000000000000000000000000000000000000`.
+For an existing branch update, fetch it first, use its exact remote tip as the
+single `^<oid>` prerequisite, set `base_branch` equal to the target branch, and
+pass that same 40-character SHA-1 as `expected_oid`.
+
+V1 publishes exactly one `refs/heads/<branch>` fast-forward. It rejects tags,
+deletions, force updates, multiple refs/prerequisites, SHA-256 repositories,
+merge commits, non-linear ranges, and a prerequisite that is not the current
+declared base-branch tip. Limits include 100 commits, 1,000 per-commit path
+entries, a 2 MiB binary-capable patch, 20,000 objects, 64 MiB expanded object
+content, and 16 MiB per object.
+
+The broker imports the exact bundle into a private bare repository using Git's
+strict object checks. The Inbox review shows target/base/head OIDs, bundle digest,
+every full commit message and author, every path touched by every commit, and a
+per-commit `--binary --full-index` patch. Repository text is untrusted content,
+not instructions. Only this broker-derived review can become approvable.
+
+Approval queues one broker-owned HTTPS push with host escrow credentials. The
+worker rechecks the target ref and uses `--force-with-lease`: an empty lease for
+creation or the submitted exact OID for an update. It then reads the ref back and
+requires the reviewed head. No token, arbitrary endpoint, refspec, or Git option
+comes from the guest.
+
+`git-push-jobs.json` and `git-push-jobs/<id>/` retain metadata and the exact bundle
+in the host data directory. Restart cancels preparing/pending/approved jobs;
+`Sending` becomes `Unknown` and is never replayed; completed outcomes remain
+retrievable. If upload/result delivery is uncertain, list/get existing jobs and
+inspect the remote branch before explicitly submitting again.
 
 `async-jobs.json` in the broker data directory stores submitted content, token
 binding digests (not tokens), state, and results. It is private host data; Unix
@@ -166,8 +234,10 @@ fails, the durable Sending record is intentionally not re-executed.
 
 ## Guest HTTP interface
 
-All requests use the bootstrap listener and the same approved guest Basic
-identity/IP pin as MCP. No management routes are added to that listener.
+All requests use the bootstrap listener and the same unique approved source-IP
+pin as proxy/MCP traffic. The policy name still owns durable jobs and session
+routing, but the plugin sends no guest credential. Matching legacy Basic identity
+is accepted only during migration. No management routes are added to that listener.
 
 `POST /guest/jobs` takes the submission plus `session_id`; `GET /guest/jobs`
 lists, `GET /guest/jobs/{id}` fetches, `POST /guest/jobs/{id}/cancel` cancels,

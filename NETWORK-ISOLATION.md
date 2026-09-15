@@ -21,6 +21,12 @@ below as deployment requirements, not optional diagnostics.
    imported host files, and credentials; it is a privileged local interface,
    not an authenticated multi-user service.
 
+Friendzone identifies runtime guest traffic by the unique explicit source-IP pin
+chosen with **Approve + pin IP**. The host/switch must prevent source spoofing,
+and each guest must appear with a distinct address. Do not place multiple guests
+behind one NAT address; ambiguous pins fail closed. Human-readable guest names
+remain policy/log labels, not proxy credentials.
+
 | Guest destination | Protocol | Policy | Purpose |
 |---|---|---|---|
 | Broker's guest-facing IP, port 8080 | TCP | Allow | Explicit HTTP/HTTPS proxy |
@@ -109,12 +115,12 @@ a clean image instead of reconnecting that guest to unrestricted networking.
 ### B. Test Friendzone before sealing
 
 Run the broker with guest-facing proxy/bootstrap addresses and loopback UI.
-Run setup, approve the guest, source its env file, and test:
+Run setup, use **Approve + pin IP**, source its env file, and test:
 
 - direct bootstrap `/health` and CA fetch;
 - an HTTPS request through the proxy with CA verification enabled;
 - Git fetch/clone and an actual small inference request;
-- the generated guest MCP configuration, including its Basic header;
+- the generated credential-free guest MCP configuration;
 - host OAuth callback and automatic refresh, independent of guest login.
 
 Do not assume a TCP-only doctor pass proves any of these. For guests with
@@ -260,7 +266,7 @@ do not change approvals or permissions. For this example:
 
 ```sh
 export FZ_HOST=172.30.240.1
-export FZ_PROXY=http://scratch-kali:x@172.30.240.1:8080
+export FZ_PROXY=http://172.30.240.1:8080
 
 # Must succeed directly: required for setup/recovery, even before approval.
 curl --noproxy '*' --connect-timeout 3 --max-time 5 -i "http://$FZ_HOST:8082/health"

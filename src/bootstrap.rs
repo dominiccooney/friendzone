@@ -88,10 +88,24 @@ pub fn script(
                     "SSL_CERT_FILE",
                     "GIT_SSL_CAINFO",
                     "GIT_PROXY_SSL_CAINFO",
+                    "CARGO_HTTP_CAINFO",
+                    "CARGO_HTTP_CHECK_REVOKE",
+                    "GIT_CONFIG_COUNT",
                     "CLINE_PLUGIN_IDLE_TIMEOUT_MS",
                 ]
                 .iter()
                 .any(|key| name.eq_ignore_ascii_case(key))
+                || ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"]
+                    .iter()
+                    .any(|prefix| {
+                        let suffix = name.get(prefix.len()..);
+                        name.get(..prefix.len())
+                            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+                            && suffix.is_some_and(|suffix| {
+                                !suffix.is_empty()
+                                    && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                            })
+                    })
                 || fakes
                     .keys()
                     .any(|key: &String| key.eq_ignore_ascii_case(&name))

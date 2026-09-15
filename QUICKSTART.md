@@ -42,9 +42,10 @@ Open <http://127.0.0.1:8081>.
 - **Guests**: open **Settings → Guests → Set up guest** and run the script
   in the guest — it appears in the
   Inbox as "awaiting approval"; click **Approve + pin IP** to admit it
-  and lock the name to its address. Unknown containers are denied until
-  approved. Manual name preapproval is an advanced option inside the same
-  setup flow; it allows any source IP and does not configure the guest.
+  and bind the policy name to its unique source address. Unknown containers are
+  denied until approved. Credential-free proxy/MCP/job access requires this
+  explicit pin. Manual name preapproval is an advanced option inside the same
+  setup flow; set a unique Pin before using it for runtime access.
 - **Management and restarts:** approved/killed guests, Kill/Resume, Pin,
   Remove and saved comment permissions are in **Settings → Guests**.
   "Approved" means permitted to use the network,
@@ -168,15 +169,53 @@ PR creation, inline review comments/threads, replies and review submissions
 are allowed with **Approve once**, not automatically. Inspect the displayed
 head/base branches, body, file/line and review event—`APPROVE` and
 `REQUEST_CHANGES` are more than comment text. The host's token needs the
-appropriate GitHub write scopes. Binary git pushes are still blocked.
+appropriate GitHub write scopes. Ordinary direct `git push` remains blocked.
 
 For Git HTTPS, give Git the **fake** token as its password via a credential
 helper/prompt. Friendzone substitutes it inside HTTP Basic credentials,
 preserving the username and host restriction. Merely setting `GITHUB_TOKEN`
 does not configure plain Git. An initial `401` on `info/refs?service=git-receive-pack`
 is GitHub's authentication challenge, not a Friendzone read-policy denial.
-Authenticating discovery does not unblock the subsequent binary push; a PR's
-head branch must already exist remotely. See [Git authentication](README.md#git-https-authentication).
+Authenticating discovery does not unblock ordinary `git push`. Publish a PR head
+branch with the reviewed bundle tool below. See [Git authentication](README.md#git-https-authentication).
+
+For an authenticated fetch from POSIX shell or PowerShell, use the fake token
+without persisting it or placing its value in a URL/command line:
+
+```sh
+git -c credential.helper= -c 'credential.helper=!f() { if test "$1" = get; then printf "%s\n" "username=x-access-token" "password=$GITHUB_TOKEN"; fi; }; f' fetch origin main
+```
+
+Replace only the trailing Git operation/arguments. The empty helper disables
+inherited helpers for this invocation. Never print `GITHUB_TOKEN` or put the
+host's real token in the guest.
+
+### Publish a branch for a PR
+
+Rerun guest setup and restart guest Cline so it has
+`friendzone_submit_git_bundle`. In the guest, create a version-2 bundle for one
+linear branch based directly on the current remote base:
+
+```sh
+git fetch origin main
+base=$(git rev-parse origin/main)
+git bundle create --version=2 "$PWD/feature.bundle" refs/heads/feature "^$base"
+```
+
+Call `friendzone_submit_git_bundle` with the absolute bundle path,
+`repository=owner/repo`, `branch=feature`, `base_branch=main`, forty zeroes as
+`expected_oid`, and a human-readable `request_key`.
+
+The tool returns `preparing`; do not resubmit. Friendzone validates the exact
+bundle, then the host Inbox shows commit messages, paths, OIDs, digest, and patch.
+After **Approve once**, the broker rechecks the remote and publishes once with a
+creation lease. Use `friendzone_get_request` for the verified result. For updates,
+use the exact current target SHA as the bundle's sole prerequisite and
+`expected_oid`, and set `base_branch` equal to `branch`.
+
+Do not retry an uncertain submission or result blindly. List/get existing jobs
+and inspect the remote branch first. Ordinary `git push`, force pushes, tags,
+deletes, merges, LFS, multiple refs, and arbitrary remotes remain unsupported.
 
 Queries use the actual parsed `query` operation, including fragments and
 introspection. Ambiguous operation selection, unsupported directives/headers,
@@ -203,8 +242,8 @@ and known target paths. `addComment` shows the comment separately from its
 `repository(owner, name).pullRequest/issue(number)` arguments are shown with
 their repository context; these are unverified request values, not saved
 permissions. Unknown targets stay unknown. See [GRAPHQL-REVIEW.md](GRAPHQL-REVIEW.md).
-Only inspectable JSON/text or empty-body writes up to 64 KiB are supported;
-binary git pushes remain blocked. **If the guest times out, deny its old
+Only inspectable JSON/text or empty-body writes up to 64 KiB are supported on the
+synchronous proxy path; ordinary binary git pushes remain blocked. **If the guest times out, deny its old
 pending request before retrying.** Retried requests are separate and may
 duplicate a write. See [GitHub policy](README.md#github-policy) for limits,
 security boundaries and cancellation details.
@@ -234,7 +273,13 @@ The script updates the guest's Cline provider file, so close guest Cline before
 running it. Existing model/other-provider settings are retained. Real keys
 stay on the host. Download scripts only over a trusted host/network; the first
 HTTP download is not authenticated. The script does not change the guest's
-firewall or system CA store; runtime CA variables are configured instead.
+firewall or system CA store; runtime CA variables are configured instead. On
+Windows it also makes Git's Schannel backend honor `GIT_SSL_CAINFO` without
+disabling certificate verification or changing Git configuration files, and
+sets Cargo's native `CARGO_HTTP_CAINFO` to the same managed CA bundle. Cargo's
+Windows-only revocation lookup is disabled because dynamically issued
+Friendzone certificates have no public revocation responder; chain and hostname
+verification remain enabled.
 
 ## 4. Guest: activate and approve
 
@@ -257,11 +302,12 @@ Read-only checks (use your guest name):
 
 ```sh
 curl --noproxy '*' -i http://HOST_IP:8082/health
-curl --noproxy '' --proxy http://reviewer:x@HOST_IP:8080 -i http://HOST_IP:8082/health
+curl --noproxy '' --proxy http://HOST_IP:8080 -i http://HOST_IP:8082/health
 ```
 
-The first should return 200 before approval. A 403 from the second explains
-pending approval, Kill, or IP-pin failures. Do not disable TLS verification.
+The first should return 200 before approval. The second requires **Approve + pin
+IP** and should then return 200. A 403/407 explains pending approval, Kill,
+missing/ambiguous pin, or source-IP mismatch. Do not disable TLS verification.
 
 ## 5. Container: point the agent at MCP forwards
 
@@ -285,11 +331,9 @@ shows the old “Cline link” wording after updating/restarting the broker,
 reload the page (hard-refresh if necessary).
 
 There is **one endpoint per forwarded server**, not one combined endpoint.
-Use a streamable-HTTP MCP client with explicit guest Basic authorization.
-The endpoint is `$FZ_BROKER/mcp/<name>`; proxy credentials are not a
-substitute for its `Authorization` header. Cline guest settings example
-(replace the URL and choose the matching guest name; the base64 below is
-`scratch-kali:x`, not a secret):
+Use a streamable-HTTP MCP client from the uniquely IP-pinned guest. The endpoint
+is `$FZ_BROKER/mcp/<name>`; no guest Authorization header is needed. Cline guest
+settings example:
 
 ```json
 {
@@ -297,8 +341,7 @@ substitute for its `Authorization` header. Cline guest settings example
     "linear-via-friendzone": {
       "transport": {
         "type": "streamableHttp",
-        "url": "http://172.31.208.1:8082/mcp/linear",
-        "headers": { "Authorization": "Basic c2NyYXRjaC1rYWxpOng=" }
+        "url": "http://172.31.208.1:8082/mcp/linear"
       }
     }
   }
@@ -310,14 +353,12 @@ all apply. No upstream credential is given to the guest.
 
 ### Guest Cline says “requires OAuth authorization”
 
-That can be a missing guest `Authorization` header, not missing Linear OAuth.
-Older Friendzone returned 401 for missing Basic credentials, which Cline
-interprets as an OAuth server. The current broker returns a clear 403 instead.
-Copy the whole guest configuration from the server's **Connect guest** action, including
-the header, not just the URL. If reusing an old Cline entry, remove its
-`oauth` and `oauthClient` fields (or add the generated entry under its new
-name), then reconnect. Do not run `authorizeMcpServerOAuth` for Friendzone
-inside the container. Authorize the **upstream** in the host Friendzone UI.
+That can be a missing or ambiguous source-IP pin, not missing Linear OAuth.
+Older Friendzone required a Basic guest header, which Cline could interpret as
+an OAuth challenge. Replace the old transport with the credential-free entry
+from **Connect guest**, removing `Authorization`, `oauth`, and `oauthClient`
+fields. Do not run `authorizeMcpServerOAuth` for Friendzone inside the container.
+Authorize the **upstream** in the host Friendzone UI.
 Forward paths are case-sensitive: `Linear` uses `/mcp/Linear`.
 
 ## 6. Smoke test — what should happen
@@ -358,5 +399,5 @@ flow while writes remain gated.
 |-----------|-------------------------------------------------------------------|
 | Host      | `cargo run -- broker --proxy-addr HOST_IP:8080 --ui-addr 127.0.0.1:8081 --bootstrap-addr HOST_IP:8082` |
 | Browser   | `http://127.0.0.1:8081` — Inbox for decisions; Settings for guests, credentials and MCP |
-| Guest     | Settings → Guests → Set up guest → curl script → run → activate → approve in host Inbox |
+| Guest     | Settings → Guests → Set up guest → curl script → run → activate → Approve + pin IP in host Inbox |
 

@@ -231,11 +231,12 @@ state, flicker on traffic, count of waiting decisions. Traffic from a
 supposedly idle container is visible without opening anything. The big
 surface spends pixels: inbox, log, reading pane.
 
-**New containers.** Unknown proxy credentials create an ack item; until
-decided, the broker serves only the guest setup script/`fz doctor` and refuses the
-rest (agents retry as after a broker restart). Ack names the container
-and attaches a ruleset (default preselected); the section starts on top.
-Denying kills the container.
+**New containers.** Guest setup announces a human-readable policy label and
+observed source address. Until the label is approved with a unique explicit IP
+pin, the broker serves only setup/health and refuses runtime traffic (agents retry
+as after a broker restart). The source-IP boundary requires host anti-spoofing and
+distinct guest addresses; ambiguous mappings fail closed. Denying kills the
+container.
 
 **Log.** A log row is a card plus a verdict (allowed, substituted,
 approved, denied, blocked), drilling into the same reading pane minus
@@ -285,8 +286,9 @@ Attacks and workflows the design must survive, each with its resolution.
   Operation type is explicit post-parse; mutations are rejected on the
   wire.
 - **Identity spoofing.** A container claims another's identity.
-  Per-container proxy credentials and spoof-proof source addresses deny
-  it; a misplaced fake token alerts.
+  Unique IP pins plus host-enforced spoof-proof source addresses deny it;
+  legacy presented names cannot override the address owner. A misplaced fake
+  token alerts.
 - **Approval social engineering.** Injected content asks the human to
   approve a push whose description lies. The diff renders from
   broker-parsed pack data; the description has no authority.

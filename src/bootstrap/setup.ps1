@@ -13,6 +13,23 @@ function Write-FzFile([string]$Path, [string]$Text) {
     } finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
 }
 function Set-FzProperty($Object, [string]$Name, $Value) { $Object | Add-Member -MemberType NoteProperty -Name $Name -Value $Value -Force }
+function Add-FzGitSchannelTrust($Values) {
+    # Git for Windows defaults to Schannel, which intentionally ignores
+    # GIT_SSL_CAINFO unless this Git option is enabled. Use one exact managed
+    # environment entry instead of changing Git config or the Windows root store.
+    # Never copy/overwrite arbitrary indexed entries: they may contain secrets.
+    $userCount=Get-FzUserValue 'GIT_CONFIG_COUNT'
+    $userKey=Get-FzUserValue 'GIT_CONFIG_KEY_0'
+    $userValue=Get-FzUserValue 'GIT_CONFIG_VALUE_0'
+    $managed=$userCount -ceq '1' -and $userKey -ceq 'http.schannelUseSSLCAInfo' -and $userValue -ceq 'true'
+    $userConflict=(-not [string]::IsNullOrEmpty($userCount) -or $null -ne $userKey -or $null -ne $userValue) -and -not $managed
+    $processManaged=$env:GIT_CONFIG_COUNT -ceq '1' -and $env:GIT_CONFIG_KEY_0 -ceq 'http.schannelUseSSLCAInfo' -and $env:GIT_CONFIG_VALUE_0 -ceq 'true'
+    $processConflict=(-not [string]::IsNullOrEmpty($env:GIT_CONFIG_COUNT) -or $null -ne $env:GIT_CONFIG_KEY_0 -or $null -ne $env:GIT_CONFIG_VALUE_0) -and -not $processManaged
+    if($userConflict -or $processConflict){throw 'Existing GIT_CONFIG_* environment entries conflict with Friendzone Git trust; configuration unchanged'}
+    $Values.GIT_CONFIG_COUNT='1'
+    $Values.GIT_CONFIG_KEY_0='http.schannelUseSSLCAInfo'
+    $Values.GIT_CONFIG_VALUE_0='true'
+}
 function Get-FzProviderJson([string]$Path, [string]$Fake) {
     $root=if(Test-Path -LiteralPath $Path){Get-Content -Raw -Encoding UTF8 -LiteralPath $Path | ConvertFrom-Json}else{[pscustomobject]@{}}
     if ($root -isnot [pscustomobject] -or ($null -ne $root.version -and $root.version -ne 1)) { throw 'Unsupported Cline providers.json; configuration unchanged' }
@@ -35,12 +52,15 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     $envFile=Join-Path $ConfigDirectory 'friendzone-env.ps1'
     $origin=[Uri]$Data.broker
     $builder=New-Object UriBuilder('http',$origin.Host,[int]$Data.proxy_port)
-    $builder.UserName=$Data.container; $builder.Password='x'
     $proxy=$builder.Uri.AbsoluteUri.TrimEnd('/')
     $values=@{FZ_HOST=$origin.DnsSafeHost;FZ_BROKER=$Data.broker;HTTP_PROXY=$proxy;HTTPS_PROXY=$proxy}
-    foreach($key in @('NODE_EXTRA_CA_CERTS','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','GIT_SSL_CAINFO','GIT_PROXY_SSL_CAINFO')) {$values[$key]=$cert}
+    foreach($key in @('NODE_EXTRA_CA_CERTS','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','GIT_SSL_CAINFO','GIT_PROXY_SSL_CAINFO','CARGO_HTTP_CAINFO')) {$values[$key]=$cert}
+    # Friendzone's dynamic leaf certificates have no public CRL/OCSP endpoint.
+    # Cargo/Schannel must skip revocation lookup while retaining CA/host checks.
+    $values.CARGO_HTTP_CHECK_REVOKE='false'
     foreach($property in $Data.fakes.PSObject.Properties) {$values[$property.Name]=[string]$property.Value}
     $values.NO_PROXY=$origin.DnsSafeHost+',localhost,127.0.0.1,::1,[::1]'
+    Add-FzGitSchannelTrust $values
     $lines=@('# Friendzone guest environment')
     $oldValuesPath=Join-Path $ConfigDirectory 'user-environment.json'
     $legacyIdleMarker=Join-Path $ConfigDirectory 'remove-legacy-cline-idle-timeout'
@@ -106,8 +126,8 @@ function Start-FzGuestSetup($Data) {
         Write-FzFile (Join-Path $config 'persist-environment.ps1') ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Data.persistence)))
         $envFile=Invoke-FzConfigure $Data ([Environment]::GetFolderPath('UserProfile')) $config $env:CLINE_DIR
         . $envFile
-        Write-Host ('Configured guest '+$Data.container+'. '+$(if($approval.approved){'Approved.'}else{'Approve it in the host Inbox.'}))
-        Write-Host 'Installed the Friendzone Cline plugin for async GraphQL and session updates.'
+        Write-Host ('Configured guest '+$Data.container+'. '+$(if($approval.approved){'Approved.'}else{'Use Approve + pin IP in the host Inbox.'}))
+        Write-Host 'Installed the Friendzone Cline plugin for async GraphQL, reviewed Git publication, and session updates.'
         Write-Host 'Restart guest Cline from this terminal. Sign out/in to refresh other Windows launchers.'
     } finally {$client.Dispose();$handler.Dispose()}
 }

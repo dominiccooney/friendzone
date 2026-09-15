@@ -138,8 +138,10 @@ are consequential review submissions, not merely comment text. Target hints
 identify opaque Repository/PR/Review/Thread IDs, not verified PR numbers;
 when both PR and review/reply IDs are supplied no single target is guessed.
 General PR/review target lookup is not added to the narrow comment resolver.
-Binary git push remains blocked; PR creation requires the head branch to
-already exist on GitHub. Token scopes must permit the approved operation.
+Ordinary binary `git push` remains blocked. The separate durable Cline
+`friendzone_submit_git_bundle` workflow can publish a broker-validated,
+host-reviewed branch before PR creation. Token scopes must permit each approved
+operation; see [ASYNC-GRAPHQL.md](ASYNC-GRAPHQL.md#git-branch-publication).
 
 ## Structured model (version 1)
 

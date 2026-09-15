@@ -23,7 +23,7 @@ impl TestServer {
     }
 
     fn proxy_url(&self) -> String {
-        format!("http://scratch-kali:x@{}", self.address)
+        format!("http://{}", self.address)
     }
 }
 
@@ -37,7 +37,7 @@ async fn denying_proxy() -> TestServer {
     TestServer::start(Router::new().fallback(|| async {
         (
             StatusCode::FORBIDDEN,
-            "friendzone: container awaiting approval; approve it in the UI inbox",
+            "friendzone: container awaiting approval; use Approve + pin IP in the UI inbox",
         )
     }))
     .await

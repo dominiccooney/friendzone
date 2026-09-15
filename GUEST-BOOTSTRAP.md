@@ -26,7 +26,7 @@ trust-on-first-use, not an authenticated software distribution channel.
 ## What changes
 
 Setup also installs the [Friendzone Cline plugin](ASYNC-GRAPHQL.md) for async
-GraphQL submissions and session updates. The managed file is
+GraphQL submissions, reviewed Git branch publication, and session updates. The managed file is
 `${CLINE_DIR:-~/.cline}/plugins/friendzone.js`; unrelated plugins are preserved.
 Restart guest Cline after setup. A compatible Cline plugin host is required;
 the installer does not download or upgrade Cline.
@@ -37,10 +37,18 @@ then writes the guest account's environment and Cline settings. Refetch before
 rerunning if the CA, broker address or fake keys have changed. Downloading a
 script never registers or approves a guest; the host Inbox still owns approval.
 
-The environment contains FZ_HOST/FZ_BROKER, HTTP_PROXY/HTTPS_PROXY, CA variables
+The environment contains FZ_HOST/FZ_BROKER, credential-free HTTP_PROXY/HTTPS_PROXY, CA variables
 for common runtimes, and fake provider keys. NO_PROXY/no_proxy includes the
 broker host, localhost, 127.0.0.1, ::1 and [::1], preserving existing exclusions.
 Real credentials and OAuth refresh tokens never enter the script.
+
+The setup name remains the human-readable policy/log label. Runtime proxy,
+async-job, and MCP identity comes from a unique explicit source-IP pin. Use
+**Approve + pin IP** after setup. Host networking must prevent source spoofing,
+and each guest needs a distinct address; NATed guests sharing one source address
+cannot be distinguished. A wildcard/preapproved name needs an explicit Pin
+before new credential-free clients can use it. Legacy Basic guest identity is
+accepted during migration only when it agrees with the pinned address.
 
 Friendzone does not override Cline's global plugin sandbox lifetime. While a
 request remains pending, the plugin emits a grouped reminder every 20 minutes;
@@ -57,10 +65,24 @@ model choice, other providers, and last-used provider; it removes stale Cline
 OAuth fields so they cannot override the fake key. Invalid provider JSON fails
 before environment/profile writes. Existing provider files get a backup.
 
-The script does not modify firewall rules or the system CA store. Runtime CA
-variables provide trust for supported clients; applications that ignore them
-need their own trust configuration. Network confinement remains host-enforced;
-see [NETWORK-ISOLATION.md](NETWORK-ISOLATION.md).
+The script does not modify firewall rules, global/repository Git configuration,
+or the Windows system CA store. Runtime CA variables provide trust for supported
+clients. On Windows, setup also supplies `http.schannelUseSSLCAInfo=true` through
+Git's `GIT_CONFIG_COUNT` environment interface. This makes Git for Windows'
+Schannel backend honor the managed
+`GIT_SSL_CAINFO` PEM without disabling verification or trusting the interception
+CA in every Windows application. Setup recognizes its exact entry on rerun but
+fails rather than copy or overwrite other `GIT_CONFIG_*` environment injection,
+which may contain secrets. Setup sets Cargo's native `CARGO_HTTP_CAINFO` to the
+same PEM, allowing its libcurl/Schannel registry and crate downloads to verify
+Friendzone-issued certificates. On Windows it also sets
+`CARGO_HTTP_CHECK_REVOKE=false`: Friendzone's dynamically issued leaf
+certificates have no public CRL/OCSP responder, so Schannel otherwise rejects
+them when revocation status cannot be determined. This disables only Cargo's
+Windows revocation lookup; CA-chain, signature, expiry, and hostname verification
+remain enabled. Applications that ignore runtime CA settings still need their
+own trust configuration. Network confinement remains host-enforced; see
+[NETWORK-ISOLATION.md](NETWORK-ISOLATION.md).
 
 ## Linux persistence
 
@@ -120,7 +142,7 @@ host-enforced network isolation in [NETWORK-ISOLATION.md](NETWORK-ISOLATION.md).
 2. Close guest Cline before running setup. Use the same guest Windows account
    that will run Cline. Execution policy still applies: do not use Bypass or
    change machine-wide policy to force installation.
-3. Approve the new guest in Inbox. Check that `$env:FZ_BROKER` and
+3. **Approve + pin IP** for the new guest in Inbox. Check that `$env:FZ_BROKER` and
    `$env:HTTP_PROXY` point at the current host, and `$env:NO_PROXY` includes the
    host and loopback addresses. User environment values affect new launchers;
    old Cline hubs and already-running applications retain their old environment.
@@ -129,7 +151,7 @@ host-enforced network isolation in [NETWORK-ISOLATION.md](NETWORK-ISOLATION.md).
    expect `module.exports=plugin;`. Substitute `$env:CLINE_DIR` for the `.cline`
    directory if configured. If Node is installed, dynamic import of that absolute
    path via `pathToFileURL` should yield `default.name === 'friendzone'`.
-5. Restart the guest Cline hub/session after activation. Confirm all five
+5. Restart the guest Cline hub/session after activation. Confirm all six
    `friendzone_*` tools are registered before asking the agent to use them.
    Then run a small inference prompt, followed by a read-only GraphQL query and
    result retrieval. Verify the session receives the completion update.

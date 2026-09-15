@@ -138,6 +138,9 @@ pub struct EventHandler {
     /// Identity travels with that tunnel, never in an IP/port cache that
     /// could outlive a socket and authenticate a different connection.
     tunnel_identity: Option<String>,
+    /// Credential-free tunnels must continue resolving by their explicit IP
+    /// pin; their carried display label must never become legacy identity.
+    tunnel_requires_pin: bool,
     /// Block this destination port globally, not by hostname: aliases and
     /// DNS rebinding must not let guests reach the host's management API.
     management_port: u16,
@@ -159,19 +162,36 @@ impl EventHandler {
             settings,
             pending: None,
             tunnel_identity: None,
+            tunnel_requires_pin: false,
             management_port,
             bootstrap_port,
             response_watch: None,
         }
     }
 
-    fn container(&self, req: &Request<Body>) -> Option<String> {
-        self.tunnel_identity.clone().or_else(|| {
-            req.headers()
+    fn container(
+        &self,
+        req: &Request<Body>,
+        peer: std::net::IpAddr,
+    ) -> anyhow::Result<(String, crate::state::Authorization)> {
+        if let Some(container) = &self.tunnel_identity {
+            if self.tunnel_requires_pin {
+                let identity = self.state.authorize_proxy_peer(peer, None)?;
+                if identity.0 != *container {
+                    anyhow::bail!("source address no longer owns the intercepted tunnel");
+                }
+                Ok(identity)
+            } else {
+                self.state.authorize_proxy_peer(peer, Some(container))
+            }
+        } else {
+            let presented = req
+                .headers()
                 .get(PROXY_AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
-                .and_then(basic_username)
-        })
+                .and_then(basic_username);
+            self.state.authorize_proxy_peer(peer, presented.as_deref())
+        }
     }
 
     async fn handle_from_peer(
@@ -181,28 +201,42 @@ impl EventHandler {
     ) -> RequestOrResponse {
         self.pending = None;
         self.response_watch = None;
-        let Some(container) = self.container(&req) else {
-            // Git/libcurl's anyauth mode waits for this challenge before
-            // sending the username from its proxy URL. 403 cannot do that.
-            return Response::builder()
-                .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-                .header(PROXY_AUTHENTICATE, "Basic realm=\"Friendzone\"")
-                .body(Body::from(
-                    "friendzone: proxy credentials required; use http://CONTAINER:x@HOST:PORT",
-                ))
-                .expect("static challenge")
-                .into();
+        let credential_free_connect =
+            self.tunnel_identity.is_none() && !req.headers().contains_key(PROXY_AUTHORIZATION);
+        let has_presented_identity =
+            self.tunnel_identity.is_some() || req.headers().contains_key(PROXY_AUTHORIZATION);
+        let container = match self.container(&req, peer.ip()) {
+            Ok(identity) => identity,
+            Err(error) if !has_presented_identity => {
+                // Git/libcurl's anyauth mode waits for this challenge before
+                // sending a legacy username. New clients use a unique IP pin.
+                return Response::builder()
+                    .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+                    .header(PROXY_AUTHENTICATE, "Basic realm=\"Friendzone\"")
+                    .body(Body::from(format!(
+                        "friendzone: {error}; credential-free proxy use requires a unique IP pin"
+                    )))
+                    .expect("static challenge")
+                    .into();
+            }
+            Err(error) => {
+                return Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .body(Body::from(format!("friendzone: {error}")))
+                    .expect("static identity denial")
+                    .into();
+            }
         };
-        // Proxy credentials identify a container and must never reach the upstream host.
+        let (container, authorization) = container;
+        // Legacy proxy identity hints must never reach the upstream host.
         req.headers_mut().remove(PROXY_AUTHORIZATION);
         // The container gate comes before any policy: unknown names are
         // join requests (approve them in the UI), and a known name from
         // the wrong address is denied.
-        let authorization = self.state.authorize(&container, peer.ip());
         if authorization != crate::state::Authorization::Allowed {
             let reason = match authorization {
                 crate::state::Authorization::Pending => {
-                    "friendzone: container awaiting approval; approve it in the UI inbox"
+                    "friendzone: container awaiting approval; use Approve + pin IP in the UI inbox"
                 }
                 _ => "friendzone: container name is pinned to a different address",
             };
@@ -238,6 +272,7 @@ impl EventHandler {
         }
         if req.method() == hudsucker::hyper::Method::CONNECT && !killed {
             self.tunnel_identity = Some(container);
+            self.tunnel_requires_pin = credential_free_connect;
             // Successful CONNECTs are transport setup, not application
             // requests. Do not bury the useful log under these rows.
             return req.into();
@@ -560,13 +595,6 @@ impl HttpHandler for EventHandler {
         let status = res.status().as_u16();
         self.state.reviews.observe(id, crate::review::Status::ResponseReceived, Some(status),
             if status >= 400 { "Upstream returned an HTTP error." } else { "Upstream response received. HTTP status alone does not confirm the operation succeeded." });
-        // Only inspect bodies for escrow-pinned hosts (our known
-        // providers), and only JSON: streaming stays untouched.
-        let is_known_host = self
-            .settings
-            .entries()
-            .iter()
-            .any(|entry| entry.hosts.iter().any(|h| h == &host));
         let is_json = res
             .headers()
             .get(hudsucker::hyper::header::CONTENT_TYPE)
@@ -592,48 +620,12 @@ impl HttpHandler for EventHandler {
                 ),
             );
         }
-        if !(is_known_host && is_json) {
-            self.state.annotate(id, Some(status), None);
-            return res;
-        }
-        let (parts, body) = res.into_parts();
-        match http_body_util::BodyExt::collect(body).await {
-            Ok(collected) => {
-                let bytes = collected.to_bytes();
-                let parsed = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
-                let detail = parsed.as_ref().and_then(inference_detail);
-                self.state.annotate(id, Some(status), detail);
-                Response::from_parts(parts, Body::from(bytes.to_vec()))
-            }
-            Err(_) => {
-                self.state.reviews.response_detail(id, crate::review::Status::Unknown, "HTTP headers received, but reading the response failed. Check upstream before retrying.");
-                self.state.annotate(id, Some(status), None);
-                Response::from_parts(parts, Body::empty())
-            }
-        }
+        // Ordinary provider responses are never collected for optional usage
+        // summaries. Returning the original body preserves first-byte delivery,
+        // streaming, flow control, trailers, and connection reuse.
+        self.state.annotate(id, Some(status), None);
+        res
     }
-}
-
-/// Summarizes a JSON inference response: model and token counts.
-/// Handles Anthropic (`usage.input_tokens`) and OpenAI-style
-/// (`usage.prompt_tokens`) shapes; unknown shapes yield None.
-fn inference_detail(json: &serde_json::Value) -> Option<String> {
-    let usage = json.get("usage")?;
-    let (input, output) = match (
-        usage.get("input_tokens").and_then(|v| v.as_u64()),
-        usage.get("output_tokens").and_then(|v| v.as_u64()),
-    ) {
-        (Some(i), Some(o)) => (i, o),
-        _ => (
-            usage.get("prompt_tokens").and_then(|v| v.as_u64())?,
-            usage
-                .get("completion_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-        ),
-    };
-    let model = json.get("model").and_then(|v| v.as_str()).unwrap_or("?");
-    Some(format!("{model}: {input} in / {output} out tokens"))
 }
 
 pub fn basic_username(value: &str) -> Option<String> {
@@ -1182,6 +1174,16 @@ mod tests {
             ),
             StatusCode::FORBIDDEN
         );
+        state.set_pinned_ip("guest", None).unwrap();
+        assert_eq!(
+            status(
+                fresh
+                    .handle_from_peer(peer, request("GET", "https://github.com/", None))
+                    .await
+            ),
+            StatusCode::FORBIDDEN,
+            "clearing an IP pin must invalidate an existing credential-free tunnel"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1434,14 +1436,24 @@ mod tests {
         );
         state.set_killed("guest".into(), false).unwrap();
         let mut fresh = EventHandler::new(state.clone(), handler.settings.clone(), 8081, 8082);
+        assert!(matches!(
+            fresh
+                .handle_from_peer(peer, request("CONNECT", "github.com:443", None))
+                .await,
+            RequestOrResponse::Request(_)
+        ));
+        let mut spoofed = EventHandler::new(state.clone(), handler.settings.clone(), 8081, 8082);
         assert_eq!(
             status(
-                fresh
-                    .handle_from_peer(peer, request("CONNECT", "github.com:443", None))
+                spoofed
+                    .handle_from_peer(
+                        peer,
+                        request("CONNECT", "github.com:443", Some("different-guest"))
+                    )
                     .await
             ),
-            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
-            "socket address reuse must not inherit identity"
+            StatusCode::FORBIDDEN,
+            "legacy name cannot override the IP-pin owner"
         );
         assert_eq!(
             status(

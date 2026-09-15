@@ -269,6 +269,11 @@ async fn approvals_pins_kills_removals_and_http_save_errors_survive_restart() {
     let dir = TempDir::new();
     let broker = Broker::start(&dir).await;
     broker.announce("pinned").await;
+    // This single-process fixture has one loopback source address. Announce all
+    // pending labels before one of them claims it; production guests require
+    // distinct spoof-protected source addresses.
+    broker.announce("wrong-ip").await;
+    broker.announce("pending").await;
     assert!(
         broker
             .post(
@@ -293,12 +298,11 @@ async fn approvals_pins_kills_removals_and_http_save_errors_survive_restart() {
             .status()
             .is_success()
     );
-    broker.announce("wrong-ip").await;
     assert!(
         broker
             .post(
                 "/api/containers/wrong-ip/approve",
-                json!({"pin_to_last_ip":true})
+                json!({"pin_to_last_ip":false})
             )
             .await
             .status()
@@ -311,7 +315,6 @@ async fn approvals_pins_kills_removals_and_http_save_errors_survive_restart() {
             .status()
             .is_success()
     );
-    broker.announce("pending").await;
     assert!(broker.proxy_request("pinned").await.status().is_success());
     broker.stop().await; // kill rather than graceful shutdown: each mutation must already be durable
 
@@ -326,7 +329,13 @@ async fn approvals_pins_kills_removals_and_http_save_errors_survive_restart() {
     assert!(broker.proxy_request("pinned").await.status().is_success());
     let denied = broker.proxy_request("wrong-ip").await;
     assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
-    assert!(denied.text().await.unwrap().contains("different address"));
+    assert!(
+        denied
+            .text()
+            .await
+            .unwrap()
+            .contains("does not own source address")
+    );
     assert_eq!(
         broker.proxy_request("killed").await.status(),
         reqwest::StatusCode::FORBIDDEN

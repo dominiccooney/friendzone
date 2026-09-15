@@ -46,17 +46,19 @@ see the network isolation guide for the remaining limitations.
 
 ## Containers
 
-Containers are dynamic; the launch command never names them. A container
-is identified by the username in its proxy credentials. **Unknown
-containers are denied**: first contact (traffic or the guest setup script) creates a
-join request in the Inbox, and nothing flows until you approve it —
-"Approve + pin IP" also locks the name to the address it connected
-from, so containers cannot use each other's names. Pins are editable
-under **Settings → Guests** (Pin…; empty = any address). The advanced
-**Set up guest → Preapprove a name** option pre-approves a name (wildcard
-address) before its VM boots; it does not install or configure the guest. Kill/Resume
-stops traffic reversibly; Remove forgets the container (its log rows
-remain for audit).
+Containers are dynamic. Setup supplies a human-readable guest name, while
+runtime proxy, MCP, and async-job traffic is identified by its unique explicit
+source-IP pin. **Unknown containers are denied**: setup first creates a join
+request in the Inbox, and nothing flows until you click **Approve + pin IP**.
+Pins must be unique. This requires host-enforced anti-spoofing and separate
+source addresses; guests behind the same NAT address cannot use IP identity.
+Pins are editable under **Settings → Guests**. Clearing a pin leaves a wildcard
+policy for legacy named clients but disables credential-free runtime access.
+The advanced **Set up guest → Preapprove a name** option similarly needs an
+explicit Pin before new credential-free clients can connect. Legacy Basic guest
+names remain accepted during migration only when they agree with the source-IP
+owner. Kill/Resume stops traffic reversibly; Remove forgets the container (its
+log rows remain for audit).
 
 Inbox is for decisions: pending requests, guest joins, then recent outcomes.
 Approved/killed guests and saved comment permissions live under
@@ -92,7 +94,7 @@ command, and run the downloaded script in the guest account. No guest binary,
 compiler, or platform-specific build is needed. Linux requires Python 3;
 Windows requires curl.exe and PowerShell 5.1 or 7.
 
-The script saves the CA, proxy/loopback exclusions and fake credentials, merges
+The script saves the CA, credential-free proxy URL, loopback exclusions and fake credentials, merges
 Cline provider settings, and persists user configuration. Linux gets idempotent
 profile hooks; Windows gets user-scoped environment values. Close guest Cline
 before running the script because it updates that application's settings, then
@@ -106,15 +108,35 @@ script endpoints, persistence details, trust model and rollback.
 
 Start the broker, then in another shell:
 
+First preapprove a `reviewer` label in Settings and pin it to `127.0.0.1`.
+
 ```powershell
-curl.exe --proxy http://reviewer:demo@127.0.0.1:8080 `
+curl.exe --proxy http://127.0.0.1:8080 `
   --cacert "$env:LOCALAPPDATA/friendzone/friendzone-ca.pem" `
   https://example.com/
 ```
 
-The request appears under the `reviewer` container in the UI and request log.
+The request appears under the IP-pinned `reviewer` guest in the UI and request log.
 The UI kill button rejects subsequent requests from that container until
 resumed.
+
+### Proxy transport and inference performance
+
+Friendzone uses one shared upstream Hyper connection pool across all guest
+connections. TLS ALPN negotiates HTTP/2 when an origin supports it and falls
+back to HTTP/1.1 otherwise. Concurrent requests to an HTTP/2 origin multiplex
+over a shared connection instead of opening one TLS connection per inference.
+Idle upstream connections are retained for up to five minutes, with at most 16
+idle connections per origin. HTTP/2 connections use adaptive flow control and
+30-second keepalive pings with a 10-second acknowledgement timeout, including
+while idle, so dead pooled connections are detected before reuse.
+
+Ordinary provider response bodies—including `application/json`—stream directly
+to the guest with backpressure; Friendzone does not collect them for optional
+usage summaries. Only reviewed GitHub GraphQL JSON uses a bounded streaming
+observer, which does not delay or rewrite response bytes. Ordinary inference
+requests have no Friendzone concurrency semaphore; review and durable-job limits
+do not apply to them.
 
 ## GitHub policy
 
@@ -144,13 +166,56 @@ plain Git use it. The guest bootstrap does not install a Git credential
 helper; do not put the real token in the guest. No global Git configuration
 is changed by the broker.
 
+For an authenticated HTTPS Git read/fetch, use an invocation-scoped helper.
+This exact form works from a POSIX shell and PowerShell; replace only the final
+Git arguments:
+
+```sh
+git -c credential.helper= -c 'credential.helper=!f() { if test "$1" = get; then printf "%s\n" "username=x-access-token" "password=$GITHUB_TOKEN"; fi; }; f' fetch origin main
+```
+
+The first empty helper disables inherited helpers for that invocation. The
+shell run by Git reads the guest's **fake** `GITHUB_TOKEN` at execution time;
+the value is not placed in the command line, remote URL, or persistent Git
+configuration. Do not print the token or substitute the host's real token.
+
 `GET .../info/refs?service=git-receive-pack` is push-service **discovery**, not
 a write. GitHub can return `401` with a Basic challenge before Git retries
 with credentials, even on a public repository. The log's `allowed` verdict
 means Friendzone forwarded the request; its HTTP status is GitHub's response.
-**This auth support does not enable branch pushes:** the subsequent binary
-`POST .../git-receive-pack` is still blocked. Creating a PR through the API
-therefore still requires an already-published head branch.
+The subsequent binary `POST .../git-receive-pack` from ordinary `git push`
+remains blocked: Friendzone does not quick-approve opaque pack bytes on a waiting
+connection. To publish a branch for a PR, use the durable Cline
+`friendzone_submit_git_bundle` workflow below.
+
+### Reviewed Git branch publication
+
+The guest creates a version-2 Git bundle with exactly one branch and one
+prerequisite, then submits its absolute path through the Friendzone Cline plugin.
+Friendzone imports and validates the exact objects in a private host-side bare
+repository. Only after validation does Inbox show an approvable review containing
+the repository/ref, expected/base/head OIDs, bundle SHA-256, full commit messages
+and authors, every per-commit path entry, and an exact binary-capable patch.
+
+For a new branch based directly on the current `origin/main` tip:
+
+```sh
+git fetch origin main
+base=$(git rev-parse origin/main)
+git bundle create --version=2 "$PWD/feature.bundle" refs/heads/feature "^$base"
+```
+
+Ask the agent to call `friendzone_submit_git_bundle` with that absolute path,
+`repository=owner/repo`, `branch=feature`, `base_branch=main`, and forty zeroes as
+`expected_oid`. An existing-branch update uses its exact current remote SHA as
+both the sole prerequisite and `expected_oid`, with `base_branch=branch`.
+
+V1 allows one merge-free, linear, fast-forward `refs/heads/*` publication. It
+does not support tags, deletes, force updates, merge commits, multiple refs,
+SHA-256 object IDs, LFS, or arbitrary remotes/refspecs/options. The broker uses
+the configured host GitHub credential, rechecks the target, pushes once with an
+exact `--force-with-lease`, and reads the ref back. Restart never replays an
+interrupted publication. See the [complete contract and limits](ASYNC-GRAPHQL.md#git-branch-publication).
 
 ### Reads and manual review
 
@@ -198,7 +263,8 @@ or **Deny**. Review cards label branches, repository IDs, title/body, commit,
 file/line and review event (`COMMENT`, `APPROVE`, `REQUEST_CHANGES`). These
 mutations never inherit ordinary saved comment permissions. JSON REST PR
 creation/review-comment requests use the same one-shot gate. GitHub token
-permissions still apply, and creating a PR does not unblock binary git pushes.
+permissions still apply. Publish the head branch first with the reviewed bundle
+tool; ordinary binary `git push` remains blocked.
 See [GRAPHQL-REVIEW.md](GRAPHQL-REVIEW.md) for supported syntax and the
 operation/target model and the supported issue/PR-scoped comment permission.
 
@@ -217,10 +283,11 @@ redacted. URLs and request bodies may themselves contain sensitive guest
 data, so don't share screenshots casually. Payloads are untrusted text,
 not instructions to the reviewer and not a broker-validated action summary.
 
-The queue is memory-only: 32 requests globally, 8 per guest, 64 KiB per body,
+The synchronous proxy queue is memory-only: 32 requests globally, 8 per guest, 64 KiB per body,
 16 KiB of headers and 8 KiB of URL, with a 10-second upload and 120-second
-decision deadline. Compressed, binary, multipart/form and git push payloads
-remain blocked because this UI cannot faithfully review them. Kill,
+decision deadline. Compressed, binary, multipart/form and direct git push
+payloads remain blocked because this path cannot faithfully review them. The
+separate bundle tool is durable and broker-parsed. Kill,
 removal, approval/pin changes, expiry, or cancellation of the waiting HTTP
 handler end the pending request; restart never replays it. A permission
 change after the final admission check cannot undo already-admitted work.
@@ -314,7 +381,8 @@ and opens host sign-in in one step. After login, **Next: choose tools and
 guests**, then **Save guest access**. Until then, the new server is private.
 Existing server cards offer **Authorize in Friendzone** and **Choose tools
 and guests**, plus a full, wrapping guest endpoint with **Copy URL**.
-**Connect guest → Copy Cline configuration** includes the required guest Authorization header.
+**Connect guest → Copy Cline configuration** uses the guest's unique source-IP
+pin and includes no guest credential or upstream token.
 The broker discovers protected-resource and authorization-server metadata,
 registers a public client, uses PKCE S256 and a resource-bound grant, and
 stores its own session on the host. Concurrent requests share one refresh
@@ -341,10 +409,12 @@ The Windows browser launcher passes URLs as data so OAuth query parameters
 are not split at `&`. The sign-in panel retains the complete URL with Open
 and Copy actions, plus the registered callback for troubleshooting.
 
-Guests use the generated Basic `Authorization` header, not upstream OAuth.
-An old guest Cline entry showing “OAuth required” should be replaced with the
-generated transport configuration and have stale `oauth`/`oauthClient`
-fields removed. See [QUICKSTART.md](QUICKSTART.md) for recovery steps.
+Guests are identified by their unique source-IP pin, not upstream OAuth. New
+generated MCP transports have no guest `Authorization` header. An old guest
+Cline entry showing “OAuth required” should be replaced with the generated
+transport configuration and have stale `Authorization`, `oauth`, and
+`oauthClient` fields removed. See [QUICKSTART.md](QUICKSTART.md) for recovery
+steps.
 
 ## Credential escrow (inference and other APIs)
 
@@ -383,6 +453,13 @@ with the broker host plus `localhost`, `127.0.0.1`, `::1`, and `[::1]`.
 Existing exclusions from both cases are merged without duplicates. This
 keeps guest Cline hub requests on guest loopback instead of sending them to
 the host proxy. `GIT_SSL_CAINFO` and other runtime CA variables are included.
+Windows setup also makes Git's Schannel backend honor that PEM using the scoped
+`http.schannelUseSSLCAInfo=true` environment config; it does not disable TLS
+verification, edit Git config files, or install the CA into the Windows store.
+Cargo receives the same PEM through its native `CARGO_HTTP_CAINFO` setting. On
+Windows, Cargo revocation lookup is disabled because Friendzone's dynamic leaf
+certificates have no public CRL/OCSP responder; all other TLS verification stays
+enabled.
 After updating an old env file, source it and restart guest processes that
 inherited the old environment. These exclusions are not a security boundary.
 
@@ -397,13 +474,14 @@ through untouched.
 Working now: persistent container approval/IP pins/Kill, a searchable
 10,000-event in-memory log, CONNECT interception and credential substitution;
 parsed GitHub GraphQL reads, one-shot write review with desktop notifications,
-and narrow per-guest issue/PR comment permissions; live MCP configuration,
+reviewed durable Git branch-bundle publication, and narrow per-guest issue/PR
+comment permissions; live MCP configuration,
 tool/guest allowlists and host-side OAuth; Cline sign-in and token refresh;
 script-only guest setup with persistent Linux profiles or Windows user
 environment. Settings is organized into Guests, Credentials and MCP servers.
 
-Not yet: proxy password validation (identity is name + approval + IP pin),
-general rulesets, binary git push review, on-disk logs, OS-secret-store
+Not yet: shared/NATed-address guest identity,
+general rulesets, transparent/direct `git push`, on-disk proxy logs, OS-secret-store
 credentials, stdio MCP forwarding, automatic Hyper-V/tart network provisioning,
 general DNS-rebinding/LAN protection, or termination of already-forwarded
 connections when Kill is pressed. Guest egress enforcement remains external.

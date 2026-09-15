@@ -5,7 +5,10 @@ use axum::{Router, http::HeaderMap, response::IntoResponse, routing::get};
 use hudsucker::{Proxy, certificate_authority::RcgenAuthority, rustls::crypto::aws_lc_rs};
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -57,56 +60,99 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
     settings.set_secret("github", "fixture-real-token").unwrap();
     let state = AppState::default();
     state.add_container("guest").unwrap();
+    state
+        .set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
+        .unwrap();
     let seen = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
     let received = seen.clone();
+    let cargo_hits = Arc::new(AtomicUsize::new(0));
+    let cargo_received = cargo_hits.clone();
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();
     let _upstream = Task(tokio::spawn(async move {
         axum::serve(
             upstream,
-            Router::new().route(
-                "/cline/cline.git/info/refs",
-                get(
-                    move |headers: HeaderMap,
-                          axum::extract::Query(query): axum::extract::Query<
-                        std::collections::HashMap<String, String>,
-                    >| {
-                        let received = received.clone();
+            Router::new()
+                .route(
+                    "/cline/cline.git/info/refs",
+                    get(
+                        move |headers: HeaderMap,
+                              axum::extract::Query(query): axum::extract::Query<
+                            std::collections::HashMap<String, String>,
+                        >| {
+                            let received = received.clone();
+                            async move {
+                                assert!(!headers.contains_key("proxy-authorization"));
+                                let auth = headers
+                                    .get("authorization")
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_owned);
+                                let expected = format!(
+                                    "Basic {}",
+                                    STANDARD.encode(b"x-access-token:fixture-real-token")
+                                );
+                                let valid = auth.as_deref() == Some(&expected);
+                                received.lock().unwrap().push(auth);
+                                if !valid {
+                                    return (
+                                        StatusCode::UNAUTHORIZED,
+                                        [("www-authenticate", "Basic realm=\"GitHub\"")],
+                                        "Authentication required",
+                                    )
+                                        .into_response();
+                                }
+                                let service = query.get("service").unwrap();
+                                assert!(matches!(
+                                    service.as_str(),
+                                    "git-upload-pack" | "git-receive-pack"
+                                ));
+                                (
+                                    [(
+                                        "content-type",
+                                        format!("application/x-{service}-advertisement"),
+                                    )],
+                                    advertisement(service),
+                                )
+                                    .into_response()
+                            }
+                        },
+                    ),
+                )
+                .route(
+                    "/config.json",
+                    get(|| async {
+                        axum::Json(serde_json::json!({
+                            "dl":"https://static.crates.io/crates",
+                            "api":"https://crates.io"
+                        }))
+                    }),
+                )
+                .route(
+                    "/api/v1/crates",
+                    get(move |headers: HeaderMap| {
+                        let cargo_received = cargo_received.clone();
                         async move {
                             assert!(!headers.contains_key("proxy-authorization"));
-                            let auth = headers
-                                .get("authorization")
-                                .and_then(|value| value.to_str().ok())
-                                .map(str::to_owned);
-                            let expected =
-                                format!("Basic {}", STANDARD.encode(b"octocat:fixture-real-token"));
-                            let valid = auth.as_deref() == Some(&expected);
-                            received.lock().unwrap().push(auth);
-                            if !valid {
-                                return (
-                                    StatusCode::UNAUTHORIZED,
-                                    [("www-authenticate", "Basic realm=\"GitHub\"")],
-                                    "Authentication required",
-                                )
-                                    .into_response();
-                            }
-                            let service = query.get("service").unwrap();
-                            assert!(matches!(
-                                service.as_str(),
-                                "git-upload-pack" | "git-receive-pack"
-                            ));
-                            (
-                                [(
-                                    "content-type",
-                                    format!("application/x-{service}-advertisement"),
-                                )],
-                                advertisement(service),
-                            )
-                                .into_response()
+                            cargo_received.fetch_add(1, Ordering::SeqCst);
+                            axum::Json(serde_json::json!({
+                                "crates":[{
+                                    "id":"friendzone-cargo-ca-fixture",
+                                    "name":"friendzone-cargo-ca-fixture",
+                                    "updated_at":"2026-01-01T00:00:00Z",
+                                    "versions":null,"keywords":null,"categories":null,"badges":[],
+                                    "created_at":"2026-01-01T00:00:00Z",
+                                    "downloads":1,"recent_downloads":1,"default_version":"1.2.3",
+                                    "num_versions":1,"yanked":false,"max_version":"1.2.3",
+                                    "newest_version":"1.2.3","max_stable_version":"1.2.3",
+                                    "description":"local Cargo CA fixture","homepage":null,
+                                    "documentation":null,"repository":null,"links":{},
+                                    "exact_match":true,"trustpub_only":false
+                                }],
+                                "meta":{"total":1,"next_page":null,"prev_page":null}
+                            }))
                         }
-                    },
+                    }),
                 ),
-            ),
         )
         .await
         .unwrap();
@@ -115,9 +161,12 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
     let address = listener.local_addr().unwrap();
     let connector = tower::service_fn(move |uri: hudsucker::hyper::Uri| {
         Box::pin(async move {
-            if uri.host() != Some("github.com") {
+            if !matches!(
+                uri.host(),
+                Some("github.com") | Some("crates.io") | Some("index.crates.io")
+            ) {
                 return Err(std::io::Error::other(
-                    "fixture connector refuses non-GitHub destinations",
+                    "fixture connector refuses unexpected destinations",
                 ));
             }
             tokio::net::TcpStream::connect(upstream_address)
@@ -148,11 +197,7 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
         .use_rustls_tls()
         .add_root_certificate(reqwest::Certificate::from_pem(files.cert_pem.as_bytes()).unwrap())
         .no_proxy()
-        .proxy(
-            reqwest::Proxy::all(format!("http://{address}"))
-                .unwrap()
-                .basic_auth("guest", "x"),
-        )
+        .proxy(reqwest::Proxy::all(format!("http://{address}")).unwrap())
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
         .build()
@@ -169,7 +214,7 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
     assert_eq!(seen.lock().unwrap().as_slice(), &[None]);
     let response = client
         .get(discovery)
-        .basic_auth("octocat", Some("fake-github-token"))
+        .basic_auth("x-access-token", Some("fake-github-token"))
         .send()
         .await
         .unwrap();
@@ -184,10 +229,13 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
     // helper. Only dummy credentials exist, and the connector cannot go online.
     let mut git = tokio::process::Command::new("git");
     git.env_clear();
-    // Git for Windows otherwise uses Schannel, which need not honor a PEM
-    // CA file. Other platforms keep their compiled/default TLS backend.
+    // Exercise the installed Windows backend and the guest setup fix: Schannel
+    // keeps verification enabled but is explicitly allowed to honor the PEM.
     if cfg!(windows) {
-        git.args(["-c", "http.sslBackend=openssl"]);
+        git.args(["-c", "http.sslBackend=schannel"])
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "http.schannelUseSSLCAInfo")
+            .env("GIT_CONFIG_VALUE_0", "true");
     }
     for key in [
         "PATH",
@@ -205,10 +253,10 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
     git.current_dir(&dir.0).env("HOME",&dir.0).env("USERPROFILE",&dir.0)
         .env("XDG_CONFIG_HOME",&dir.0).env("APPDATA",&dir.0).env("LOCALAPPDATA",&dir.0)
         .env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL",&config).env("GIT_TERMINAL_PROMPT","0")
-        .env("GIT_SSL_CAINFO",&ca).kill_on_drop(true)
-        .args(["-c","credential.helper=","-c","credential.helper=!f() { if test \"$1\" = get; then printf '%s\\n' 'username=octocat' 'password=fake-github-token'; fi; }; f",
+        .env("GIT_SSL_CAINFO",&ca).env("GITHUB_TOKEN","fake-github-token").kill_on_drop(true)
+        .args(["-c","credential.helper=","-c","credential.helper=!f() { if test \"$1\" = get; then printf \"%s\\n\" \"username=x-access-token\" \"password=$GITHUB_TOKEN\"; fi; }; f",
             "-c","http.sslVerify=true","-c","protocol.version=0","-c","http.followRedirects=false",
-            "-c",&format!("http.proxy=http://guest:x@{address}"),"ls-remote","https://github.com/cline/cline.git"]);
+            "-c",&format!("http.proxy=http://{address}"),"ls-remote","https://github.com/cline/cline.git"]);
     let before = seen.lock().unwrap().len();
     let output = tokio::time::timeout(Duration::from_secs(15), git.output())
         .await
@@ -229,8 +277,62 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
         observed.iter().any(Option::is_some),
         "Git must retry with Basic credentials"
     );
-    let expected = format!("Basic {}", STANDARD.encode(b"octocat:fixture-real-token"));
+    let expected = format!(
+        "Basic {}",
+        STANDARD.encode(b"x-access-token:fixture-real-token")
+    );
     assert!(observed.iter().flatten().all(|value| value == &expected));
+
+    // Cargo's vendored libcurl uses Schannel on Windows. Its native CA setting
+    // must verify the same generated interception certificate. CARGO_HOME and
+    // the connector are isolated, so this cannot read user config or go online.
+    let cargo_executable = std::process::Command::new("rustup")
+        .args(["which", "cargo"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|path| PathBuf::from(path.trim()))
+        .unwrap_or_else(|| PathBuf::from("cargo"));
+    let mut cargo = tokio::process::Command::new(cargo_executable);
+    cargo.env_clear();
+    for key in [
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "SystemDrive",
+        "COMSPEC",
+        "TEMP",
+        "TMP",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            cargo.env(key, value);
+        }
+    }
+    cargo
+        .current_dir(&dir.0)
+        .env("HOME", &dir.0)
+        .env("USERPROFILE", &dir.0)
+        .env("CARGO_HOME", dir.0.join("cargo-home"))
+        .env("HTTP_PROXY", format!("http://{address}"))
+        .env("HTTPS_PROXY", format!("http://{address}"))
+        .env("NO_PROXY", "")
+        .env("CARGO_HTTP_CAINFO", &ca)
+        .env("CARGO_HTTP_CHECK_REVOKE", "false")
+        .env("CARGO_HTTP_TIMEOUT", "10")
+        .kill_on_drop(true)
+        .args(["search", "friendzone-cargo-ca-fixture", "--limit", "1"]);
+    let output = tokio::time::timeout(Duration::from_secs(15), cargo.output())
+        .await
+        .unwrap()
+        .expect("Cargo must be installed for CA interoperability test");
+    assert!(
+        output.status.success(),
+        "cargo search failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("friendzone-cargo-ca-fixture"));
+    assert_eq!(cargo_hits.load(Ordering::SeqCst), 1);
 
     let before = seen.lock().unwrap().len();
     let blocked = client
@@ -273,5 +375,5 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
     );
     let audit = serde_json::to_string(&state.view()).unwrap();
     assert!(!audit.contains("fixture-real-token"));
-    assert!(!audit.contains(&STANDARD.encode(b"octocat:fixture-real-token")));
+    assert!(!audit.contains(&STANDARD.encode(b"x-access-token:fixture-real-token")));
 }

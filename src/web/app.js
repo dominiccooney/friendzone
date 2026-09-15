@@ -81,9 +81,9 @@ function renderGuestRegistry() {
     const errorTarget = pending ? "#join-error" : "#container-error";
     const pin = c.pinned_ip ? (c.pinned_ip.startsWith("~") ? `last seen ${esc(c.pinned_ip.slice(1))}, not pinned` : `pinned to ${esc(c.pinned_ip)}`) : "any address";
     const actions = pending
-      ? `<span class="state killed">awaiting approval</span><button class="approve">Approve</button><button class="approve-pin">Approve + pin IP</button><button class="quiet remove">Deny</button>`
+      ? `<span class="state killed">awaiting approval</span><button class="approve-pin">Approve + pin IP</button><button class="quiet approve">Approve without pin (legacy)</button><button class="quiet remove">Deny</button>`
       : `<span class="state ${killed?"killed":"approved"}" title="Network authorization, not agent activity">${containerStatus(c)}</span><button class="stop ${killed?"resume":""}">${killed?"Resume":"Kill"}</button><button class="quiet pin-edit">Pin…</button><button class="quiet remove">Remove</button>`;
-    section.innerHTML = `<div class="container-head"><span class="status-dot" style="background:${killed?"var(--red)":"#999"}" title="${esc(containerStatus(c))}; agent activity is not monitored"></span><div><div class="container-name">${esc(c.name)}</div><div class="meta">${c.request_count} retained requests · ${esc(containerTraffic(c))} · ${pin}</div></div><div class="actions">${actions}</div></div>${pending?'<div class="container-body">Join request · approve to grant network access.</div>':""}`;
+    section.innerHTML = `<div class="container-head"><span class="status-dot" style="background:${killed?"var(--red)":"#999"}" title="${esc(containerStatus(c))}; agent activity is not monitored"></span><div><div class="container-name">${esc(c.name)}</div><div class="meta">${c.request_count} retained requests · ${esc(containerTraffic(c))} · ${pin}</div></div><div class="actions">${actions}</div></div>${pending?'<div class="container-body">Join request · Approve + pin IP for credential-free access.</div>':""}`;
     section.querySelector(".stop")?.addEventListener("click", () => {$("#container-error").textContent="";return setKilled(c.id, !killed).catch(showContainerError);});
     section.querySelector(".approve")?.addEventListener("click", async () => {
       await changeContainerPolicy(`/api/containers/${encodeURIComponent(c.id)}/approve`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pin_to_last_ip:false})}, errorTarget);
@@ -145,11 +145,11 @@ $("#enable-notifications").onclick = async () => {
 
 function notifyPendingRequests(pending) {
   if (!notificationsEnabled || typeof Notification === "undefined" || !window.isSecureContext || Notification.permission !== "granted") return;
-  for (const request of pending) if (!notifiedIds.has(request.id)) newNotificationIds.add(request.id);
+  for (const request of pending) if ((request.status || "pending") === "pending" && !notifiedIds.has(request.id)) newNotificationIds.add(request.id);
   if (!newNotificationIds.size || notificationTimer) return;
   notificationTimer = setTimeout(() => {
     notificationTimer = null;
-    const live = new Set((snapshot.pending_requests || []).map(request=>request.id));
+    const live = new Set((snapshot.pending_requests || []).filter(request=>(request.status || "pending") === "pending").map(request=>request.id));
     const ids = [...newNotificationIds].filter(id=>live.has(id) && !notifiedIds.has(id));
     newNotificationIds.clear();
     if (!ids.length || !notificationsEnabled || Notification.permission !== "granted") return;
@@ -190,6 +190,7 @@ function renderPendingRequests() {
 }
 
 const REVIEW_STATUSES = {
+  preparing:["Preparing review","sending"],
   pending:["Pending","pending"], approved:["Approved","sending"], sending:["Sending","sending"],
   response_received:["Response received","response"], denied:["Denied","blocked"], expired:["Expired","muted"],
   graphql_error:["GraphQL error","blocked"],
@@ -236,19 +237,32 @@ function reviewTarget(facts) {
   const repositories=Array.isArray(facts?.repositories)?facts.repositories:[];
   const targets=Array.isArray(facts?.targets)?facts.targets:[];
   const text=[...repositories,...targets].join(" · ");
-  if(repositories.length===1&&targets.length===1){
-    const repository=/^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100})$/.exec(repositories[0]);
-    const number=/^#([1-9][0-9]*)$/.exec(targets[0]);
-    if(repository&&number){
-      const artifacts=Array.isArray(facts?.artifacts)?facts.artifacts:[];
-      const artifact=artifacts.length===1&&artifacts[0]?.repository===repositories[0]&&String(artifacts[0]?.number)===number[1]?artifacts[0]:null;
-      const segment=artifact?.kind==="pull_request"?"pull":"issues";
-      const label=`${repositories[0]} ${targets[0]}`;
-      const url=`https://github.com/${encodeURIComponent(repository[1])}/${encodeURIComponent(repository[2])}/${segment}/${number[1]}`;
-      return {text:label,markup:`<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`};
-    }
+  const parseRepository=value=>typeof value==="string"?/^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100})$/.exec(value):null;
+  const link=(url,label)=>`<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`;
+  const repositoryUrl=value=>{const match=parseRepository(value);return match?`https://github.com/${encodeURIComponent(match[1])}/${encodeURIComponent(match[2])}`:null;};
+  const parts=repositories.map(repository=>{const url=repositoryUrl(repository);return url?link(url,repository):esc(repository);});
+  const artifacts=Array.isArray(facts?.artifacts)?facts.artifacts:[];
+  const represented=new Set();
+  for(const artifact of artifacts){
+    const number=String(artifact?.number??"");
+    const repository=artifact?.repository;
+    const base=repositoryUrl(repository);
+    if(!base||!/^([1-9][0-9]*)$/.test(number)||!["issue","pull_request","issue_or_pull_request"].includes(artifact?.kind))continue;
+    const segment=artifact.kind==="pull_request"?"pull":"issues";
+    parts.push(link(`${base}/${segment}/${number}`,`#${number}`));
+    represented.add(`${repository}\u0000${number}`);
   }
-  return {text,markup:esc(text||"Not identified")};
+  for(const target of targets){
+    const numbered=typeof target==="string"?/^#([1-9][0-9]*)$/.exec(target):null;
+    const matching=numbered?artifacts.filter(artifact=>String(artifact?.number)===numbered[1]&&represented.has(`${artifact?.repository}\u0000${numbered[1]}`)):[];
+    if(matching.length)continue;
+    if(numbered&&repositories.length===1&&artifacts.length===0){
+      const base=repositoryUrl(repositories[0]);
+      if(base){parts.push(link(`${base}/issues/${numbered[1]}`,target));continue;}
+    }
+    parts.push(esc(target));
+  }
+  return {text,markup:parts.join(" · ")||"Not identified"};
 }
 function reviewRow(request) {
   const status = reviewStatus(request), pending = !request.status || request.status === "pending";
@@ -262,8 +276,11 @@ function reviewRow(request) {
 function applyReviewOutcome(summary) {
   if (!activeReview) return;
   const oldStatus = activeReview.status || "pending";
+  if(oldStatus==="preparing" && summary.status==="pending"){
+    const id=activeReview.id;void openRequestReview(id);return;
+  }
   // An older fetch must not reopen a one-shot decision acknowledged locally.
-  if (oldStatus !== "pending" && (summary.status || "pending") === "pending") return;
+  if (oldStatus !== "pending" && oldStatus !== "preparing" && (summary.status || "pending") === "pending") return;
   Object.assign(activeReview, summary);
   const waiting = (activeReview.status || "pending") === "pending";
   if (oldStatus === "pending" && !waiting) { ++commentPermissionGeneration; renderCommentPermissionPanel(null); }
@@ -282,6 +299,7 @@ let reviewClock = null;
 function reviewTiming(request, now = Date.now()) {
   const created = Date.parse(request.created_at), expires = Date.parse(request.expires_at);
   if (request.asynchronous) {
+    if(request.status==="preparing")return "Async Git job · validating the bundle and deriving a review. No publication is approvable yet.";
     if ((request.status || "pending") === "pending") return `Async job · review by ${new Date(request.expires_at).toLocaleString()}. Client does not need to wait.`;
     const upstream=request.upstream;
     if(upstream?.started_at){
@@ -329,7 +347,9 @@ async function openRequestReview(id) {
     $("#request-review-headers").textContent = detail.headers.map(([name,value])=>`${name}: ${value}`).join("\n");
     $("#request-review-body").textContent = detail.body || "(empty body)";
     renderGraphqlReview(detail.graphql);
-    $("#request-raw").open = detail.graphql?.status !== "parsed";
+    renderGitPushReview(detail.git_push);
+    $("#request-raw-summary").textContent=detail.git_push?"Publication identity":"Exact request body";
+    $("#request-raw").open = !detail.git_push && detail.graphql?.status !== "parsed";
     renderCommentPermissionPanel(detail);
     $("#request-review").hidden = false;
     applyReviewOutcome(detail);
@@ -468,6 +488,14 @@ function renderGraphqlReview(graphql) {
   $("#request-graphql-variables-panel").hidden = !variables.length && (!analysis.supplied_variables || analysis.supplied_variables === "{}");
 }
 
+function renderGitPushReview(review) {
+  $("#request-git-push").hidden=!review;
+  $("#request-git-push-refs").textContent=review?`Repository: ${review.repository}\nTarget: refs/heads/${review.branch}\nExpected current target: ${review.expected_oid}\nBase branch: refs/heads/${review.base_branch}\nBase OID: ${review.base_oid}\nReviewed head OID: ${review.head_oid}\nBundle: ${review.bundle_bytes} bytes · SHA-256 ${review.bundle_sha256}`:"";
+  $("#request-git-push-commits").innerHTML=review?(review.commits||[]).map(commit=>`<article class="graphql-field"><strong>${esc(commit.oid)}</strong><pre>${esc(commit.message)}</pre><p class="meta">${esc(commit.author)} &lt;${esc(commit.email)}&gt; · ${esc(commit.authored_at)} · parent: ${esc(commit.parents.join(", "))}</p></article>`).join(""):"";
+  $("#request-git-push-files").innerHTML=review?(review.files||[]).map(file=>`<div class="graphql-value"><strong>${esc(file.status)}</strong> ${file.old_path?`${esc(file.old_path)} → `:""}${esc(file.path)} <span class="meta">in ${esc(file.commit_oid)}</span></div>`).join(""):"";
+  $("#request-git-push-patch").textContent=review?.patch||"";
+}
+
 async function decideRequest(decision) {
   if (!activeReview || (activeReview.status && activeReview.status !== "pending") || decisionInFlight === activeReview.id) return;
   const reviewed = activeReview;
@@ -539,7 +567,7 @@ const PROVIDER_PRESETS = {
   },
   github: {
     name: "github", hosts: "api.github.com,github.com,codeload.github.com", header: "authorization", prefix: "Bearer ", guest: "GITHUB_TOKEN",
-    hint: "Use a fine-grained PAT from github.com → Settings → Developer settings → Personal access tokens (narrow scopes recommended), or reuse the gh CLI's token: run `gh auth token`. Agents and gh read it from GITHUB_TOKEN. GitHub GraphQL queries flow automatically. PR creation and review comments/submissions require Approve once in Inbox; saved ordinary-comment permissions do not cover them. Approval cannot grant scopes your token lacks. Binary git pushes remain blocked.",
+    hint: "Use a fine-grained PAT from github.com → Settings → Developer settings → Personal access tokens (narrow scopes recommended), or reuse the gh CLI's token: run `gh auth token`. Agents and gh read the fake from GITHUB_TOKEN. GitHub GraphQL queries flow automatically. PR/review writes and tool-submitted Git branch bundles require Approve once in Inbox. Ordinary git push remains blocked. Approval cannot grant scopes your token lacks.",
   },
   custom: { name: "", hosts: "", header: "", prefix: "", guest: "", hint: "Fill the advanced fields: pinned hosts, credential header, optional 'Bearer ' prefix, and the env var the agent expects." },
 };
@@ -820,7 +848,7 @@ async function loadMcpConnection() {
     const result = await response.json();
     if (generation !== mcpConnectGeneration) return;
     $("#mcp-connect-url").value = result.endpoint;
-    $("#mcp-connect-auth").value = result.authorization;
+    $("#mcp-connect-auth").value = result.authorization || "Not required — guest is identified by its pinned source IP";
     $("#mcp-connect-json").value = JSON.stringify(result.cline_config, null, 2);
     const forward = mcpConnectData?.forwards.find(f=>f.name===name);
     const warnings = [...result.warnings];
@@ -828,7 +856,8 @@ async function loadMcpConnection() {
     if (forward?.auth === "oauth-required") warnings.push("Upstream OAuth is not connected. Use Authorize in Friendzone on the host, not in guest Cline.");
     $("#mcp-connect-warning").textContent = warnings.join("\n");
     $("#mcp-connect-status").textContent = `Configuration for '${name}' as '${guest}'. This is not a connectivity test.`;
-    for (const id of ["url", "auth", "json"]) $("#mcp-copy-"+id).disabled = false;
+    for (const id of ["url", "json"]) $("#mcp-copy-"+id).disabled = false;
+    $("#mcp-copy-auth").disabled = !result.authorization;
   } catch (error) {
     if (generation === mcpConnectGeneration) $("#mcp-connect-status").textContent = String(error);
   }

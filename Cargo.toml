@@ -29,5 +29,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
 
 [dev-dependencies]
+hyper-rustls = { version = "0.27", features = ["http2"] }
+tokio-rustls = "0.26"
 tower = { version = "0.5", features = ["util"] }
 

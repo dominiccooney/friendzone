@@ -97,11 +97,11 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
     ok: true,
     json: async () => ({
       endpoint: "http://172.31.208.1:8082/mcp/linear",
-      authorization: "Basic " + Buffer.from(guest + ":x").toString("base64"),
+      authorization: null,
+      identity: "source_ip",
       warnings: [],
       cline_config: {mcpServers:{"linear-via-friendzone":{transport:{
         type:"streamableHttp", url:"http://172.31.208.1:8082/mcp/linear",
-        headers:{Authorization:"Basic " + Buffer.from(guest + ":x").toString("base64")},
       }}}},
     }),
   });
@@ -184,7 +184,7 @@ test("compact overview puts operation repository and HTTP errors in one row with
   const job={...pendingRequest,status:'response_received',http_status:499,outcome:'Response received',updated_at:'2026-09-14T09:14:17Z',facts:{operation_name:'PublishBackgroundCommandStreaming',operation_type:'mutation',fields:['createCommitOnBranch'],repositories:['cline/cline'],targets:['branch feature'],more:false}};
   const markup=f.run(`reviewTable([${JSON.stringify(job)}],"empty")`);
   assert.match(markup,/<table/);assert.match(markup,/<td[^>]*>PublishBackgroundCommandStreaming<\/td>/);
-  assert.match(markup,/>cline\/cline · branch feature<\/td>/);assert.match(markup,/>HTTP 499<\/span>/);
+  assert.match(markup,/href="https:\/\/github\.com\/cline\/cline"[^>]*>cline\/cline<\/a> · branch feature<\/td>/);assert.match(markup,/>HTTP 499<\/span>/);
   assert.doesNotMatch(markup,/Response received|<article|<p>/);
   assert.match(markup,/createCommitOnBranch/);assert.match(markup,/&lt;script&gt;/);
   f.run(`snapshot.pending_requests=[];snapshot.containers=[];renderPendingRequests()`);
@@ -195,21 +195,24 @@ test("compact overview puts operation repository and HTTP errors in one row with
   assert.equal(f.sandbox.document.querySelector('#attention-empty').hidden,true);
 });
 
-test("compact numbered targets link to the specific GitHub issue or pull request",()=>{
+test("compact targets independently link repositories and every GitHub artifact",()=>{
   const f=fixture();
   const facts={operation_name:"Inspect",operation_type:"query",fields:["repository"],repositories:["cline/cline"],targets:["#1234"],more:false};
   const markup=f.run(`reviewTable([{...${JSON.stringify(pendingRequest)},facts:${JSON.stringify(facts)}}],"empty")`);
-  assert.match(markup,/<a href="https:\/\/github\.com\/cline\/cline\/issues\/1234" target="_blank" rel="noopener noreferrer">cline\/cline #1234<\/a>/);
-  assert.doesNotMatch(markup,/cline\/cline · #1234/);
+  assert.match(markup,/<a href="https:\/\/github\.com\/cline\/cline" target="_blank" rel="noopener noreferrer">cline\/cline<\/a> · <a href="https:\/\/github\.com\/cline\/cline\/issues\/1234" target="_blank" rel="noopener noreferrer">#1234<\/a>/);
   const pull=f.run(`reviewTarget({...${JSON.stringify(facts)},artifacts:[{repository:"cline/cline",number:"1234",kind:"pull_request"}]}).markup`);
   assert.match(pull,/href="https:\/\/github\.com\/cline\/cline\/pull\/1234"/);
   const issue=f.run(`reviewTarget({...${JSON.stringify(facts)},artifacts:[{repository:"cline/cline",number:"1234",kind:"issue"}]}).markup`);
   assert.match(issue,/href="https:\/\/github\.com\/cline\/cline\/issues\/1234"/);
 
+  const repository=f.run(`reviewTarget({repositories:["cline/cline"],targets:[]}).markup`);
+  assert.equal(repository,'<a href="https://github.com/cline/cline" target="_blank" rel="noopener noreferrer">cline/cline</a>');
   const branch=f.run(`reviewTarget({repositories:["cline/cline"],targets:["branch feature"]}).markup`);
-  assert.equal(branch,"cline/cline · branch feature");
+  assert.match(branch,/href="https:\/\/github\.com\/cline\/cline"/);assert.match(branch,/ · branch feature$/);
+  const multiple=f.run(`reviewTarget({repositories:["cline/cline"],targets:["#12","#34"],artifacts:[{repository:"cline/cline",number:"12",kind:"pull_request"},{repository:"cline/cline",number:"34",kind:"pull_request"}]}).markup`);
+  assert.match(multiple,/href="https:\/\/github\.com\/cline\/cline"[^>]*>cline\/cline<\/a> · <a href="https:\/\/github\.com\/cline\/cline\/pull\/12"[^>]*>#12<\/a> · <a href="https:\/\/github\.com\/cline\/cline\/pull\/34"[^>]*>#34<\/a>/);
   const ambiguous=f.run(`reviewTarget({repositories:["one/repo","two/repo"],targets:["#12"]}).markup`);
-  assert.doesNotMatch(ambiguous,/<a/);
+  assert.match(ambiguous,/href="https:\/\/github\.com\/one\/repo"/);assert.match(ambiguous,/href="https:\/\/github\.com\/two\/repo"/);assert.doesNotMatch(ambiguous,/href="[^"]+\/(?:issues|pull)\/12"/);assert.match(ambiguous,/#12$/);
   const hostile=f.run(`reviewTarget({repositories:["cline/<script>"],targets:["#12"]}).markup`);
   assert.doesNotMatch(hostile,/<a|<script>/);assert.match(hostile,/&lt;script&gt;/);
 });
@@ -236,6 +239,36 @@ test("async jobs keep normal approval controls without claiming a live waiting c
   f.run('applyReviewOutcome({status:"cancelled",outcome:"Broker restarted before execution. Not sent."})');
   assert.equal(f.sandbox.document.querySelector("#request-approve").disabled,true);
   assert.doesNotMatch(f.sandbox.document.querySelector("#request-review-timing").textContent,/timeout|client.*cancell/i);
+});
+
+test("Git publication preparation cannot approve and refetches the derived review before enabling approval", async () => {
+  const f=fixture(), element=id=>f.sandbox.document.querySelector("#"+id);
+  const preparing={...pendingRequest,method:"GIT PUSH",asynchronous:true,status:"preparing",outcome:"Validating bundle and deriving review",git_push:null};
+  const opening=f.run('openRequestReview("request-id")');
+  f.calls.at(-1).resolve({ok:true,json:async()=>preparing});await opening;
+  assert.equal(element("request-approve").disabled,true);
+  assert.equal(element("request-review-actions").hidden,true);
+  assert.match(element("request-review-timing").textContent,/No publication is approvable yet/);
+  const before=f.calls.length;
+  f.run('applyReviewOutcome({status:"pending",updated_at:"2099-01-02T00:00:00Z",outcome:"Awaiting host approval"})');
+  assert.equal(f.calls.length,before+1);
+  const refetch=f.calls.at(-1);
+  assert.equal(refetch.url,"/api/requests/request-id");
+  assert.equal(element("request-approve").disabled,true,"summary-only transition must not enable approval");
+  const review={repository:"cline/cline",branch:"feature",base_branch:"main",expected_oid:"0".repeat(40),base_oid:"1".repeat(40),head_oid:"2".repeat(40),bundle_sha256:"3".repeat(64),bundle_bytes:123,
+    commits:[{oid:"2".repeat(40),parents:["1".repeat(40)],author:"A <script>",email:"a@example.test",authored_at:"2026-09-15T00:00:00Z",subject:"subject",message:"subject\n\n<body & detail>"}],
+    files:[{commit_oid:"2".repeat(40),status:"R100",old_path:"old<script>",path:"new&name"}],patch:"diff --git a/x b/x\n+<script>literal patch</script>\n"};
+  refetch.resolve({ok:true,json:async()=>({...preparing,status:"pending",updated_at:"2099-01-02T00:00:00Z",outcome:"Awaiting host approval",git_push:review})});
+  await new Promise(setImmediate);
+  assert.equal(element("request-approve").disabled,false);
+  assert.equal(element("request-git-push").hidden,false);
+  assert.match(element("request-git-push-refs").textContent,/refs\/heads\/feature.*Reviewed head OID/s);
+  const commits=element("request-git-push-commits").innerHTML;
+  assert.match(commits,/A &lt;script&gt;/);assert.match(commits,/&lt;body &amp; detail&gt;/);assert.doesNotMatch(commits,/<script>|<body/);
+  const files=element("request-git-push-files").innerHTML;
+  assert.match(files,/old&lt;script&gt; → new&amp;name/);assert.doesNotMatch(files,/<script>/);
+  assert.equal(element("request-git-push-patch").textContent,review.patch);
+  assert.equal(element("request-git-push-patch").innerHTML,"");
 });
 
 test("repository issue/PR targets preserve repository context rather than extracting a bare number", () => {
@@ -734,17 +767,15 @@ test("guest change discards stale instructions and copies the current config", a
   f.reply(f.calls.at(-1), "guest-ü"); await current;
   f.reply(oldCall, "scratch-kali"); await old;
   const json = JSON.parse(f.element("connect-json").value);
-  const header = json.mcpServers["linear-via-friendzone"].transport.headers.Authorization;
-  assert.equal(Buffer.from(header.slice(6), "base64").toString(), "guest-ü:x");
+  assert.equal(json.mcpServers["linear-via-friendzone"].transport.headers,undefined);
   assert.equal(f.element("copy-json").disabled, false);
   let copied;
   f.sandbox.navigator.clipboard = {async writeText(text) { copied = text; }};
   await f.element("copy-json").onclick();
   assert.equal(copied, f.element("connect-json").value);
   delete f.sandbox.navigator.clipboard;
-  await f.element("copy-auth").onclick();
-  assert.equal(f.element("connect-auth").selected, true);
-  assert.match(f.element("connect-status").textContent, /Ctrl\+C/);
+  assert.equal(f.element("copy-auth").disabled,true);
+  assert.match(f.element("connect-auth").value,/pinned source IP/);
 });
 
 test("selection defaults, empty state, and guest refresh preserve user choices", () => {

@@ -8,6 +8,7 @@ use axum::{
     response::{Html, IntoResponse},
     routing::{get, post},
 };
+#[cfg(test)]
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 
@@ -484,20 +485,27 @@ async fn mcp_guest_config(
     else {
         return (StatusCode::NOT_FOUND, "Select a guest from the Inbox first").into_response();
     };
-    if guest.id.is_empty() || guest.id.contains(':') || guest.id.chars().any(char::is_control) {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "This guest name cannot be encoded as a Basic username; use a name without ':' or control characters").into_response();
-    }
     let endpoint = match guest_mcp_endpoint(state.bootstrap_addr, query.host.as_deref(), &name) {
         Ok(endpoint) => endpoint,
         Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     };
-    let authorization = format!("Basic {}", STANDARD.encode(format!("{}:x", guest.id)));
     let mut warnings = Vec::new();
     if !guest.approved {
-        warnings.push("Guest is awaiting approval. Approve it in the host Inbox.".to_owned());
+        warnings
+            .push("Guest is awaiting approval. Use Approve + pin IP in the host Inbox.".to_owned());
     }
     if guest.state == "killed" {
         warnings.push("Guest is killed. Resume it in the host Inbox.".to_owned());
+    }
+    if guest
+        .pinned_ip
+        .as_deref()
+        .is_none_or(|pin| pin.starts_with('~'))
+    {
+        warnings.push(
+            "Credential-free access requires a unique explicit IP pin. Use Approve + pin IP or Pin in host Settings."
+                .to_owned(),
+        );
     }
     if !forward.allows_guest(&guest.id) {
         warnings.push("This forward is not shared with the selected guest. Add its name to the forward's allowed guests and apply.".to_owned());
@@ -508,11 +516,11 @@ async fn mcp_guest_config(
     let key = format!("{name}-via-friendzone");
     Json(serde_json::json!({
         "endpoint": endpoint,
-        "authorization": authorization,
+        "authorization": null,
+        "identity": "source_ip",
         "warnings": warnings,
         "cline_config": {"mcpServers": {key: {"transport": {
-            "type": "streamableHttp", "url": endpoint,
-            "headers": {"Authorization": authorization}
+            "type": "streamableHttp", "url": endpoint
         }}}}
     }))
     .into_response()
@@ -769,6 +777,7 @@ fn bootstrap_router(state: BootstrapState) -> Router {
             }),
         )
         .route("/guest/jobs", post(submit_job).get(list_jobs))
+        .route("/guest/git-push", post(submit_git_push))
         .route("/guest/jobs/{id}", get(get_job).delete(delete_job))
         .route("/guest/jobs/{id}/cancel", post(cancel_job))
         .route("/mcp/{name}", post(mcp_message))
@@ -790,12 +799,15 @@ fn job_identity(
     headers: &axum::http::HeaderMap,
     peer: SocketAddr,
 ) -> Result<(String, uuid::Uuid)> {
-    let name = headers
+    let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .and_then(crate::proxy::basic_username)
-        .context("guest Basic authorization required")?;
-    if state.mcp.app.authorize(&name, peer.ip()) != crate::state::Authorization::Allowed {
+        .and_then(crate::proxy::basic_username);
+    let (name, authorization) = state
+        .mcp
+        .app
+        .authorize_proxy_peer(peer.ip(), presented.as_deref())?;
+    if authorization != crate::state::Authorization::Allowed {
         anyhow::bail!("guest awaiting approval or IP pin mismatch");
     }
     let (instance, _) = state
@@ -847,6 +859,113 @@ async fn submit_job(
         Err(e) => (StatusCode::CONFLICT, e.to_string()).into_response(),
     }
 }
+
+async fn submit_git_push(
+    State(state): State<BootstrapState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(input): axum::extract::Query<crate::pushes::Submission>,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let (name, _) = match job_identity(&state, &headers, peer) {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::FORBIDDEN, error.to_string()).into_response(),
+    };
+    if let Err(error) = crate::pushes::validate_submission(&input) {
+        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+    }
+    if headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/x-git-bundle")
+        || headers.contains_key(header::CONTENT_ENCODING)
+    {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Git push submissions require an unencoded application/x-git-bundle body",
+        )
+            .into_response();
+    }
+    if headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length == 0 || length > crate::pushes::MAX_BUNDLE as u64)
+    {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "Git bundle exceeds 32 MiB").into_response();
+    }
+    let Ok(_slot) = crate::pushes::upload_slots().clone().try_acquire_owned() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Git bundle upload slots busy",
+        )
+            .into_response();
+    };
+    let staging = match state.mcp.app.pushes.staging_path() {
+        Ok(path) => path,
+        Err(error) => {
+            return (StatusCode::INSUFFICIENT_STORAGE, error.to_string()).into_response();
+        }
+    };
+    let upload = async {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = tokio::fs::File::from_std(options.open(&staging)?);
+        let mut stream = request.into_body().into_data_stream();
+        let mut total = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("read Git bundle upload")?;
+            total = total
+                .checked_add(chunk.len() as u64)
+                .context("Git bundle size overflow")?;
+            if total > crate::pushes::MAX_BUNDLE as u64 {
+                anyhow::bail!("Git bundle exceeds 32 MiB");
+            }
+            file.write_all(&chunk).await?;
+        }
+        if total == 0 {
+            anyhow::bail!("Git bundle is empty");
+        }
+        file.sync_all().await?;
+        Ok::<u64, anyhow::Error>(total)
+    };
+    let total = match tokio::time::timeout(std::time::Duration::from_secs(60), upload).await {
+        Ok(Ok(total)) => total,
+        Ok(Err(error)) => {
+            let _ = tokio::fs::remove_file(&staging).await;
+            return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+        }
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&staging).await;
+            return (StatusCode::REQUEST_TIMEOUT, "Git bundle upload timed out").into_response();
+        }
+    };
+    match state.mcp.app.pushes.submit(
+        &state.mcp.app,
+        &state.settings,
+        &name,
+        peer.ip(),
+        crate::pushes::UploadedBundle {
+            submission: input,
+            staging: staging.clone(),
+            bytes: total,
+        },
+    ) {
+        Ok(value) => (StatusCode::ACCEPTED, Json(value)).into_response(),
+        Err(error) => {
+            let _ = tokio::fs::remove_file(staging).await;
+            (StatusCode::CONFLICT, error.to_string()).into_response()
+        }
+    }
+}
 #[derive(Deserialize)]
 struct JobSession {
     session_id: String,
@@ -859,7 +978,15 @@ async fn list_jobs(
 ) -> axum::response::Response {
     match job_identity(&state, &headers, peer) {
         Ok((name, instance)) => {
-            Json(state.mcp.app.jobs.list(&name, instance, &query.session_id)).into_response()
+            let mut jobs = state.mcp.app.jobs.list(&name, instance, &query.session_id);
+            jobs.extend(
+                state
+                    .mcp
+                    .app
+                    .pushes
+                    .list(&name, instance, &query.session_id),
+            );
+            Json(jobs).into_response()
         }
         Err(e) => (StatusCode::FORBIDDEN, e.to_string()).into_response(),
     }
@@ -872,11 +999,19 @@ async fn get_job(
     axum::extract::Query(query): axum::extract::Query<JobSession>,
 ) -> axum::response::Response {
     match job_identity(&state, &headers, peer).and_then(|(name, instance)| {
-        state
-            .mcp
-            .app
-            .jobs
-            .get(&name, instance, id, &query.session_id)
+        if state.mcp.app.pushes.contains(id) {
+            state
+                .mcp
+                .app
+                .pushes
+                .get(&name, instance, id, &query.session_id)
+        } else {
+            state
+                .mcp
+                .app
+                .jobs
+                .get(&name, instance, id, &query.session_id)
+        }
     }) {
         Ok(value) => Json(value).into_response(),
         Err(e) => (StatusCode::FORBIDDEN, e.to_string()).into_response(),
@@ -890,11 +1025,19 @@ async fn cancel_job(
     axum::extract::Query(query): axum::extract::Query<JobSession>,
 ) -> axum::response::Response {
     match job_identity(&state, &headers, peer).and_then(|(name, instance)| {
-        state
-            .mcp
-            .app
-            .jobs
-            .cancel(&name, instance, id, &query.session_id)
+        if state.mcp.app.pushes.contains(id) {
+            state
+                .mcp
+                .app
+                .pushes
+                .cancel(&name, instance, id, &query.session_id)
+        } else {
+            state
+                .mcp
+                .app
+                .jobs
+                .cancel(&name, instance, id, &query.session_id)
+        }
     }) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::CONFLICT, e.to_string()).into_response(),
@@ -908,11 +1051,19 @@ async fn delete_job(
     axum::extract::Query(query): axum::extract::Query<JobSession>,
 ) -> axum::response::Response {
     match job_identity(&state, &headers, peer).and_then(|(name, instance)| {
-        state
-            .mcp
-            .app
-            .jobs
-            .delete(&name, instance, id, &query.session_id)
+        if state.mcp.app.pushes.contains(id) {
+            state
+                .mcp
+                .app
+                .pushes
+                .delete(&name, instance, id, &query.session_id)
+        } else {
+            state
+                .mcp
+                .app
+                .jobs
+                .delete(&name, instance, id, &query.session_id)
+        }
     }) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::CONFLICT, e.to_string()).into_response(),
@@ -978,12 +1129,37 @@ async fn bootstrap_hello(
     State(state): State<BootstrapState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
     axum::extract::Query(query): axum::extract::Query<HelloQuery>,
-) -> Json<serde_json::Value> {
-    let authorization = state.mcp.app.authorize(&query.container, peer.ip());
+) -> axum::response::Response {
+    // Announce the label through the same source-owner check, then report whether
+    // this source is ready for credential-free traffic. Wildcard preapproval and
+    // a different label already owning this IP are not sufficient.
+    let named = state
+        .mcp
+        .app
+        .authorize_proxy_peer(peer.ip(), Some(&query.container));
+    if let Err(error) = named {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "container": query.container,
+                "approved": false,
+                "error": error.to_string(),
+            })),
+        )
+            .into_response();
+    }
+    let approved = state
+        .mcp
+        .app
+        .authorize_proxy_peer(peer.ip(), None)
+        .is_ok_and(|(owner, authorization)| {
+            owner == query.container && authorization == crate::state::Authorization::Allowed
+        });
     Json(serde_json::json!({
         "container": query.container,
-        "approved": authorization == crate::state::Authorization::Allowed,
+        "approved": approved,
     }))
+    .into_response()
 }
 
 /// Connection facts a guest needs to compose its environment: the
@@ -1003,7 +1179,8 @@ async fn bootstrap_env(State(state): State<BootstrapState>) -> impl IntoResponse
 }
 
 /// Container-facing MCP endpoint (streamable HTTP, JSON responses).
-/// Identity comes from the same Basic credentials as the proxy.
+/// Identity comes from the same unique source-IP pin as the proxy. A matching
+/// legacy Basic username remains accepted during migration.
 async fn mcp_message(
     State(state): State<BootstrapState>,
     Path(name): Path<String>,
@@ -1011,15 +1188,39 @@ async fn mcp_message(
     headers: axum::http::HeaderMap,
     Json(message): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let Some(container) = headers
+    let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(crate::proxy::basic_username)
-    else {
-        // Cline interprets every 401 as OAuth. This endpoint uses guest
-        // Basic identity, not OAuth; return a clear denial, not discovery.
-        return (StatusCode::FORBIDDEN, "Friendzone guest Authorization header is missing or invalid. In host Settings → MCP servers, use Connect guest → Copy Cline configuration. Remove stale oauth/oauthClient fields from the guest entry; upstream OAuth belongs on the host.").into_response();
+        .and_then(crate::proxy::basic_username);
+    let (container, authorization) = match state
+        .mcp
+        .app
+        .authorize_proxy_peer(peer.ip(), presented.as_deref())
+    {
+        Ok(identity) => identity,
+        Err(error) => {
+            let label = presented.unwrap_or_else(|| format!("ip:{}", peer.ip()));
+            let reason = format!("guest identity rejected: {error}");
+            let event = state.mcp.app.record_unattributed(
+                label,
+                "MCP identity".into(),
+                format!("mcp:{name}"),
+                crate::state::Verdict::Blocked,
+            );
+            state
+                .mcp
+                .app
+                .annotate(event, Some(403), Some(reason.clone()));
+            return (StatusCode::FORBIDDEN, format!("Friendzone {reason}")).into_response();
+        }
     };
+    if authorization != crate::state::Authorization::Allowed {
+        return (
+            StatusCode::FORBIDDEN,
+            "Friendzone guest is awaiting approval or IP pinning",
+        )
+            .into_response();
+    }
     let response =
         crate::mcp::handle_message(&state.mcp, &name, &container, peer.ip(), message).await;
     if response.is_null() {
@@ -1129,6 +1330,7 @@ async fn review_request(
         .reviews
         .inspect(id)
         .or_else(|| state.app.jobs.inspect(id))
+        .or_else(|| state.app.pushes.inspect(id))
     {
         Some(detail) => ([(header::CACHE_CONTROL, "no-store")], Json(detail)).into_response(),
         None => (
@@ -1246,7 +1448,12 @@ async fn decide_request(
         )
             .into_response();
     }
-    let result = if state.app.jobs.contains(id) {
+    let result = if state.app.pushes.contains(id) {
+        state
+            .app
+            .pushes
+            .decide(id, &request.fingerprint, request.decision)
+    } else if state.app.jobs.contains(id) {
         state
             .app
             .jobs
@@ -1316,8 +1523,8 @@ struct AddContainerRequest {
     name: String,
 }
 
-/// Registers a container ahead of traffic so its proxy credentials and
-/// section exist before the VM boots.
+/// Registers a human-readable policy label before the guest boots. An explicit
+/// unique IP pin is still required for credential-free runtime traffic.
 async fn add_container(
     State(state): State<UiState>,
     Json(request): Json<AddContainerRequest>,
@@ -1326,7 +1533,7 @@ async fn add_container(
     if name.is_empty() || name.contains(':') || name.contains('@') {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            "container names must be nonempty and contain no ':' or '@' (they become proxy usernames)",
+            "container names must be nonempty and contain no ':' or '@' (reserved for legacy identity compatibility)",
         )
             .into_response();
     }
@@ -1604,6 +1811,10 @@ mod tests {
         let app = AppState::load(&dir).unwrap();
         app.add_container("guest").unwrap();
         app.add_container("other").unwrap();
+        app.set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
+            .unwrap();
+        app.set_pinned_ip("other", Some("127.0.0.2".parse().unwrap()))
+            .unwrap();
         let registry = crate::mcp::ForwardRegistry::load(&dir, settings.clone()).unwrap();
         let guest = bootstrap_router(BootstrapState {
             cert: Arc::new("test".into()),
@@ -1640,20 +1851,11 @@ mod tests {
             req
         };
         let payload=serde_json::json!({"request_key":"large","session_id":"s","query":"mutation($body:String!){addComment(input:{subjectId:\"ID\",body:$body}){clientMutationId}}","variables":{"body":"x".repeat(90000)}}).to_string();
-        let denied = guest
-            .clone()
-            .oneshot(request("POST", "/guest/jobs", payload.clone(), None))
-            .await
-            .unwrap();
-        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            guest.clone().oneshot(request(
-                "POST",
-                "/guest/jobs",
-                payload.clone(),
-                Some("guest"),
-            )),
+            guest
+                .clone()
+                .oneshot(request("POST", "/guest/jobs", payload.clone(), None)),
         )
         .await
         .unwrap()
@@ -1685,7 +1887,7 @@ mod tests {
                 "POST",
                 &format!("/api/requests/{id}/decision"),
                 "{}".into(),
-                Some("guest"),
+                None,
             ))
             .await
             .unwrap();
@@ -1743,7 +1945,7 @@ mod tests {
         assert_eq!(value["status"], "denied");
         assert!(value["terminal"].as_bool().unwrap());
         let response = guest
-            .oneshot(request("POST", "/guest/jobs", payload, Some("guest")))
+            .oneshot(request("POST", "/guest/jobs", payload, None))
             .await
             .unwrap();
         let repeated: serde_json::Value = serde_json::from_slice(
@@ -2665,6 +2867,8 @@ mod tests {
             .unwrap();
         let app = AppState::default();
         app.add_container("scratch-kali").unwrap();
+        app.set_pinned_ip("scratch-kali", Some("127.0.0.1".parse().unwrap()))
+            .unwrap();
         let oauth = crate::mcp_oauth::OauthFlows::default();
         let forward = registry.get("Linear").unwrap();
         let url = oauth
@@ -2740,20 +2944,19 @@ mod tests {
             ));
             request
         };
-        let guest = bootstrap.clone().oneshot(make_guest(true)).await.unwrap();
+        let guest = bootstrap.clone().oneshot(make_guest(false)).await.unwrap();
         let text = axum::body::to_bytes(guest.into_body(), 8192).await.unwrap();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&text).unwrap()["result"]["tools"],
             serde_json::json!([{"name":"read"}])
         );
         assert!(!String::from_utf8_lossy(&text).contains("access-1"));
-        let missing = bootstrap.clone().oneshot(make_guest(false)).await.unwrap();
-        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
-        assert!(!missing.headers().contains_key(header::WWW_AUTHENTICATE));
-        let text = axum::body::to_bytes(missing.into_body(), 8192)
+        let legacy = bootstrap.clone().oneshot(make_guest(true)).await.unwrap();
+        assert_eq!(legacy.status(), StatusCode::OK);
+        let text = axum::body::to_bytes(legacy.into_body(), 8192)
             .await
             .unwrap();
-        assert!(String::from_utf8_lossy(&text).contains("Copy Cline configuration"));
+        assert!(!String::from_utf8_lossy(&text).contains("access-1"));
         assert_eq!(
             ui.clone()
                 .oneshot(request(format!(
@@ -2774,7 +2977,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(disconnected.status(), StatusCode::NO_CONTENT);
-        let guest = bootstrap.oneshot(make_guest(true)).await.unwrap();
+        let guest = bootstrap.oneshot(make_guest(false)).await.unwrap();
         assert_eq!(
             guest.status(),
             StatusCode::OK,
@@ -2954,24 +3157,20 @@ mod tests {
             &generated["cline_config"]["mcpServers"]["test-via-friendzone"]["transport"];
         assert_eq!(transport["type"], "streamableHttp");
         assert_eq!(transport["url"], "http://172.31.208.1:8082/mcp/test");
-        let authorization = transport["headers"]["Authorization"].as_str().unwrap();
-        assert_eq!(
-            crate::proxy::basic_username(authorization).as_deref(),
-            Some("guest")
-        );
-        assert_eq!(
-            transport["headers"].as_object().unwrap().len(),
-            1,
-            "no upstream headers copied"
-        );
+        assert!(transport.get("headers").is_none());
+        assert!(generated["authorization"].is_null());
+        assert_eq!(generated["identity"], "source_ip");
         assert_eq!(generated["warnings"], serde_json::json!([]));
         let endpoint = reqwest::Url::parse(transport["url"].as_str().unwrap()).unwrap();
-        let request = |auth: bool, address: SocketAddr| {
+        let request = |legacy: Option<&str>, address: SocketAddr| {
             // Consume the generated instructions through the real guest route.
             let mut builder =
                 Request::post(endpoint.path()).header("content-type", "application/json");
-            if auth {
-                builder = builder.header("authorization", authorization);
+            if let Some(legacy) = legacy {
+                builder = builder.header(
+                    "authorization",
+                    format!("Basic {}", STANDARD.encode(format!("{legacy}:x"))),
+                );
             }
             let mut request = builder
                 .body(Body::from(
@@ -2983,18 +3182,9 @@ mod tests {
                 .insert(axum::extract::ConnectInfo(address));
             request
         };
-        assert_eq!(
-            bootstrap
-                .clone()
-                .oneshot(request(false, peer))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::FORBIDDEN
-        );
         let allowed = bootstrap
             .clone()
-            .oneshot(request(true, peer))
+            .oneshot(request(None, peer))
             .await
             .unwrap();
         let body = axum::body::to_bytes(allowed.into_body(), 4096)
@@ -3006,19 +3196,31 @@ mod tests {
                 .get("result")
                 .is_some()
         );
+        assert_eq!(
+            bootstrap
+                .clone()
+                .oneshot(request(Some("other"), peer))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
         let wrong_ip = bootstrap
             .clone()
-            .oneshot(request(true, "127.0.0.2:12345".parse().unwrap()))
+            .oneshot(request(None, "127.0.0.2:12345".parse().unwrap()))
             .await
             .unwrap();
+        assert_eq!(wrong_ip.status(), StatusCode::FORBIDDEN);
         let body = axum::body::to_bytes(wrong_ip.into_body(), 4096)
             .await
             .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("no unique IP pin"));
         assert!(
-            serde_json::from_slice::<serde_json::Value>(&body)
-                .unwrap()
-                .get("error")
-                .is_some()
+            !app.view()
+                .containers
+                .iter()
+                .any(|guest| guest.id.starts_with("ip:")),
+            "an unmapped source may be logged but must not become a guest"
         );
         let invalid = ui
             .clone()
@@ -3120,11 +3322,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response["endpoint"], "http://broker.local:9082/mcp/linear");
-        assert_eq!(response["authorization"], "Basic c2NyYXRjaC1rYWxpOng=");
+        assert!(response["authorization"].is_null());
+        assert_eq!(response["identity"], "source_ip");
         assert_eq!(
             response["warnings"].as_array().unwrap().len(),
-            3,
-            "approval, kill and sharing warnings"
+            4,
+            "approval, kill, missing pin and sharing warnings"
         );
         assert_eq!(
             serde_json::to_value(app.view()).unwrap(),
@@ -3146,15 +3349,13 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            crate::proxy::basic_username(response["authorization"].as_str().unwrap()).as_deref(),
-            Some("guest-ü")
-        );
+        assert!(response["authorization"].is_null());
         assert!(
-            response["warnings"][0]
-                .as_str()
+            response["warnings"]
+                .as_array()
                 .unwrap()
-                .contains("loopback")
+                .iter()
+                .any(|warning| warning.as_str().unwrap().contains("loopback"))
         );
         assert_eq!(
             ui.clone()
@@ -3164,7 +3365,7 @@ mod tests {
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::UNPROCESSABLE_ENTITY
+            StatusCode::OK
         );
         assert_eq!(
             ui.clone()
@@ -3211,6 +3412,74 @@ mod tests {
             settings,
             proxy_port: 8080,
         })
+    }
+
+    #[tokio::test]
+    async fn bootstrap_hello_requires_the_requested_label_to_own_a_unique_ip_pin() {
+        let settings = test_settings();
+        let registry =
+            crate::mcp::ForwardRegistry::load(settings.data_dir(), settings.clone()).unwrap();
+        let app = AppState::default();
+        app.add_container("guest").unwrap();
+        let state = BootstrapState {
+            cert: Arc::new(String::new()),
+            binary: Arc::new(vec![]),
+            guest_binaries: Arc::default(),
+            mcp: crate::mcp::McpState::new(app.clone(), registry),
+            settings,
+            proxy_port: 8080,
+        };
+        let peer: SocketAddr = "192.0.2.10:4567".parse().unwrap();
+
+        let response = bootstrap_hello(
+            State(state.clone()),
+            axum::extract::ConnectInfo(peer),
+            axum::extract::Query(HelloQuery {
+                container: "guest".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["approved"], false);
+
+        app.set_pinned_ip("guest", Some(peer.ip())).unwrap();
+        let response = bootstrap_hello(
+            State(state.clone()),
+            axum::extract::ConnectInfo(peer),
+            axum::extract::Query(HelloQuery {
+                container: "guest".into(),
+            }),
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["approved"], true);
+
+        let response = bootstrap_hello(
+            State(state),
+            axum::extract::ConnectInfo(peer),
+            axum::extract::Query(HelloQuery {
+                container: "other".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            !app.view()
+                .containers
+                .iter()
+                .any(|guest| guest.id == "other")
+        );
     }
 
     #[tokio::test]

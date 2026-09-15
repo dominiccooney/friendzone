@@ -9,7 +9,7 @@ $script:fakeUser = @{ HTTP_PROXY = 'previous-proxy'; NO_PROXY = 'existing.exampl
 $script:writes = @()
 function Get-FzUserValue([string]$Name) { $script:fakeUser[$Name] }
 function Set-FzUserValue([string]$Name, $Value) { $script:writes += $Name; $script:fakeUser[$Name] = $Value }
-$values = [pscustomobject]@{ HTTP_PROXY = 'http://guest:x@192.0.2.1:8080'; NO_PROXY = '192.0.2.1,localhost,127.0.0.1'; CLINE_API_KEY = 'new-fake' }
+$values = [pscustomobject]@{ HTTP_PROXY = 'http://192.0.2.1:8080'; NO_PROXY = '192.0.2.1,localhost,127.0.0.1'; CLINE_API_KEY = 'new-fake' }
 $backup = Join-Path $TemporaryDirectory 'backup.json'
 Invoke-FzUserEnvironment $values $backup $false
 if ($script:fakeUser.HTTP_PROXY -cne $values.HTTP_PROXY) { throw 'proxy not persisted to mock' }
@@ -106,6 +106,22 @@ if ($env:FZ_HOST -ne '192.0.2.1') { throw 'wrong broker host' }
 if ($env:CLINE_API_KEY -cne "fake'`$(not-a-command)") { throw 'fake changed or evaluated' }
 if ($env:NO_PROXY -notmatch 'localhost' -or $env:NO_PROXY -notmatch '127.0.0.1') { throw 'loopback exclusions missing' }
 if($env:NODE_EXTRA_CA_CERTS -cne (Join-Path $configDir 'friendzone-ca.pem')){throw 'CA path with spaces/apostrophe did not survive activation'}
+if($env:CARGO_HTTP_CAINFO -cne (Join-Path $configDir 'friendzone-ca.pem')){throw 'Cargo CA path with spaces/apostrophe did not survive activation'}
+if($env:CARGO_HTTP_CHECK_REVOKE -cne 'false'){throw 'Cargo Schannel revocation override was not activated'}
+if($env:GIT_CONFIG_COUNT -cne '1' -or $env:GIT_CONFIG_KEY_0 -cne 'http.schannelUseSSLCAInfo' -or $env:GIT_CONFIG_VALUE_0 -cne 'true'){throw 'Schannel was not configured to use the Friendzone CA'}
+$git=Get-Command git -ErrorAction SilentlyContinue
+if($git){
+    if((& $git.Source config --get http.schannelUseSSLCAInfo) -cne 'true'){throw 'Git did not receive Schannel CA configuration'}
+}
+if((Get-Content -Raw -LiteralPath (Join-Path $configDir 'user-environment.json')) -notmatch 'http.schannelUseSSLCAInfo'){throw 'Schannel trust was not persisted'}
+$script:fakeUser.GIT_CONFIG_COUNT='2'
+$script:fakeUser.GIT_CONFIG_KEY_0='http.extraHeader'
+$script:fakeUser.GIT_CONFIG_VALUE_0='secret must not be copied'
+try{Invoke-FzConfigure $data $homeDir $configDir;throw 'expected invalid Git environment failure'}catch{if($_.Exception.Message -eq 'expected invalid Git environment failure'){throw}}
+$script:fakeUser.GIT_CONFIG_COUNT='1'
+$script:fakeUser.GIT_CONFIG_KEY_0='http.schannelUseSSLCAInfo'
+$script:fakeUser.GIT_CONFIG_VALUE_0='true'
+if([IO.File]::ReadAllText($EnvironmentFile) -cne $beforeEnv){throw 'invalid Git environment changed configuration'}
 if($env:CLINE_PLUGIN_IDLE_TIMEOUT_MS -ne 'user-original' -or $script:fakeUser.CLINE_PLUGIN_IDLE_TIMEOUT_MS -ne 'user-original'){throw "legacy managed idle override not restored (process='$($env:CLINE_PLUGIN_IDLE_TIMEOUT_MS)', user='$($script:fakeUser.CLINE_PLUGIN_IDLE_TIMEOUT_MS)')"}
 if((Get-Content -Raw -LiteralPath (Join-Path $configDir 'user-environment.json')) -match 'CLINE_PLUGIN_IDLE_TIMEOUT_MS'){throw 'legacy override retained in managed values'}
 if((Get-Content -Raw -LiteralPath $legacyBackup) -match 'CLINE_PLUGIN_IDLE_TIMEOUT_MS'){throw 'legacy backup entry retained'}
