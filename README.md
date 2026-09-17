@@ -96,7 +96,12 @@ Windows requires curl.exe and PowerShell 5.1 or 7.
 
 The script saves the CA, credential-free proxy URL, loopback exclusions and fake credentials, merges
 Cline provider settings, and persists user configuration. Linux gets idempotent
-profile hooks; Windows gets user-scoped environment values. Close guest Cline
+profile hooks; Windows gets user-scoped environment values plus the current-user
+Windows Internet proxy used by many .NET clients (not machine-wide WinHTTP).
+It also installs the exact Friendzone CA into the guest user's Windows Trusted
+Root store (`CurrentUser\Root`), not the machine-wide store. Prior proxy settings
+and Friendzone-owned certificate bytes are recorded for ownership-aware rollback.
+Close guest Cline
 before running the script because it updates that application's settings, then
 restart Cline from the activated environment.
 
@@ -126,10 +131,12 @@ Friendzone uses one shared upstream Hyper connection pool across all guest
 connections. TLS ALPN negotiates HTTP/2 when an origin supports it and falls
 back to HTTP/1.1 otherwise. Concurrent requests to an HTTP/2 origin multiplex
 over a shared connection instead of opening one TLS connection per inference.
-Idle upstream connections are retained for up to five minutes, with at most 16
-idle connections per origin. HTTP/2 connections use adaptive flow control and
-30-second keepalive pings with a 10-second acknowledgement timeout, including
-while idle, so dead pooled connections are detected before reuse.
+Idle upstream connections are retained for up to one minute, with at most 16
+idle connections per origin. HTTP/2 connections use adaptive flow control.
+Friendzone does not send application-level HTTP/2 keepalive PINGs: some provider
+edges reject aggressive ping schedules with GOAWAY. Active requests keep their
+connection alive normally; an uncertain POST failure is reported and never
+automatically replayed.
 
 Ordinary provider response bodies—including `application/json`—stream directly
 to the guest with backpressure; Friendzone does not collect them for optional
@@ -137,6 +144,33 @@ usage summaries. Only reviewed GitHub GraphQL JSON uses a bounded streaming
 observer, which does not delay or rewrite response bytes. Ordinary inference
 requests have no Friendzone concurrency semaphore; review and durable-job limits
 do not apply to them.
+
+An upstream transport failure returns HTTP 502 with the same bounded diagnostic
+stored in the request log. It reports connect vs send phase, elapsed milliseconds,
+negotiated protocol when known, and typed I/O/TLS/HTTP/2 facts. For example,
+`h2=remote_stream_reset; h2_reason=REFUSED_STREAM(7)` identifies a peer reset,
+while `io=ConnectionRefused; delivery=not_started` proves no connection was made.
+`delivery=uncertain` means a POST may have reached the provider; Friendzone does
+not replay it. Diagnostics contain broker-generated categories and numeric codes,
+never request/response content, arbitrary error strings, or credentials. Rows
+recorded by older broker builds as only `client error (SendRequest)` cannot be
+enriched after the fact; restart onto the new binary to capture the next failure.
+
+While transport diagnosis is enabled, stdout/stderr also logs each h2 connection
+open/close and the peer's actual numeric SETTINGS, for example
+`friendzone h2_peer_settings h2_connection=7 direction=upstream ...
+max_concurrent_streams=2147483647 ...`. It separately logs each forwarded
+request's broker UUID, normalized host, method/path (never query), active request
+counts, request-body timing, response protocol/status/content-type, time to
+headers/first body byte, completion time and bytes. Response-header lines include
+the upstream local/remote socket tuple; identical tuples are sound evidence that
+requests used the same pooled TCP/TLS connection. Connection lines include an
+observation timestamp and connection age/lifetime. Raw h2 tracing stays disabled
+because it can include HEADERS and credentials. Stock Hyper does not expose its
+physical h2 session ID on each response, so do not infer an exact request-to-
+`h2_connection` mapping; compare timestamps, open connection count, protocol and
+`active_host` instead. No prompts, response bodies, authorization values, or
+query strings are emitted by these diagnostics.
 
 ## GitHub policy
 
@@ -160,24 +194,27 @@ Bearer escrow entries. It goes through the same exact-token, host-pin and
 current-secret checks, then uses the configured upstream Bearer header.
 This does not inject credentials into anonymous or unrelated requests.
 
-Git must actually supply the fake token as its HTTPS password (through a
-credential helper or prompt). Exporting `GITHUB_TOKEN` alone does not make
-plain Git use it. The guest bootstrap does not install a Git credential
-helper; do not put the real token in the guest. No global Git configuration
-is changed by the broker.
-
-For an authenticated HTTPS Git read/fetch, use an invocation-scoped helper.
-This exact form works from a POSIX shell and PowerShell; replace only the final
-Git arguments:
+When a GitHub escrow entry exports the fake `GITHUB_TOKEN`, guest setup makes
+plain Git authentication automatic without modifying repository or user-global
+Git configuration. Normal reads work after setup and a fresh shell:
 
 ```sh
-git -c credential.helper= -c 'credential.helper=!f() { if test "$1" = get; then printf "%s\n" "username=x-access-token" "password=$GITHUB_TOKEN"; fi; }; f' fetch origin main
+git fetch origin main
+git lfs fetch origin HEAD
 ```
 
-The first empty helper disables inherited helpers for that invocation. The
-shell run by Git reads the guest's **fake** `GITHUB_TOKEN` at execution time;
-the value is not placed in the command line, remote URL, or persistent Git
-configuration. Do not print the token or substitute the host's real token.
+Setup writes a Friendzone-owned Git include containing the helper logic but no
+token value, then activates it through the managed environment. The credential
+block and helper both require exact HTTPS `github.com`; the helper returns
+`x-access-token` plus the current fake `GITHUB_TOKEN` only for that origin and
+clears stale earlier helpers there. It returns nothing for HTTP, subdomains,
+lookalike hosts, `api.github.com`, or other origins. Git LFS inherits this setup.
+Do not print the token, put it in a remote URL, or use the host's real token.
+
+Friendzone parses the bounded Git LFS batch body because both downloads and
+uploads use `POST`. Only a strict `operation: "download"` batch on the canonical
+GitHub LFS route flows automatically. Upload, malformed, compressed, oversized,
+or unsupported LFS batches remain blocked and cannot be manually approved.
 
 `GET .../info/refs?service=git-receive-pack` is push-service **discovery**, not
 a write. GitHub can return `401` with a Basic challenge before Git retries
@@ -206,12 +243,18 @@ git bundle create --version=2 "$PWD/feature.bundle" refs/heads/feature "^$base"
 ```
 
 Ask the agent to call `friendzone_submit_git_bundle` with that absolute path,
-`repository=owner/repo`, `branch=feature`, `base_branch=main`, and forty zeroes as
-`expected_oid`. An existing-branch update uses its exact current remote SHA as
-both the sole prerequisite and `expected_oid`, with `base_branch=branch`.
+`repository=owner/repo`, `branch=feature`, `base_oid=$base`, and forty zeroes as
+`expected_oid`. An ordinary existing-branch update uses its exact current remote
+SHA as both the sole prerequisite/`base_oid` and `expected_oid`.
+A rebased update uses the commit it actually rebased onto as the bundle
+prerequisite and the target branch's pre-rebase remote SHA as `expected_oid`.
+No named base branch is required. Friendzone fetches the exact `base_oid` from the
+fixed repository, verifies it against the bundle prerequisite, and rewrites the
+target only under the captured target lease.
 
-V1 allows one merge-free, linear, fast-forward `refs/heads/*` publication. It
-does not support tags, deletes, force updates, merge commits, multiple refs,
+V1 allows one merge-free, linear `refs/heads/*` history rooted at one exact
+repository-known prerequisite, including an exactly leased rebased target update. It does not support
+tags, deletes, unleased updates, merge commits, multiple refs,
 SHA-256 object IDs, LFS, or arbitrary remotes/refspecs/options. The broker uses
 the configured host GitHub credential, rechecks the target, pushes once with an
 exact `--force-with-lease`, and reads the ref back. Restart never replays an

@@ -15,7 +15,7 @@ the integration after restarting Cline; it does not cancel submitted jobs.
 - For large content, pass an **absolute guest `request_file` path** instead of
   inline GraphQL. File shape: `{"query":"…","variables":{},"operationName":null}`.
 - `friendzone_submit_git_bundle`: uploads an absolute Git bundle v2 path plus
-  repository, branch, base branch and exact expected target OID. It returns a
+  repository, target branch, exact prerequisite/base OID and exact expected target OID. It returns a
   durable job in `preparing`; approval is unavailable until the broker has
   validated the bundle and derived the full review described below.
 - `friendzone_get_request`: status, HTTP status, and the upstream response string.
@@ -156,18 +156,27 @@ the guest and submit it with `friendzone_submit_git_bundle`. The plugin uploads
 exact bytes directly to the fixed bootstrap origin without credentials,
 redirects, proxy interpretation, or automatic retries.
 
-The publication tool description tells the agent how to authenticate HTTPS Git
-reads/fetches with the guest's fake `GITHUB_TOKEN` without persisting it:
+When the broker has a GitHub escrow entry exposing the fake `GITHUB_TOKEN`, guest
+setup configures Git automatically. Ordinary HTTPS Git and LFS reads work:
 
 ```sh
-git -c credential.helper= -c 'credential.helper=!f() { if test "$1" = get; then printf "%s\n" "username=x-access-token" "password=$GITHUB_TOKEN"; fi; }; f' fetch origin main
+git fetch origin main
+git lfs fetch origin HEAD
 ```
 
-The same invocation works from POSIX shell and PowerShell because the outer
-single quotes preserve `$GITHUB_TOKEN` until Git runs its helper shell. The empty
-helper clears inherited helpers for this command. Never print the token, embed it
-in a URL, persist the helper, or put the host's real token in the guest. This
-authenticates reads/discovery only; ordinary `git push` remains blocked.
+Setup writes a Friendzone-owned include file containing no token value. Its
+credential block is scoped to exact HTTPS `github.com`; the helper independently
+checks that protocol and host, clears stale helpers for that origin, and reads the
+current fake `GITHUB_TOKEN` only when Git asks. It returns no Friendzone credential
+for HTTP, subdomains, lookalike hosts, `api.github.com`, or any other origin. Git
+LFS inherits the same configuration. Never print the token, embed it in a URL, or
+put the host's real token in the guest. Ordinary `git push` remains blocked.
+
+Both LFS downloads and uploads negotiate with JSON `POST` requests. Friendzone
+buffers at most the normal 64 KiB review-body limit and strictly validates the
+current Git LFS batch schema. Only `operation: "download"` on the canonical
+GitHub LFS endpoint flows; upload, malformed, compressed, oversized, duplicate,
+or unsupported envelopes remain blocked without entering Inbox.
 
 For a new `feature` branch based directly on the current `origin/main` tip:
 
@@ -178,15 +187,33 @@ git bundle create --version=2 "$PWD/feature.bundle" refs/heads/feature "^$base"
 ```
 
 Submit the absolute bundle path with `repository=owner/repo`, `branch=feature`,
-`base_branch=main`, and `expected_oid=0000000000000000000000000000000000000000`.
-For an existing branch update, fetch it first, use its exact remote tip as the
-single `^<oid>` prerequisite, set `base_branch` equal to the target branch, and
-pass that same 40-character SHA-1 as `expected_oid`.
+`base_oid=$base`, and `expected_oid=0000000000000000000000000000000000000000`.
+For an ordinary existing-branch update, fetch it first, use its exact remote tip
+as both the single `^<oid>` prerequisite/`base_oid` and `expected_oid`.
 
-V1 publishes exactly one `refs/heads/<branch>` fast-forward. It rejects tags,
-deletions, force updates, multiple refs/prerequisites, SHA-256 repositories,
-merge commits, non-linear ranges, and a prerequisite that is not the current
-declared base-branch tip. Limits include 100 commits, 1,000 per-commit path
+For a rebased update, capture the existing remote target before rebasing, rebase
+onto the current base branch, and make that base tip the bundle prerequisite:
+
+```sh
+git fetch origin main feature
+expected=$(git rev-parse origin/feature)
+git rebase origin/main feature
+base=$(git rev-parse origin/main)
+git bundle create --version=2 "$PWD/feature.bundle" refs/heads/feature "^$base"
+```
+
+Submit with `branch=feature`, `base_oid=$base`, and `expected_oid=$expected`.
+No named base branch is required. Friendzone fetches the exact prerequisite commit
+from the fixed repository and requires it to be a strict ancestor of the submitted
+head. The target must still equal the captured `feature` OID; approval publishes
+the rebased head using that exact target force-with-lease.
+
+V1 publishes exactly one linear `refs/heads/<branch>` history rooted at one
+exact prerequisite available from the fixed repository. It rejects tags,
+deletions, unleased updates, multiple
+refs/prerequisites, SHA-256 repositories,
+merge commits, non-linear ranges, a prerequisite the repository cannot supply,
+or a supplied `base_oid` that differs from the bundle header. Limits include 100 commits, 1,000 per-commit path
 entries, a 2 MiB binary-capable patch, 20,000 objects, 64 MiB expanded object
 content, and 16 MiB per object.
 
@@ -207,6 +234,14 @@ in the host data directory. Restart cancels preparing/pending/approved jobs;
 `Sending` becomes `Unknown` and is never replayed; completed outcomes remain
 retrievable. If upload/result delivery is uncertain, list/get existing jobs and
 inspect the remote branch before explicitly submitting again.
+
+The exact-`base_oid` contract uses push-job store version 2. On first startup,
+Friendzone automatically moves a version 1 metadata file and artifact directory
+into `git-push-jobs-v1-archive-<UTC>-<UUID>/` beside them, then starts an empty v2
+store. Legacy jobs remain available for audit but are never migrated, submitted,
+or replayed. The broker logs the absolute archive path. Unknown or corrupt store
+versions still stop startup and report the absolute offending path. This does not
+affect the separate async GraphQL job store.
 
 `async-jobs.json` in the broker data directory stores submitted content, token
 binding digests (not tokens), state, and results. It is private host data; Unix

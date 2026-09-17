@@ -1,9 +1,10 @@
 //! Request classification: reads flow, potential writes require review.
 //!
-//! Read vs write is semantic, not the HTTP method: git-upload-pack and
-//! GraphQL POSTs enter the bounded body-inspection path. The selected query
-//! operation flows automatically; mutations queue for one-shot review unless
-//! an explicitly saved comment permission admits a reconstructed addComment.
+//! Read vs write is semantic, not the HTTP method: git-upload-pack, Git LFS
+//! download batches, and GraphQL POSTs enter policy/body inspection. Selected
+//! GraphQL queries and strict LFS `operation: download` envelopes flow
+//! automatically; mutations queue for one-shot review unless an explicitly
+//! saved comment permission admits a reconstructed addComment.
 //! Unknown origins remain unpoliced while policy grows.
 
 use hudsucker::{Body, hyper::Request};

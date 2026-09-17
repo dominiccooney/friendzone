@@ -33,9 +33,17 @@ the installer does not download or upgrade Cline.
 
 The script contains a snapshot of the public CA, proxy port and fake keys from
 the broker at download time. It registers the guest directly with the broker,
-then writes the guest account's environment and Cline settings. Refetch before
-rerunning if the CA, broker address or fake keys have changed. Downloading a
+then writes the guest account's environment, Windows current-user proxy (on
+Windows), and Cline settings. Refetch before rerunning if the CA, broker address
+or fake keys have changed. Downloading a
 script never registers or approves a guest; the host Inbox still owns approval.
+
+When setup runs, the broker identifies the VM by its observed source IP. If that
+IP is already uniquely pinned to a guest, that existing guest name is canonical
+and setup uses it even when an old downloaded script requested another name.
+The script prints the replacement; it never creates a second identity for that
+IP. Registration failures now include the exact bootstrap URL, HTTP status, and
+the broker's recovery action before any guest settings are changed.
 
 The environment contains FZ_HOST/FZ_BROKER, credential-free HTTP_PROXY/HTTPS_PROXY, CA variables
 for common runtimes, and fake provider keys. NO_PROXY/no_proxy includes the
@@ -66,12 +74,15 @@ OAuth fields so they cannot override the fake key. Invalid provider JSON fails
 before environment/profile writes. Existing provider files get a backup.
 
 The script does not modify firewall rules, global/repository Git configuration,
-or the Windows system CA store. Runtime CA variables provide trust for supported
-clients. On Windows, setup also supplies `http.schannelUseSSLCAInfo=true` through
+or the Windows **LocalMachine** CA store. On Windows it installs the exact
+Friendzone CA into the guest user's Trusted Root Certification Authorities store
+(`CurrentUser\Root`), so same-user .NET/Schannel applications trust intercepted
+HTTPS without disabling verification. Runtime CA variables remain configured for
+clients that use explicit PEM bundles. Setup also supplies
+`http.schannelUseSSLCAInfo=true` through
 Git's `GIT_CONFIG_COUNT` environment interface. This makes Git for Windows'
 Schannel backend honor the managed
-`GIT_SSL_CAINFO` PEM without disabling verification or trusting the interception
-CA in every Windows application. Setup recognizes its exact entry on rerun but
+`GIT_SSL_CAINFO` PEM without disabling verification. Setup recognizes its exact entry on rerun but
 fails rather than copy or overwrite other `GIT_CONFIG_*` environment injection,
 which may contain secrets. Setup sets Cargo's native `CARGO_HTTP_CAINFO` to the
 same PEM, allowing its libcurl/Schannel registry and crate downloads to verify
@@ -80,9 +91,19 @@ Friendzone-issued certificates. On Windows it also sets
 certificates have no public CRL/OCSP responder, so Schannel otherwise rejects
 them when revocation status cannot be determined. This disables only Cargo's
 Windows revocation lookup; CA-chain, signature, expiry, and hostname verification
-remain enabled. Applications that ignore runtime CA settings still need their
-own trust configuration. Network confinement remains host-enforced; see
+remain enabled. Applications running as a different Windows user or using a private trust store
+still need their own trust configuration. Network confinement remains host-enforced; see
 [NETWORK-ISOLATION.md](NETWORK-ISOLATION.md).
+
+When the broker exposes a fake `GITHUB_TOKEN`, setup also writes a
+Friendzone-owned `friendzone.gitconfig` and loads it through the managed
+environment. It contains helper logic but no token value. The helper clears stale
+credential helpers and supplies the current fake token only for exact HTTPS
+`github.com`; HTTP, subdomains, lookalike hosts, `api.github.com`, and other
+origins receive no Friendzone credential. Git LFS inherits the same configuration.
+When no matching GitHub escrow entry exists, the managed include is a harmless
+marker-only file. Existing user-global and repository Git configuration is not
+edited.
 
 ## Linux persistence
 
@@ -111,23 +132,40 @@ are separate; do not overwrite unrelated later edits.
 ## Windows persistence
 
 Files live in `%APPDATA%\friendzone`. The script writes **User**, never
-**Machine**, environment values and activates its PowerShell process. Its
-children inherit the new environment; existing applications do not. Sign out
-and back in for GUI launchers, and restart guest agents/hubs. PowerShell
+**Machine**, environment values and activates its PowerShell process. It also
+sets the current user's Windows Internet Settings (`ProxyEnable`, `ProxyServer`,
+and `ProxyOverride`) to the credential-free Friendzone proxy. This is the proxy
+used by many WinINET-aware and modern .NET HTTP clients; it is not a machine-wide
+WinHTTP `netsh` change and cannot force software that ignores system proxy
+settings. The broker and explicit loopback forms are added to the bypass list;
+existing bypass entries are preserved. Its children inherit the new environment;
+existing applications do not. Sign out
+and back in for GUI launchers, and restart guest agents/hubs and existing
+`HttpClient` owners. PowerShell
 profiles are not required, so non-interactive and `-NoProfile` processes still
 inherit values from a fresh launcher.
 
-Before user-environment writes, `user-environment-backup.json` records original
-and applied values. Reruns retain the originals and skip unchanged writes. On
-write failure, completed writes are rolled back. To undo in the guest:
+Before writes, `user-environment-backup.json`, `system-proxy-backup.json`, and
+`certificate-trust-state.json` record original/applied settings and exact
+Friendzone-owned certificate bytes. Reruns retain originals, skip unchanged
+writes, and rotate only a root previously installed by Friendzone. A matching
+root that predated setup is used but never claimed. Environment, proxy, and CA
+updates form one transaction. To undo in the guest:
 
 ```powershell
 & "$env:APPDATA\friendzone\persist-environment.ps1" `
   -BackupPath "$env:APPDATA\friendzone\user-environment-backup.json" -Restore
 ```
 
-Rollback preserves externally changed variables with a warning. Start a fresh
-session afterward; already-inherited environment values do not disappear.
+Rollback removes only the exact current-user root recorded as installed by
+Friendzone and restores environment/proxy values that still equal Friendzone's
+applied values. Pre-existing roots and externally changed values are preserved.
+Start a fresh session/restart applications afterward;
+already-inherited environment values and cached proxy decisions do not disappear.
+
+The trust change is current-user only and requires no elevation. It is not a
+machine-wide `LocalMachine\Root` installation. Applications may cache trust and
+proxy state, so restart them after setup or rollback.
 
 ## First Windows guest acceptance
 
@@ -146,6 +184,10 @@ host-enforced network isolation in [NETWORK-ISOLATION.md](NETWORK-ISOLATION.md).
    `$env:HTTP_PROXY` point at the current host, and `$env:NO_PROXY` includes the
    host and loopback addresses. User environment values affect new launchers;
    old Cline hubs and already-running applications retain their old environment.
+   Check `Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' ProxyEnable,ProxyServer,ProxyOverride`
+   and confirm the user proxy points to the current Friendzone host/port. Confirm
+   `Get-ChildItem Cert:\CurrentUser\Root` contains the Friendzone Local CA shown
+   by the setup script's saved `friendzone-ca.pem` thumbprint.
 4. Verify the installed module **without executing it**. Use
    `(Get-Content -LiteralPath "$env:USERPROFILE/.cline/plugins/friendzone.js" -Tail 1)`;
    expect `module.exports=plugin;`. Substitute `$env:CLINE_DIR` for the `.cline`
@@ -161,7 +203,7 @@ host-enforced network isolation in [NETWORK-ISOLATION.md](NETWORK-ISOLATION.md).
 
 Tests cover PowerShell installation into temporary paths with spaces/apostrophes
 and Unicode, exact plugin bytes, idempotence, backups, unmanaged-file rejection,
-and **mocked** user-environment writes. Actual Windows guest inference, proxy/CA
+and **mocked** user-environment/system-proxy/root-store writes. Actual Windows guest inference, proxy/CA
 behavior, hub restart and steer-message delivery are acceptance checks—not claims
 implied by those installer tests.
 
@@ -180,7 +222,7 @@ Management routes remain unavailable on this listener.
 ## Validation boundary
 
 Tests execute script configuration against explicit temporary homes and local
-fixtures. Windows environment writes are mocked in memory. The developer's
+fixtures. Windows environment and Internet Settings writes are mocked in memory. The developer's
 real profiles, user registry, trust store, network settings and live broker
 are never used as installation test targets. Native zsh startup and real
 Windows persistence still require acceptance testing in a disposable guest.

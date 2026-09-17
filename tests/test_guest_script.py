@@ -14,6 +14,11 @@ import unittest
 from unittest import mock
 
 SOURCE = Path(__file__).resolve().parents[1] / "src/bootstrap/configure.py"
+GIT_CONFIG = '''# Friendzone managed Git configuration v1
+[credential "https://github.com"]
+\thelper =
+\thelper = "!fz_github_credential() { test \\"$1\\" = get || exit 0; protocol=; host=; while IFS= read -r line; do case \\"$line\\" in protocol=*) protocol=${line#protocol=} ;; host=*) host=${line#host=} ;; esac; done; test \\"$protocol\\" = https && test \\"$host\\" = github.com && test -n \\"$GITHUB_TOKEN\\" || exit 0; printf \\"%s\\\\n\\" \\"username=x-access-token\\" \\"password=$GITHUB_TOKEN\\"; }; fz_github_credential"
+'''
 spec = importlib.util.spec_from_file_location("configure", SOURCE)
 configure = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(configure)
@@ -27,7 +32,8 @@ class GuestScriptTests(unittest.TestCase):
         self.config = self.home / "config"
         self.data = dict(broker="http://192.0.2.1:9082", container="guest", proxy_port=9080,
                          plugin=base64.b64encode((SOURCE.parents[1] / "plugin/friendzone.js").read_bytes()).decode(),
-                         ca="CERTIFICATE", fakes={"CLINE_API_KEY": "fake'$(bad)", "OTHER_KEY": "other"})
+                         ca="CERTIFICATE", git_credential_config=GIT_CONFIG,
+                         fakes={"CLINE_API_KEY": "fake'$(bad)", "OTHER_KEY": "other", "GITHUB_TOKEN": "fz-test-github-token"})
 
     def apply(self, env=None):
         return configure.configure(self.data, self.home, self.config, self.home / "zsh", env or {})
@@ -47,6 +53,49 @@ class GuestScriptTests(unittest.TestCase):
         self.assertIn(configure.MARKER, (self.home / "zsh/.zshenv").read_text())
         self.assertNotIn("CLINE_PLUGIN_IDLE_TIMEOUT_MS", (self.config / "friendzone-env.sh").read_text())
         self.assertIn("export CARGO_HTTP_CAINFO=", (self.config / "friendzone-env.sh").read_text())
+        managed = (self.config / "friendzone.gitconfig").read_text()
+        self.assertEqual(managed, GIT_CONFIG)
+        self.assertIn("$GITHUB_TOKEN", managed)
+        self.assertNotIn("fz-test-github-token", managed)
+
+    def test_git_helper_is_automatic_and_exactly_github_scoped(self):
+        activation = self.apply()
+        bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "/bin/bash"
+        isolated = self.home / "isolated-global.gitconfig"
+        isolated.write_text('[credential]\n\thelper = !f() { if test "$1" = get; then printf "%s\\n" "username=stale" "password=stale"; fi; }; f\n')
+        command = r'''. "$1"
+test "$GIT_CONFIG_COUNT" = 1
+test "$GIT_CONFIG_KEY_0" = include.path
+test "$GIT_CONFIG_VALUE_0" = "$2"
+github=$(printf 'protocol=https\nhost=github.com\n\n' | GIT_TERMINAL_PROMPT=0 git credential fill)
+case "$github" in *'username=x-access-token'*'password=fz-test-github-token'*) ;; *) exit 10;; esac
+for input in 'protocol=http\nhost=github.com\n\n' 'protocol=https\nhost=github.com.evil.test\n\n' 'protocol=https\nhost=api.github.com\n\n'; do
+  output=$(printf "$input" | GIT_TERMINAL_PROMPT=0 git credential fill 2>&1 || true)
+  case "$output" in *fz-test-github-token*) exit 11;; esac
+done
+unset GITHUB_TOKEN
+output=$(printf 'protocol=https\nhost=github.com\n\n' | GIT_TERMINAL_PROMPT=0 git credential fill 2>&1 || true)
+case "$output" in *fz-test-github-token*|*username=x-access-token*) exit 12;; esac'''
+        result = subprocess.run([bash, "--noprofile", "--norc", "-ec", command, "test", str(activation), str(self.config / "friendzone.gitconfig")],
+                                env=dict(os.environ, HOME=str(self.home), GITHUB_TOKEN="outside", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=str(isolated)), capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_removing_github_escrow_retires_only_the_managed_fake(self):
+        self.apply()
+        old = self.data["fakes"].pop("GITHUB_TOKEN")
+        self.data["git_credential_config"] = "# Friendzone managed Git configuration v1\n"
+        activation = self.apply({"GITHUB_TOKEN": old})
+        environment = (self.config / "friendzone-env.sh").read_text()
+        self.assertNotIn("export GITHUB_TOKEN=", environment)
+        self.assertIn("unset GITHUB_TOKEN", environment)
+        self.assertEqual((self.config / "friendzone.gitconfig").read_text(), self.data["git_credential_config"])
+        bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "/bin/bash"
+        for current, expected in ((old, ""), ("external-token", "external-token")):
+            command = '. "$1"; printf "%s" "${GITHUB_TOKEN-}"'
+            result = subprocess.run([bash, "--noprofile", "--norc", "-ec", command, "test", str(activation)],
+                                    env=dict(os.environ, GITHUB_TOKEN=current), capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(result.stdout.decode(), expected)
 
     def test_plugin_install_is_idempotent_custom_home_and_preserves_other_plugins(self):
         cline = self.home / "custom Cline ü"
@@ -151,7 +200,7 @@ class GuestScriptTests(unittest.TestCase):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(b'{"approved":false}')
+                self.wfile.write(b'{"approved":false,"container":"canonical-guest","message":"Use host approval."}')
             def log_message(self, *args):
                 pass
         server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
@@ -170,8 +219,11 @@ class GuestScriptTests(unittest.TestCase):
                 mock.patch.dict(os.environ, environment, clear=True), contextlib.redirect_stdout(io.StringIO()) as output:
             configure.main(encoded)
         self.assertEqual(requests, ["/bootstrap/hello?container=guest"])
-        self.assertIn("Approve + pin IP in the host Inbox", output.getvalue())
+        self.assertIn("was replaced with canonical-guest", output.getvalue())
+        self.assertIn("Configured guest canonical-guest. Use host approval.", output.getvalue())
         self.assertEqual((self.home / "xdg/friendzone/friendzone-ca.pem").read_text(), "CERTIFICATE")
+        plugin = json.loads((self.home / ".cline/friendzone.json").read_text())
+        self.assertEqual(plugin["container"], "canonical-guest")
 
 
 if __name__ == "__main__":

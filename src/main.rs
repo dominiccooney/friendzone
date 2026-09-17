@@ -1,11 +1,13 @@
 mod bootstrap;
 mod browser;
 mod ca;
+mod diagnostics;
 mod doctor;
 mod github;
 mod graphql;
 mod guest_http;
 mod jobs;
+mod lfs;
 mod mcp;
 mod mcp_import;
 mod mcp_oauth;
@@ -62,11 +64,21 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("friendzone=info".parse()?),
-        )
+    use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
+
+    let normal = tracing_subscriber::fmt::layer().with_filter(
+        tracing_subscriber::EnvFilter::from_default_env()
+            .add_directive("fz=info".parse()?)
+            // Raw h2 TRACE events include HEADERS frames. The dedicated layer
+            // below exposes only normalized numeric peer SETTINGS.
+            .add_directive("h2=off".parse()?),
+    );
+    let h2_settings = diagnostics::H2SettingsLayer::default().with_filter(
+        tracing_subscriber::filter::filter_fn(diagnostics::h2_settings_metadata),
+    );
+    tracing_subscriber::registry()
+        .with(normal)
+        .with(h2_settings)
         .init();
 
     match Cli::parse().command {
@@ -95,6 +107,16 @@ async fn run_broker(
     data_dir: PathBuf,
 ) -> Result<()> {
     validate_listeners(proxy_addr, ui_addr, bootstrap_addr)?;
+    let data_dir = if data_dir.is_absolute() {
+        data_dir
+    } else {
+        std::env::current_dir()
+            .context("resolve current directory for --data-dir")?
+            .join(data_dir)
+    };
+    // Print this before loading any store so every startup failure is
+    // actionable even when the UI never starts.
+    println!("Friendzone data:      {}", data_dir.display());
     let files = AuthorityFiles::load_or_create(&data_dir)?;
     let issuer = files.issuer()?;
     let state = AppState::load(&data_dir)?;
@@ -129,7 +151,6 @@ async fn run_broker(
         names.sort();
         println!("Guest binaries:       {}", names.join(", "));
     }
-    println!("Friendzone data:      {}", data_dir.display());
     println!("Friendzone proxy:     http://{proxy_addr}");
     println!("Friendzone UI:        http://{ui_addr}");
     println!("Friendzone bootstrap: http://{bootstrap_addr}");

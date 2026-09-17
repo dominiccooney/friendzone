@@ -89,6 +89,17 @@ def configure(data, home, config, zdotdir, environ):
     if previous == str(wrapper):
         previous = ""
     old_environment = env.read_text(encoding="utf-8") if env.exists() else ""
+    old_github_token = None
+    if old_environment.startswith("# Friendzone guest environment\n"):
+        for line in old_environment.splitlines():
+            try:
+                fields = shlex.split(line)
+            except ValueError:
+                fields = []
+            if len(fields) == 2 and fields[0] == "export" and fields[1].startswith("GITHUB_TOKEN="):
+                if old_github_token is not None:
+                    raise ValueError("Invalid previous Friendzone GITHUB_TOKEN environment")
+                old_github_token = fields[1].split("=", 1)[1]
     legacy_idle = "export CLINE_PLUGIN_IDLE_TIMEOUT_MS=90000000\n"
     legacy_idle_marker = config / "remove-legacy-cline-idle-timeout"
     # The old generated file proves ownership. Preserve any user-authored value.
@@ -100,7 +111,20 @@ def configure(data, home, config, zdotdir, environ):
     values.update(FZ_HOST=origin.hostname, FZ_BROKER=data["broker"], HTTP_PROXY=proxy, HTTPS_PROXY=proxy, http_proxy=proxy, https_proxy=proxy)
     for key in ("NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "GIT_SSL_CAINFO", "GIT_PROXY_SSL_CAINFO", "CARGO_HTTP_CAINFO"):
         values[key] = str(cert)
+    git_config_text = data.get("git_credential_config") or ""
+    git_config = config / "friendzone.gitconfig"
+    if not git_config_text.startswith("# Friendzone managed Git configuration v1\n"):
+        raise ValueError("Invalid managed Git credential configuration")
+    expected = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "include.path", "GIT_CONFIG_VALUE_0": str(git_config)}
+    injected = {key: value for key, value in environ.items()
+                if key == "GIT_CONFIG_PARAMETERS" or key == "GIT_CONFIG_COUNT" or
+                key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_")}
+    if injected and injected != expected:
+        raise ValueError("Existing GIT_CONFIG_* environment entries conflict with Friendzone Git authentication")
+    values.update(expected)
     content = "# Friendzone guest environment\n" + "".join(f"export {key}={shlex.quote(value)}\n" for key, value in values.items())
+    if old_github_token is not None and "GITHUB_TOKEN" not in values:
+        content += "if [ \"${{GITHUB_TOKEN-}}\" = {0} ]; then unset GITHUB_TOKEN; fi\n".format(shlex.quote(old_github_token))
     if remove_legacy_idle:
         marker = shlex.quote(str(legacy_idle_marker))
         content += "if [ -r {0} ]; then\n  if [ \"${{CLINE_PLUGIN_IDLE_TIMEOUT_MS-}}\" = 90000000 ]; then unset CLINE_PLUGIN_IDLE_TIMEOUT_MS; fi\n  rm -f -- {0}\nfi\n".format(marker)
@@ -116,12 +140,14 @@ export NO_PROXY="$_fz_list" no_proxy="$_fz_list"
 unset _fz_rest _fz_list _fz_item
 '''
     source = ". " + shlex.quote(str(env)) + "\n"
-    edits = ([(legacy_idle_marker, "Friendzone previously managed the exact value 90000000; activation removes only that value.\n")] if remove_legacy_idle else []) + [(cert, data["ca"]), (env, content), (old_hook, previous),
+    edits = ([(legacy_idle_marker, "Friendzone previously managed the exact value 90000000; activation removes only that value.\n")] if remove_legacy_idle else []) + [(git_config, git_config_text), (cert, data["ca"]), (env, content), (old_hook, previous),
              (activation, source + "export BASH_ENV=" + shlex.quote(str(wrapper)) + "\n"),
              (wrapper, ("if [ -r {0} ]; then . {0}; fi\n".format(shlex.quote(previous)) if previous else "") + source)]
     profiles = {home / ".profile", home / ".bashrc", zdotdir / ".zshenv"}
     profiles.update(home / name for name in (".bash_profile", ".bash_login") if (home / name).exists())
     backups = []
+    if git_config.exists() and not git_config.read_text(encoding="utf-8").startswith("# Friendzone managed Git configuration v1\n"):
+        raise ValueError("Unmanaged friendzone.gitconfig exists; configuration unchanged")
     cline_home = Path(environ.get("CLINE_DIR", "").strip() or home / ".cline").absolute()
     plugin_path = cline_home / "plugins/friendzone.js"
     plugin_config = cline_home / "friendzone.json"
@@ -177,9 +203,17 @@ def main(encoded):
     url = data["broker"] + "/bootstrap/hello?" + urllib.parse.urlencode({"container": data["container"]})
     with client.open(url, timeout=10) as response:
         approval = json.load(response)
+    canonical = approval.get("container") if isinstance(approval, dict) else None
+    if not isinstance(canonical, str) or not canonical or ":" in canonical or len(canonical.encode()) > 128 or any(ord(character) < 32 or ord(character) == 127 for character in canonical):
+        raise ValueError("Friendzone registration did not return a valid guest name; no guest settings were changed")
+    requested = data["container"]
+    data["container"] = canonical
     home = Path.home()
     config = Path(os.environ.get("XDG_CONFIG_HOME", str(home / ".config"))) / "friendzone"
     activation = configure(data, home, config, os.environ.get("ZDOTDIR", str(home)), os.environ)
-    print("Configured guest " + data["container"] + ". " + ("Approved." if approval.get("approved") else "Use Approve + pin IP in the host Inbox."))
+    if canonical != requested:
+        print("Requested guest name " + requested + " was replaced with " + canonical + " because this VM source IP is already pinned to that guest.")
+    message = approval.get("message") or ("Approved and pinned." if approval.get("approved") else "Use Approve + pin IP in the host Inbox.")
+    print("Configured guest " + canonical + ". " + str(message))
     print("Installed the Friendzone Cline plugin for async GraphQL, reviewed Git publication, and session updates.")
     print("Activate this terminal, then restart guest Cline so it inherits the environment:\n  . " + shlex.quote(str(activation)))

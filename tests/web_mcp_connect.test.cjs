@@ -255,7 +255,7 @@ test("Git publication preparation cannot approve and refetches the derived revie
   const refetch=f.calls.at(-1);
   assert.equal(refetch.url,"/api/requests/request-id");
   assert.equal(element("request-approve").disabled,true,"summary-only transition must not enable approval");
-  const review={repository:"cline/cline",branch:"feature",base_branch:"main",expected_oid:"0".repeat(40),base_oid:"1".repeat(40),head_oid:"2".repeat(40),bundle_sha256:"3".repeat(64),bundle_bytes:123,
+  const review={repository:"cline/cline",branch:"feature",expected_oid:"0".repeat(40),base_oid:"1".repeat(40),head_oid:"2".repeat(40),bundle_sha256:"3".repeat(64),bundle_bytes:123,
     commits:[{oid:"2".repeat(40),parents:["1".repeat(40)],author:"A <script>",email:"a@example.test",authored_at:"2026-09-15T00:00:00Z",subject:"subject",message:"subject\n\n<body & detail>"}],
     files:[{commit_oid:"2".repeat(40),status:"R100",old_path:"old<script>",path:"new&name"}],patch:"diff --git a/x b/x\n+<script>literal patch</script>\n"};
   refetch.resolve({ok:true,json:async()=>({...preparing,status:"pending",updated_at:"2099-01-02T00:00:00Z",outcome:"Awaiting host approval",git_push:review})});
@@ -263,6 +263,7 @@ test("Git publication preparation cannot approve and refetches the derived revie
   assert.equal(element("request-approve").disabled,false);
   assert.equal(element("request-git-push").hidden,false);
   assert.match(element("request-git-push-refs").textContent,/refs\/heads\/feature.*Reviewed head OID/s);
+  assert.doesNotMatch(element("request-git-push-refs").textContent,/Base branch/);
   const commits=element("request-git-push-commits").innerHTML;
   assert.match(commits,/A &lt;script&gt;/);assert.match(commits,/&lt;body &amp; detail&gt;/);assert.doesNotMatch(commits,/<script>|<body/);
   const files=element("request-git-push-files").innerHTML;

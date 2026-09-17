@@ -748,6 +748,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures-util",
+ "h2",
  "http-body-util",
  "hudsucker",
  "hyper-rustls",

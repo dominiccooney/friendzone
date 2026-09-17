@@ -13,22 +13,26 @@ function Write-FzFile([string]$Path, [string]$Text) {
     } finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
 }
 function Set-FzProperty($Object, [string]$Name, $Value) { $Object | Add-Member -MemberType NoteProperty -Name $Name -Value $Value -Force }
-function Add-FzGitSchannelTrust($Values) {
+function Add-FzGitConfiguration($Values, [string]$GitConfigPath) {
     # Git for Windows defaults to Schannel, which intentionally ignores
     # GIT_SSL_CAINFO unless this Git option is enabled. Use one exact managed
-    # environment entry instead of changing Git config or the Windows root store.
+    # environment entries instead of editing user-global/repository Git config.
     # Never copy/overwrite arbitrary indexed entries: they may contain secrets.
-    $userCount=Get-FzUserValue 'GIT_CONFIG_COUNT'
-    $userKey=Get-FzUserValue 'GIT_CONFIG_KEY_0'
-    $userValue=Get-FzUserValue 'GIT_CONFIG_VALUE_0'
-    $managed=$userCount -ceq '1' -and $userKey -ceq 'http.schannelUseSSLCAInfo' -and $userValue -ceq 'true'
-    $userConflict=(-not [string]::IsNullOrEmpty($userCount) -or $null -ne $userKey -or $null -ne $userValue) -and -not $managed
-    $processManaged=$env:GIT_CONFIG_COUNT -ceq '1' -and $env:GIT_CONFIG_KEY_0 -ceq 'http.schannelUseSSLCAInfo' -and $env:GIT_CONFIG_VALUE_0 -ceq 'true'
-    $processConflict=(-not [string]::IsNullOrEmpty($env:GIT_CONFIG_COUNT) -or $null -ne $env:GIT_CONFIG_KEY_0 -or $null -ne $env:GIT_CONFIG_VALUE_0) -and -not $processManaged
+    $userCount=Get-FzUserValue 'GIT_CONFIG_COUNT';$userKey=Get-FzUserValue 'GIT_CONFIG_KEY_0';$userValue=Get-FzUserValue 'GIT_CONFIG_VALUE_0'
+    $userLegacy=$userCount -ceq '1' -and $userKey -ceq 'http.schannelUseSSLCAInfo' -and $userValue -ceq 'true' -and $null-eq(Get-FzUserValue 'GIT_CONFIG_KEY_1') -and $null-eq(Get-FzUserValue 'GIT_CONFIG_VALUE_1')
+    $userCurrent=$userCount -ceq '2' -and $userKey -ceq 'http.schannelUseSSLCAInfo' -and $userValue -ceq 'true' -and (Get-FzUserValue 'GIT_CONFIG_KEY_1') -ceq 'include.path' -and (Get-FzUserValue 'GIT_CONFIG_VALUE_1') -ceq $GitConfigPath
+    $userPresent=(-not [string]::IsNullOrEmpty($userCount) -or $null-ne$userKey -or $null-ne$userValue -or $null-ne(Get-FzUserValue 'GIT_CONFIG_KEY_1') -or $null-ne(Get-FzUserValue 'GIT_CONFIG_VALUE_1') -or -not [string]::IsNullOrEmpty((Get-FzUserValue 'GIT_CONFIG_PARAMETERS')))
+    $userConflict=$userPresent -and -not $userLegacy -and -not $userCurrent
+    $processLegacy=$env:GIT_CONFIG_COUNT -ceq '1' -and $env:GIT_CONFIG_KEY_0 -ceq 'http.schannelUseSSLCAInfo' -and $env:GIT_CONFIG_VALUE_0 -ceq 'true' -and $null-eq$env:GIT_CONFIG_KEY_1 -and $null-eq$env:GIT_CONFIG_VALUE_1
+    $processCurrent=$env:GIT_CONFIG_COUNT -ceq '2' -and $env:GIT_CONFIG_KEY_0 -ceq 'http.schannelUseSSLCAInfo' -and $env:GIT_CONFIG_VALUE_0 -ceq 'true' -and $env:GIT_CONFIG_KEY_1 -ceq 'include.path' -and $env:GIT_CONFIG_VALUE_1 -ceq $GitConfigPath
+    $processPresent=(-not [string]::IsNullOrEmpty($env:GIT_CONFIG_COUNT) -or $null-ne$env:GIT_CONFIG_KEY_0 -or $null-ne$env:GIT_CONFIG_VALUE_0 -or $null-ne$env:GIT_CONFIG_KEY_1 -or $null-ne$env:GIT_CONFIG_VALUE_1 -or -not [string]::IsNullOrEmpty($env:GIT_CONFIG_PARAMETERS))
+    $processConflict=$processPresent -and -not $processLegacy -and -not $processCurrent
     if($userConflict -or $processConflict){throw 'Existing GIT_CONFIG_* environment entries conflict with Friendzone Git trust; configuration unchanged'}
     $Values.GIT_CONFIG_COUNT='1'
     $Values.GIT_CONFIG_KEY_0='http.schannelUseSSLCAInfo'
     $Values.GIT_CONFIG_VALUE_0='true'
+    $Values.GIT_CONFIG_COUNT='2'
+    $Values.GIT_CONFIG_KEY_1='include.path';$Values.GIT_CONFIG_VALUE_1=$GitConfigPath
 }
 function Get-FzProviderJson([string]$Path, [string]$Fake) {
     $root=if(Test-Path -LiteralPath $Path){Get-Content -Raw -Encoding UTF8 -LiteralPath $Path | ConvertFrom-Json}else{[pscustomobject]@{}}
@@ -49,6 +53,10 @@ function Get-FzProviderJson([string]$Path, [string]$Fake) {
 }
 function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirectory, [string]$ClineDirectory) {
     $cert=Join-Path $ConfigDirectory 'friendzone-ca.pem'
+    $gitConfig=Join-Path $ConfigDirectory 'friendzone.gitconfig'
+    $gitConfigText=[string]$Data.git_credential_config
+    if(-not $gitConfigText.StartsWith("# Friendzone managed Git configuration v1`n")){throw 'Invalid managed Git credential configuration'}
+    if((Test-Path -LiteralPath $gitConfig)-and-not([IO.File]::ReadAllText($gitConfig).StartsWith("# Friendzone managed Git configuration v1`n"))){throw 'Unmanaged friendzone.gitconfig exists; configuration unchanged'}
     $envFile=Join-Path $ConfigDirectory 'friendzone-env.ps1'
     $origin=[Uri]$Data.broker
     $builder=New-Object UriBuilder('http',$origin.Host,[int]$Data.proxy_port)
@@ -60,15 +68,19 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     $values.CARGO_HTTP_CHECK_REVOKE='false'
     foreach($property in $Data.fakes.PSObject.Properties) {$values[$property.Name]=[string]$property.Value}
     $values.NO_PROXY=$origin.DnsSafeHost+',localhost,127.0.0.1,::1,[::1]'
-    Add-FzGitSchannelTrust $values
+    Add-FzGitConfiguration $values $gitConfig
     $lines=@('# Friendzone guest environment')
     $oldValuesPath=Join-Path $ConfigDirectory 'user-environment.json'
     $legacyIdleMarker=Join-Path $ConfigDirectory 'remove-legacy-cline-idle-timeout'
     $removeLegacyIdle=(Test-Path -LiteralPath $legacyIdleMarker)
     $legacyIdlePrevious=$null
+    $oldValues=$null
+    $retiredGithubToken=$null
     $backupPath=Join-Path $ConfigDirectory 'user-environment-backup.json'
+    $systemProxyBackupPath=Join-Path $ConfigDirectory 'system-proxy-backup.json'
+    $certificateTrustStatePath=Join-Path $ConfigDirectory 'certificate-trust-state.json'
     if(Test-Path -LiteralPath $oldValuesPath){
-        try{$oldValues=Get-Content -Raw -LiteralPath $oldValuesPath|ConvertFrom-Json;$removeLegacyIdle=$removeLegacyIdle -or ($oldValues.CLINE_PLUGIN_IDLE_TIMEOUT_MS -ceq '90000000')}catch{}
+        try{$oldValues=Get-Content -Raw -LiteralPath $oldValuesPath|ConvertFrom-Json;$removeLegacyIdle=$removeLegacyIdle -or ($oldValues.CLINE_PLUGIN_IDLE_TIMEOUT_MS -ceq '90000000');if($null-ne$oldValues.PSObject.Properties['GITHUB_TOKEN']-and-not$values.ContainsKey('GITHUB_TOKEN')){$retiredGithubToken=[string]$oldValues.GITHUB_TOKEN}}catch{}
     }
     if($removeLegacyIdle -and (Test-Path -LiteralPath $legacyIdleMarker)){
         try{$legacyIdlePrevious=(Get-Content -Raw -LiteralPath $legacyIdleMarker|ConvertFrom-Json).previous}catch{}
@@ -78,6 +90,7 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     foreach($key in $values.Keys) {
         if ($key -ne 'NO_PROXY') {$lines += '[Environment]::SetEnvironmentVariable('+(Quote-FzPowerShell $key)+','+(Quote-FzPowerShell $values[$key])+",'Process')"}
     }
+    if($null-ne$retiredGithubToken){$lines += 'if ($env:GITHUB_TOKEN -ceq '+(Quote-FzPowerShell $retiredGithubToken)+') { Remove-Item Env:GITHUB_TOKEN }'}
     $lines += '$env:NO_PROXY = @(('+ (Quote-FzPowerShell $values.NO_PROXY) + ' + '','' + $env:NO_PROXY).Split('','') | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique) -join '','''
     if($removeLegacyIdle){
         if($null -eq $legacyIdlePrevious){$restoreIdle='Remove-Item Env:CLINE_PLUGIN_IDLE_TIMEOUT_MS'}
@@ -100,34 +113,83 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     foreach($path in @($pluginPath,$pluginConfig)){if((Test-Path -LiteralPath $path) -and -not (Test-Path -LiteralPath ($path+'.backup'))){Copy-Item -LiteralPath $path -Destination ($path+'.backup')}}
     Write-FzFile $pluginPath $plugin
     Write-FzFile $pluginConfig $pluginJson
+    Write-FzFile $gitConfig $gitConfigText
     if($removeLegacyIdle){Write-FzFile $legacyIdleMarker (ConvertTo-Json -InputObject @{previous=$legacyIdlePrevious})}
     Write-FzFile $cert $Data.ca
     Write-FzFile $envFile ($lines -join "`n")
     if($providerJson){Write-FzFile $provider $providerJson}
     $valuesPath=$oldValuesPath
     Write-FzFile $valuesPath (ConvertTo-Json -InputObject $values)
-    Invoke-FzUserEnvironment ([pscustomobject]$values) $backupPath $false
+    Invoke-FzWindowsPersistence ([pscustomobject]$values) $backupPath $systemProxyBackupPath $cert $certificateTrustStatePath $false
+    if($null-ne$retiredGithubToken){Remove-FzManagedUserValue 'GITHUB_TOKEN' $retiredGithubToken $backupPath}
     if($removeLegacyIdle){Remove-FzManagedUserValue 'CLINE_PLUGIN_IDLE_TIMEOUT_MS' '90000000' $backupPath}
     return $envFile
 }
-function Start-FzGuestSetup($Data) {
-    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {throw 'Select the Linux script on non-Windows guests'}
-    if (-not $Data.container) {$Data.container=[Environment]::MachineName}
-    if ($Data.container.Contains(':') -or [Text.Encoding]::UTF8.GetByteCount($Data.container) -gt 128) {throw 'Invalid guest name'}
+function Format-FzRegistrationDetail($Value, [int]$Limit=2048) {
+    $text=[regex]::Replace([string]$Value,'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]',' ')
+    if($text.Length-gt$Limit){return $text.Substring(0,$Limit)+'...'}
+    $text
+}
+function Test-FzGuestName([string]$Name) {
+    -not [string]::IsNullOrWhiteSpace($Name) -and
+    -not $Name.Contains(':') -and
+    [Text.Encoding]::UTF8.GetByteCount($Name) -le 128 -and
+    @($Name.ToCharArray() | Where-Object { [char]::IsControl($_) }).Count -eq 0
+}
+function Invoke-FzRegistrationRequest([string]$Url) {
     Add-Type -AssemblyName System.Net.Http
     $handler=New-Object Net.Http.HttpClientHandler
     $handler.UseProxy=$false; $handler.AllowAutoRedirect=$false
     $client=New-Object Net.Http.HttpClient($handler); $client.Timeout=[TimeSpan]::FromSeconds(10)
+    $response=$null
     try {
-        $response=$client.GetAsync($Data.broker+'/bootstrap/hello?container='+[Uri]::EscapeDataString($Data.container)).GetAwaiter().GetResult()
-        if([int]$response.StatusCode -ne 200){throw 'Broker could not register this guest; configuration unchanged'}
-        $approval=$response.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
-        $config=Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'friendzone'
-        Write-FzFile (Join-Path $config 'persist-environment.ps1') ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Data.persistence)))
-        $envFile=Invoke-FzConfigure $Data ([Environment]::GetFolderPath('UserProfile')) $config $env:CLINE_DIR
-        . $envFile
-        Write-Host ('Configured guest '+$Data.container+'. '+$(if($approval.approved){'Approved.'}else{'Use Approve + pin IP in the host Inbox.'}))
-        Write-Host 'Installed the Friendzone Cline plugin for async GraphQL, reviewed Git publication, and session updates.'
-        Write-Host 'Restart guest Cline from this terminal. Sign out/in to refresh other Windows launchers.'
-    } finally {$client.Dispose();$handler.Dispose()}
+        $response=$client.GetAsync($Url).GetAwaiter().GetResult()
+        [pscustomobject]@{status=[int]$response.StatusCode;reason=[string]$response.ReasonPhrase;body=$response.Content.ReadAsStringAsync().GetAwaiter().GetResult()}
+    } finally {if($null-ne$response){$response.Dispose()};$client.Dispose();$handler.Dispose()}
+}
+function Invoke-FzGuestRegistration($Data) {
+    $url=$Data.broker+'/bootstrap/hello?container='+[Uri]::EscapeDataString($Data.container)
+    try{$reply=Invoke-FzRegistrationRequest $url}
+    catch{throw ('Could not contact Friendzone at '+$url+': '+(Format-FzRegistrationDetail $_.Exception.Message)+'. No guest settings were changed. Verify the broker bootstrap address and VM network route.')}
+    $body=[string]$reply.body
+    if([int]$reply.status-ne 200){
+        $detail=$null
+        try{
+            $failure=$body|ConvertFrom-Json
+            $parts=@()
+            foreach($name in @('error','action','message')){if(-not[string]::IsNullOrWhiteSpace([string]$failure.$name)){$parts+=Format-FzRegistrationDetail $failure.$name}}
+            if($parts.Count){$detail=$parts-join ' '}
+        }catch{}
+        if([string]::IsNullOrWhiteSpace($detail)){$detail=Format-FzRegistrationDetail $body}
+        if([string]::IsNullOrWhiteSpace($detail)){$detail='The broker returned no explanation.'}
+        throw ('Friendzone rejected guest setup at '+$url+' with HTTP '+[int]$reply.status+' ('+[string]$reply.reason+'): '+$detail+' No guest settings were changed. Check host Settings > Guests, then rerun setup.')
+    }
+    try{
+        try{$approval=$body|ConvertFrom-Json}
+        catch{throw ('Friendzone returned invalid registration data from '+$url+'. No guest settings were changed. Restart or update the broker, then rerun setup.')}
+        $container=[string]$approval.container
+        if(-not(Test-FzGuestName $container)){throw ('Friendzone registration data from '+$url+' did not identify a valid guest. No guest settings were changed.')}
+        return $approval
+    }catch{throw}
+}
+function Start-FzGuestSetup($Data) {
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {throw 'Select the Linux script on non-Windows guests'}
+    if (-not $Data.container) {$Data.container=[Environment]::MachineName}
+    if (-not(Test-FzGuestName ([string]$Data.container))) {throw 'Invalid guest name'}
+    $requested=[string]$Data.container
+    $approval=Invoke-FzGuestRegistration $Data
+    if([string]$approval.container-cne$requested){
+        Write-Warning ('Requested guest name '+$requested+' was replaced with '+[string]$approval.container+' because this VM source IP is already pinned to that guest.')
+        $Data.container=[string]$approval.container
+    }
+    $config=Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'friendzone'
+    Write-FzFile (Join-Path $config 'persist-environment.ps1') ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Data.persistence)))
+    $envFile=Invoke-FzConfigure $Data ([Environment]::GetFolderPath('UserProfile')) $config $env:CLINE_DIR
+    . $envFile
+    $registrationMessage=[string]$approval.message
+    if([string]::IsNullOrWhiteSpace($registrationMessage)){$registrationMessage=if($approval.approved){'Approved and pinned.'}else{'Use Approve + pin IP in the host Inbox.'}}
+    Write-Host ('Configured guest '+$Data.container+'. '+$registrationMessage)
+    Write-Host 'Installed the Friendzone Cline plugin for async GraphQL, reviewed Git publication, and session updates.'
+    Write-Host 'Trusted the Friendzone CA and configured the current-user Windows Internet proxy. Restart applications that cache proxy or TLS settings.'
+    Write-Host 'Restart guest Cline from this terminal. Sign out/in to refresh other Windows launchers.'
 }

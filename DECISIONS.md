@@ -336,7 +336,8 @@ Attacks and workflows the design must survive, each with its resolution.
 - GraphQL mutations on the wire and their argument-level scoping. Writes
   buffer through the inbox instead.
 - GitHub App short-lived tokens, when the org constraint lifts.
-- Git LFS, release assets, ghcr.io.
+- Git LFS uploads, release assets, ghcr.io. Strict GitHub LFS download batches
+  are supported through the existing HTTPS read policy.
 - Other code hosts: GitLab, Bitbucket, Azure DevOps.
 - Linux hosts; cloud containers likely arrive first.
 - Remote monitoring (Android, web).

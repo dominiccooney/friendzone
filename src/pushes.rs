@@ -53,7 +53,9 @@ pub struct Submission {
     pub session_id: String,
     pub repository: String,
     pub branch: String,
-    pub base_branch: String,
+    /// Exact bundle prerequisite and review boundary. It must match the
+    /// bundle header; branch names have no role in selecting this commit.
+    pub base_oid: String,
     pub expected_oid: String,
 }
 
@@ -89,7 +91,6 @@ pub struct FileReview {
 pub struct Review {
     pub repository: String,
     pub branch: String,
-    pub base_branch: String,
     pub expected_oid: String,
     pub base_oid: String,
     pub head_oid: String,
@@ -184,14 +185,13 @@ impl Job {
             summary: self.summary(),
             headers: vec![],
             body: format!(
-                "Repository: {}\nTarget: refs/heads/{}\nExpected remote OID: {}\nBase: {} ({})\nHead: {}\nBundle SHA-256: {}",
+                "Repository: {}\nTarget: refs/heads/{}\nExpected remote OID: {}\nReview base OID: {}\nHead: {}\nBundle SHA-256: {}",
                 self.submission.repository,
                 self.submission.branch,
                 self.submission.expected_oid,
                 review
                     .map(|review| review.base_oid.as_str())
                     .unwrap_or("(preparing)"),
-                self.submission.base_branch,
                 review
                     .map(|review| review.head_oid.as_str())
                     .unwrap_or("(preparing)"),
@@ -215,6 +215,11 @@ struct Saved {
     jobs: BTreeMap<Uuid, Job>,
 }
 
+#[derive(Deserialize)]
+struct SavedVersion {
+    version: u32,
+}
+
 struct Inner {
     data: Mutex<Saved>,
     metadata_path: Option<PathBuf>,
@@ -229,7 +234,7 @@ impl Pushes {
     pub fn new(changes: tokio::sync::watch::Sender<u64>) -> Self {
         Self(Arc::new(Inner {
             data: Mutex::new(Saved {
-                version: 1,
+                version: 2,
                 ..Default::default()
             }),
             metadata_path: None,
@@ -241,76 +246,150 @@ impl Pushes {
     pub fn load(dir: &Path, changes: tokio::sync::watch::Sender<u64>) -> Result<Self> {
         let metadata_path = dir.join("git-push-jobs.json");
         let artifacts = dir.join("git-push-jobs");
-        private_dir(&artifacts)?;
+        let recovery = || {
+            format!(
+                "Move {} and {} into a backup directory together, then restart Friendzone. Nothing was changed.",
+                metadata_path.display(),
+                artifacts.display()
+            )
+        };
         let mut saved: Saved = match std::fs::read(&metadata_path) {
             Ok(bytes) => {
                 if bytes.len() > 64 * 1024 * 1024 {
-                    bail!("Git push job store exceeds the metadata limit");
+                    bail!(
+                        "Saved Git push history at {} exceeds the 64 MiB limit. {}",
+                        metadata_path.display(),
+                        recovery()
+                    );
                 }
-                serde_json::from_slice(&bytes).context("invalid Git push job store")?
+                let version: SavedVersion = serde_json::from_slice(&bytes).with_context(|| {
+                    format!(
+                        "Saved Git push history at {} is unreadable. {}",
+                        metadata_path.display(),
+                        recovery()
+                    )
+                })?;
+                if version.version == 1 {
+                    let archive = archive_version_one(dir, &metadata_path, &artifacts)?;
+                    tracing::warn!(
+                        archive = %archive.display(),
+                        "older Git push history was archived and will not be executed; starting with an empty push history"
+                    );
+                    Saved {
+                        version: 2,
+                        ..Default::default()
+                    }
+                } else if version.version == 2 {
+                    serde_json::from_slice(&bytes).with_context(|| {
+                        format!(
+                            "Saved Git push history at {} is invalid. {}",
+                            metadata_path.display(),
+                            recovery()
+                        )
+                    })?
+                } else {
+                    bail!(
+                        "Saved Git push history at {} uses an unsupported format (version {}). {}",
+                        metadata_path.display(),
+                        version.version,
+                        recovery()
+                    );
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Saved {
-                version: 1,
+                version: 2,
                 ..Default::default()
             },
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Could not read saved Git push history at {}. {}",
+                        metadata_path.display(),
+                        recovery()
+                    )
+                });
+            }
         };
-        if saved.version != 1 || saved.jobs.len() > MAX_JOBS {
-            bail!("unsupported Git push job store");
-        }
-        let mut stored_bytes = 0u64;
-        for (id, job) in &saved.jobs {
-            if job.id != *id {
-                bail!("Git push job key/ID mismatch");
+        private_dir(&artifacts).with_context(|| {
+            format!("create Git push artifact directory {}", artifacts.display())
+        })?;
+        (|| -> Result<()> {
+            if saved.version != 2 {
+                bail!("unexpected format version {}", saved.version);
             }
-            validate_submission(&job.submission).context("invalid saved Git push submission")?;
-            if job.bundle_bytes == 0 || job.bundle_bytes > MAX_BUNDLE as u64 {
-                bail!("saved Git push bundle has an invalid size");
+            if saved.jobs.len() > MAX_JOBS {
+                bail!("more than {MAX_JOBS} saved publications");
             }
-            stored_bytes = stored_bytes
-                .checked_add(job.bundle_bytes)
-                .context("saved Git push storage size overflow")?;
-            if stored_bytes > MAX_STORAGE {
-                bail!("saved Git push artifacts exceed the storage limit");
-            }
-            let job_root = artifacts.join(id.to_string());
-            let root_metadata = std::fs::symlink_metadata(&job_root)
-                .context("saved Git push artifact directory is missing")?;
-            if !root_metadata.file_type().is_dir() || root_metadata.file_type().is_symlink() {
-                bail!("saved Git push artifact directory is not a regular directory");
-            }
-            let bundle = job_root.join("submission.bundle");
-            let metadata =
-                std::fs::symlink_metadata(&bundle).context("saved Git push bundle is missing")?;
-            if !metadata.file_type().is_file()
-                || metadata.file_type().is_symlink()
-                || metadata.len() != job.bundle_bytes
-            {
-                bail!("saved Git push bundle does not match its metadata");
-            }
-            validate_sha256(&job.bundle_sha256)?;
-            let digest = sha256_file_sync(&bundle).context("hash saved Git push bundle")?;
-            if digest != job.bundle_sha256
-                || fingerprint(&job.submission, &digest, &job.binding) != job.fingerprint
-            {
-                bail!("saved Git push bundle fingerprint does not match its metadata");
-            }
-            match (&job.review, job.status) {
-                (None, Status::Preparing | Status::Blocked | Status::Cancelled) => {}
-                (Some(review), _) => {
-                    if review.repository != job.submission.repository
-                        || review.branch != job.submission.branch
-                        || review.base_branch != job.submission.base_branch
-                        || review.expected_oid != job.submission.expected_oid.to_ascii_lowercase()
-                        || review.bundle_sha256 != job.bundle_sha256
-                        || review.bundle_bytes != job.bundle_bytes
-                    {
-                        bail!("saved Git push review does not match its submission");
-                    }
+            let mut stored_bytes = 0u64;
+            for (id, job) in &saved.jobs {
+                if job.id != *id {
+                    bail!("publication {id} has a mismatched ID");
                 }
-                _ => bail!("saved Git push job is missing its derived review"),
+                validate_submission(&job.submission)
+                    .with_context(|| format!("publication {id} has invalid request metadata"))?;
+                if job.bundle_bytes == 0 || job.bundle_bytes > MAX_BUNDLE as u64 {
+                    bail!("publication {id} has an invalid bundle size");
+                }
+                stored_bytes = stored_bytes
+                    .checked_add(job.bundle_bytes)
+                    .context("saved bundle sizes overflow")?;
+                if stored_bytes > MAX_STORAGE {
+                    bail!("saved bundles exceed the storage limit");
+                }
+                let job_root = artifacts.join(id.to_string());
+                let root_metadata = std::fs::symlink_metadata(&job_root).with_context(|| {
+                    format!("publication {id} is missing its artifact directory")
+                })?;
+                if !root_metadata.file_type().is_dir() || root_metadata.file_type().is_symlink() {
+                    bail!("publication {id} has an unsafe artifact directory");
+                }
+                let bundle = job_root.join("submission.bundle");
+                let metadata = std::fs::symlink_metadata(&bundle)
+                    .with_context(|| format!("publication {id} is missing its Git bundle"))?;
+                if !metadata.file_type().is_file()
+                    || metadata.file_type().is_symlink()
+                    || metadata.len() != job.bundle_bytes
+                {
+                    bail!("publication {id} has a Git bundle that does not match its metadata");
+                }
+                validate_sha256(&job.bundle_sha256)?;
+                let digest = sha256_file_sync(&bundle)
+                    .with_context(|| format!("could not verify publication {id}'s Git bundle"))?;
+                if digest != job.bundle_sha256
+                    || fingerprint(&job.submission, &digest, &job.binding) != job.fingerprint
+                {
+                    bail!("publication {id} failed its integrity check");
+                }
+                match (&job.review, job.status) {
+                    (None, Status::Preparing | Status::Blocked | Status::Cancelled) => {}
+                    (Some(review), _) => {
+                        if review.repository != job.submission.repository
+                            || review.branch != job.submission.branch
+                            || !job
+                                .submission
+                                .base_oid
+                                .eq_ignore_ascii_case(&review.base_oid)
+                            || review.expected_oid
+                                != job.submission.expected_oid.to_ascii_lowercase()
+                            || review.bundle_sha256 != job.bundle_sha256
+                            || review.bundle_bytes != job.bundle_bytes
+                        {
+                            bail!("publication {id}'s review does not match its request");
+                        }
+                    }
+                    _ => bail!("publication {id} is missing its derived review"),
+                }
             }
-        }
+            Ok(())
+        })()
+        .with_context(|| {
+            format!(
+                "Saved Git push history in {} and {} cannot be used safely. {}",
+                metadata_path.display(),
+                artifacts.display(),
+                recovery()
+            )
+        })?;
         for job in saved.jobs.values_mut() {
             match job.status {
                 Status::Sending => job.set(
@@ -868,11 +947,8 @@ pub(crate) fn validate_submission(input: &Submission) -> Result<()> {
     }
     validate_repository(&input.repository)?;
     validate_branch(&input.branch)?;
-    validate_branch(&input.base_branch)?;
+    validate_oid(&input.base_oid, false)?;
     validate_oid(&input.expected_oid, true)?;
-    if input.expected_oid != ZERO_OID && input.base_branch != input.branch {
-        bail!("updates require base_branch to equal the target branch");
-    }
     Ok(())
 }
 
@@ -974,7 +1050,7 @@ fn fingerprint(input: &Submission, bundle_sha256: &str, binding: &Binding) -> St
     for value in [
         input.repository.as_bytes(),
         input.branch.as_bytes(),
-        input.base_branch.as_bytes(),
+        input.base_oid.as_bytes(),
         input.expected_oid.as_bytes(),
         bundle_sha256.as_bytes(),
         binding.entry.as_bytes(),
@@ -995,8 +1071,8 @@ async fn prepare_remote(
     remote: &str,
 ) -> Result<Review> {
     let header = read_bundle_header(bundle, &input.branch).await?;
-    if input.expected_oid != ZERO_OID && input.expected_oid != header.base_oid {
-        bail!("updates require expected_oid to equal the bundle prerequisite");
+    if !input.base_oid.eq_ignore_ascii_case(&header.base_oid) {
+        bail!("base_oid must exactly match the bundle's sole prerequisite OID");
     }
     let bundle_sha256 = sha256_file(bundle).await?;
     let repo = root.join("repository.git");
@@ -1032,7 +1108,6 @@ async fn prepare_remote(
     } else if current.as_deref() != Some(input.expected_oid.as_str()) {
         bail!("target branch does not match expected_oid; refresh before submitting");
     }
-    let base_ref = format!("refs/heads/{}", input.base_branch);
     let base_destination = "refs/friendzone/base";
     git(
         &repo,
@@ -1043,7 +1118,7 @@ async fn prepare_remote(
             "--depth=1",
             "--no-tags",
             remote,
-            &format!("{base_ref}:{base_destination}"),
+            &format!("{}:{base_destination}", header.base_oid),
         ],
         Some(token),
         None,
@@ -1051,10 +1126,11 @@ async fn prepare_remote(
         MAX_GIT_OUTPUT,
     )
     .await?
-    .success("fetch declared base branch")?;
-    let base_tip = rev_parse(&repo, base_destination).await?;
-    if header.base_oid != base_tip {
-        bail!("bundle prerequisite must equal the current declared GitHub base branch tip");
+    .success("fetch exact bundle prerequisite from repository")?;
+    if rev_parse(&repo, base_destination).await? != header.base_oid
+        || rev_type(&repo, base_destination).await? != "commit"
+    {
+        bail!("bundle prerequisite is not the exact repository commit requested");
     }
     let baseline_objects = all_objects(&repo).await?;
     let bundle_text = bundle.to_string_lossy().into_owned();
@@ -1092,8 +1168,14 @@ async fn prepare_remote(
     if rev_type(&repo, &head_oid).await? != "commit" {
         bail!("bundle head must be a commit");
     }
-    if !is_ancestor(&repo, &header.base_oid, &head_oid).await? || header.base_oid == head_oid {
-        bail!("bundle head must be a nonempty fast-forward descendant of its base");
+    if header.base_oid == head_oid {
+        bail!(
+            "Git publication has no commits after prerequisite {}; choose an exact ancestor commit strictly before the submitted head",
+            header.base_oid
+        );
+    }
+    if !is_ancestor(&repo, &header.base_oid, &head_oid).await? {
+        bail!("bundle head must descend from its exact prerequisite commit");
     }
     validate_objects(&repo, &header.base_oid, &head_oid, &baseline_objects).await?;
     let commits = commits(&repo, &header.base_oid, &head_oid).await?;
@@ -1102,7 +1184,6 @@ async fn prepare_remote(
     Ok(Review {
         repository: input.repository.clone(),
         branch: input.branch.clone(),
-        base_branch: input.base_branch.clone(),
         expected_oid: input.expected_oid.to_ascii_lowercase(),
         base_oid: header.base_oid,
         head_oid,
@@ -1448,8 +1529,13 @@ async fn commits(repo: &Path, base: &str, head: &str) -> Result<Vec<CommitReview
         .lines()
         .map(str::to_owned)
         .collect();
-    if oids.is_empty() || oids.len() > MAX_COMMITS {
-        bail!("Git publication must contain 1 to {MAX_COMMITS} commits");
+    if oids.is_empty() {
+        bail!(
+            "Git publication has no commits after prerequisite {base}; choose an exact ancestor commit strictly before submitted head {head}"
+        );
+    }
+    if oids.len() > MAX_COMMITS {
+        bail!("Git publication contains more than {MAX_COMMITS} commits");
     }
     let mut result = Vec::with_capacity(oids.len());
     let mut expected_parent = base.to_owned();
@@ -1481,7 +1567,7 @@ async fn commits(repo: &Path, base: &str, head: &str) -> Result<Vec<CommitReview
             .collect();
         if parents != [expected_parent.as_str()] {
             bail!(
-                "v1 Git publication requires linear, merge-free commits based directly on the declared base"
+                "v1 Git publication requires linear, merge-free commits based directly on the exact prerequisite"
             );
         }
         let message = review_text("commit message", fields[5], true, 32 * 1024)?;
@@ -1819,6 +1905,65 @@ fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Version 1 used the removed named-base schema. Keep its bytes available for
+/// audit, but make it impossible for the current worker to execute them. Both
+/// paths move into one unique sibling directory before a fresh v2 store starts.
+fn archive_version_one(dir: &Path, metadata: &Path, artifacts: &Path) -> Result<PathBuf> {
+    let archive = dir.join(format!(
+        "git-push-jobs-v1-archive-{}-{}",
+        Utc::now().format("%Y%m%dT%H%M%SZ"),
+        Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir(&archive).with_context(|| {
+        format!(
+            "create archive {} for obsolete Git push store {}; nothing was moved",
+            archive.display(),
+            metadata.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("secure legacy Git push archive {}", archive.display()))?;
+    }
+    let archived_metadata = archive.join("git-push-jobs.json");
+    if let Err(error) = std::fs::rename(metadata, &archived_metadata) {
+        let _ = std::fs::remove_dir(&archive);
+        return Err(error).with_context(|| {
+            format!(
+                "archive obsolete Git push metadata {} to {}; nothing was moved",
+                metadata.display(),
+                archived_metadata.display()
+            )
+        });
+    }
+    if artifacts.exists() {
+        let archived_artifacts = archive.join("git-push-jobs");
+        if let Err(error) = std::fs::rename(artifacts, &archived_artifacts) {
+            let rollback = std::fs::rename(&archived_metadata, metadata);
+            let _ = std::fs::remove_dir(&archive);
+            return match rollback {
+                Ok(()) => Err(error).with_context(|| {
+                    format!(
+                        "archive obsolete Git push artifacts {} to {}; metadata move was rolled back and startup made no change",
+                        artifacts.display(),
+                        archived_artifacts.display()
+                    )
+                }),
+                Err(rollback_error) => anyhow::bail!(
+                    "could not archive obsolete Git push artifacts {} to {} ({error}); metadata is preserved at {}, but restoring it to {} also failed ({rollback_error})",
+                    artifacts.display(),
+                    archived_artifacts.display(),
+                    archived_metadata.display(),
+                    metadata.display()
+                ),
+            };
+        }
+    }
+    Ok(archive)
+}
+
 // Small local equivalent avoids adding a runtime dependency for one cleanup guard.
 mod scopeguard {
     pub struct ScopeGuard<T, F: FnOnce(T)> {
@@ -1927,6 +2072,91 @@ mod tests {
         (temp, remote, bundle, base, head)
     }
 
+    fn rebased_publication_fixture() -> (TestDir, PathBuf, PathBuf, String, String, String) {
+        let temp = TestDir::new();
+        let remote = temp.0.join("remote.git");
+        let work = temp.0.join("work");
+        std::fs::create_dir(&remote).unwrap();
+        std::fs::create_dir(&work).unwrap();
+        fixture_git(&remote, &["init", "--bare", "--initial-branch=master"]);
+        fixture_git(&work, &["init", "--initial-branch=master"]);
+        fixture_git(&work, &["config", "user.name", "Rebase Author"]);
+        fixture_git(&work, &["config", "user.email", "rebase@example.test"]);
+        std::fs::write(work.join("base.txt"), "base\n").unwrap();
+        fixture_git(&work, &["add", "base.txt"]);
+        fixture_git(&work, &["commit", "-m", "initial base"]);
+        let remote_text = remote.to_string_lossy().into_owned();
+        fixture_git(&work, &["push", &remote_text, "master"]);
+
+        fixture_git(&work, &["switch", "-c", "feature"]);
+        std::fs::write(work.join("feature.txt"), "feature before rebase\n").unwrap();
+        fixture_git(&work, &["add", "feature.txt"]);
+        fixture_git(&work, &["commit", "-m", "feature change"]);
+        let old_target = fixture_git(&work, &["rev-parse", "HEAD"]);
+        fixture_git(&work, &["push", &remote_text, "feature"]);
+
+        fixture_git(&work, &["switch", "master"]);
+        std::fs::write(work.join("main.txt"), "new main base\n").unwrap();
+        fixture_git(&work, &["add", "main.txt"]);
+        fixture_git(&work, &["commit", "-m", "advance main"]);
+        let base = fixture_git(&work, &["rev-parse", "HEAD"]);
+        fixture_git(&work, &["push", &remote_text, "master"]);
+
+        fixture_git(&work, &["switch", "feature"]);
+        fixture_git(&work, &["rebase", "master"]);
+        let head = fixture_git(&work, &["rev-parse", "HEAD"]);
+        assert_ne!(head, old_target);
+        let bundle = temp.0.join("rebased-feature.bundle");
+        let bundle_text = bundle.to_string_lossy().into_owned();
+        fixture_git(
+            &work,
+            &[
+                "bundle",
+                "create",
+                &bundle_text,
+                "refs/heads/feature",
+                &format!("^{base}"),
+            ],
+        );
+        // Model the practical race: main advances after the rebase and bundle
+        // creation, while the exact prerequisite remains in repository history.
+        fixture_git(&work, &["switch", "master"]);
+        std::fs::write(work.join("later-main.txt"), "main advanced again\n").unwrap();
+        fixture_git(&work, &["add", "later-main.txt"]);
+        fixture_git(&work, &["commit", "-m", "advance main after bundle"]);
+        fixture_git(&work, &["push", &remote_text, "master"]);
+        assert_ne!(
+            fixture_git(&remote, &["rev-parse", "refs/heads/master"]),
+            base
+        );
+        (temp, remote, bundle, base, old_target, head)
+    }
+
+    fn sending_job(input: Submission, review: Review) -> Job {
+        Job {
+            id: Uuid::new_v4(),
+            container: "guest".into(),
+            instance: Uuid::new_v4(),
+            epoch: Uuid::new_v4(),
+            peer: "127.0.0.1".parse().unwrap(),
+            submission: input,
+            bundle_sha256: review.bundle_sha256.clone(),
+            bundle_bytes: review.bundle_bytes,
+            review: Some(review),
+            fingerprint: "test".into(),
+            binding: Binding {
+                entry: "test".into(),
+                digest: "0".repeat(64),
+            },
+            status: Status::Sending,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            outcome: String::new(),
+            result: None,
+        }
+    }
+
     #[tokio::test]
     async fn real_bundle_derives_exact_review_and_creation_lease_publishes_once() {
         let (temp, remote, bundle, base, head) = publication_fixture();
@@ -1935,7 +2165,7 @@ mod tests {
             session_id: "session".into(),
             repository: "fixture/repository".into(),
             branch: "feature".into(),
-            base_branch: "master".into(),
+            base_oid: base.clone(),
             expected_oid: ZERO_OID.into(),
         };
         let root = temp.0.join("inspect");
@@ -2004,6 +2234,216 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebased_update_uses_base_prerequisite_and_independent_target_lease() {
+        let (temp, remote, bundle, base, old_target, head) = rebased_publication_fixture();
+        let input = Submission {
+            request_key: "publish-rebased-feature".into(),
+            session_id: "session".into(),
+            repository: "fixture/repository".into(),
+            branch: "feature".into(),
+            base_oid: base.clone(),
+            expected_oid: old_target.clone(),
+        };
+        validate_submission(&input).unwrap();
+        let root = temp.0.join("inspect");
+        private_dir(&root).unwrap();
+        let remote_text = remote.to_string_lossy().into_owned();
+        let review = prepare_remote(
+            &root,
+            &bundle,
+            &input,
+            "",
+            std::fs::metadata(&bundle).unwrap().len(),
+            &remote_text,
+        )
+        .await
+        .unwrap();
+        assert_eq!(review.expected_oid, old_target);
+        assert_eq!(review.base_oid, base);
+        assert_eq!(review.head_oid, head);
+        assert_eq!(review.commits.len(), 1);
+        assert_eq!(review.commits[0].parents, vec![base.clone()]);
+        assert_eq!(review.commits[0].subject, "feature change");
+        std::fs::copy(&bundle, root.join("submission.bundle")).unwrap();
+        let job = sending_job(input, review);
+        let result = execute_remote(&root, &job, "", &remote_text).await.unwrap();
+        assert!(result.contains("feature"));
+        assert_eq!(
+            fixture_git(&remote, &["rev-parse", "refs/heads/feature"]),
+            head
+        );
+
+        let (stale_temp, stale_remote, stale_bundle, stale_base, stale_target, _) =
+            rebased_publication_fixture();
+        let stale_input = Submission {
+            request_key: "stale-target".into(),
+            session_id: "session".into(),
+            repository: "fixture/repository".into(),
+            branch: "feature".into(),
+            base_oid: stale_base.clone(),
+            expected_oid: stale_target.clone(),
+        };
+        let stale_root = stale_temp.0.join("inspect");
+        private_dir(&stale_root).unwrap();
+        let stale_remote_text = stale_remote.to_string_lossy().into_owned();
+        let stale_review = prepare_remote(
+            &stale_root,
+            &stale_bundle,
+            &stale_input,
+            "",
+            std::fs::metadata(&stale_bundle).unwrap().len(),
+            &stale_remote_text,
+        )
+        .await
+        .unwrap();
+        std::fs::copy(&stale_bundle, stale_root.join("submission.bundle")).unwrap();
+        fixture_git(
+            &stale_remote,
+            &["update-ref", "refs/heads/feature", &stale_base],
+        );
+        let error = execute_remote(
+            &stale_root,
+            &sending_job(stale_input, stale_review),
+            "",
+            &stale_remote_text,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("target branch changed after review")
+        );
+        assert_eq!(
+            fixture_git(&stale_remote, &["rev-parse", "refs/heads/feature"]),
+            stale_base
+        );
+
+        let (base_temp, base_remote, base_bundle, base_tip, base_target, _) =
+            rebased_publication_fixture();
+        let base_root = base_temp.0.join("inspect");
+        private_dir(&base_root).unwrap();
+        let base_remote_text = base_remote.to_string_lossy().into_owned();
+        let review = prepare_remote(
+            &base_root,
+            &base_bundle,
+            &Submission {
+                request_key: "advanced-base".into(),
+                session_id: "session".into(),
+                repository: "fixture/repository".into(),
+                branch: "feature".into(),
+                base_oid: base_tip.clone(),
+                expected_oid: base_target.clone(),
+            },
+            "",
+            std::fs::metadata(&base_bundle).unwrap().len(),
+            &base_remote_text,
+        )
+        .await
+        .unwrap();
+        assert_eq!(review.base_oid, base_tip);
+        assert_ne!(
+            fixture_git(&base_remote, &["rev-parse", "refs/heads/master"]),
+            base_tip
+        );
+
+        let mismatched_root = base_temp.0.join("mismatched-base");
+        private_dir(&mismatched_root).unwrap();
+        let error = prepare_remote(
+            &mismatched_root,
+            &base_bundle,
+            &Submission {
+                request_key: "mismatched-base".into(),
+                session_id: "session".into(),
+                repository: "fixture/repository".into(),
+                branch: "feature".into(),
+                base_oid: "1".repeat(40),
+                expected_oid: base_target.clone(),
+            },
+            "",
+            std::fs::metadata(&base_bundle).unwrap().len(),
+            &base_remote_text,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("base_oid must exactly match the bundle's sole prerequisite")
+        );
+
+        let unpublished = TestDir::new();
+        let unpublished_remote = unpublished.0.join("remote.git");
+        let unpublished_work = unpublished.0.join("work");
+        std::fs::create_dir(&unpublished_remote).unwrap();
+        std::fs::create_dir(&unpublished_work).unwrap();
+        fixture_git(
+            &unpublished_remote,
+            &["init", "--bare", "--initial-branch=master"],
+        );
+        fixture_git(&unpublished_work, &["init", "--initial-branch=master"]);
+        fixture_git(&unpublished_work, &["config", "user.name", "Local Author"]);
+        fixture_git(
+            &unpublished_work,
+            &["config", "user.email", "local@example.test"],
+        );
+        std::fs::write(unpublished_work.join("base.txt"), "remote base\n").unwrap();
+        fixture_git(&unpublished_work, &["add", "base.txt"]);
+        fixture_git(&unpublished_work, &["commit", "-m", "remote base"]);
+        let unpublished_remote_text = unpublished_remote.to_string_lossy().into_owned();
+        fixture_git(
+            &unpublished_work,
+            &["push", &unpublished_remote_text, "master"],
+        );
+        std::fs::write(unpublished_work.join("local.txt"), "local only\n").unwrap();
+        fixture_git(&unpublished_work, &["add", "local.txt"]);
+        fixture_git(
+            &unpublished_work,
+            &["commit", "-m", "unpublished prerequisite"],
+        );
+        let unpublished_base = fixture_git(&unpublished_work, &["rev-parse", "HEAD"]);
+        fixture_git(&unpublished_work, &["switch", "-c", "feature"]);
+        std::fs::write(unpublished_work.join("feature.txt"), "feature\n").unwrap();
+        fixture_git(&unpublished_work, &["add", "feature.txt"]);
+        fixture_git(&unpublished_work, &["commit", "-m", "feature"]);
+        let unpublished_bundle = unpublished.0.join("feature.bundle");
+        fixture_git(
+            &unpublished_work,
+            &[
+                "bundle",
+                "create",
+                &unpublished_bundle.to_string_lossy(),
+                "refs/heads/feature",
+                &format!("^{unpublished_base}"),
+            ],
+        );
+        let unpublished_root = unpublished.0.join("inspect");
+        private_dir(&unpublished_root).unwrap();
+        let error = prepare_remote(
+            &unpublished_root,
+            &unpublished_bundle,
+            &Submission {
+                request_key: "unpublished-base".into(),
+                session_id: "session".into(),
+                repository: "fixture/repository".into(),
+                branch: "feature".into(),
+                base_oid: unpublished_base.clone(),
+                expected_oid: ZERO_OID.into(),
+            },
+            "",
+            std::fs::metadata(&unpublished_bundle).unwrap().len(),
+            &unpublished_remote_text,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("fetch exact bundle prerequisite from repository")
+        );
+    }
+
+    #[tokio::test]
     async fn durable_job_reviews_approves_publishes_once_and_never_replays_after_restart() {
         let (temp, remote, bundle, base, head) = publication_fixture();
         let data = temp.0.join("broker");
@@ -2033,7 +2473,7 @@ mod tests {
             session_id: "session".into(),
             repository: "fixture/repository".into(),
             branch: "feature".into(),
-            base_branch: "master".into(),
+            base_oid: base.clone(),
             expected_oid: ZERO_OID.into(),
         };
         let submit = |app: &AppState, request_key: &str| {
@@ -2208,13 +2648,13 @@ mod tests {
     }
 
     #[test]
-    fn submission_rejects_force_delete_tag_and_ambiguous_ref_shapes() {
+    fn submission_accepts_rebased_update_and_rejects_invalid_ref_shapes() {
         let valid = Submission {
             request_key: "key".into(),
             session_id: "session".into(),
             repository: "owner/repo".into(),
             branch: "feature/topic".into(),
-            base_branch: "main".into(),
+            base_oid: "1".repeat(40),
             expected_oid: ZERO_OID.into(),
         };
         validate_submission(&valid).unwrap();
@@ -2225,8 +2665,138 @@ mod tests {
         }
         let mut update = valid.clone();
         update.expected_oid = "1".repeat(40);
-        assert!(validate_submission(&update).is_err());
-        update.base_branch = update.branch.clone();
         validate_submission(&update).unwrap();
+
+        assert!(
+            serde_json::from_value::<Submission>(serde_json::json!({
+                "request_key":"old-plugin",
+                "session_id":"session",
+                "repository":"owner/repo",
+                "branch":"feature",
+                "base_branch":"main",
+                "expected_oid":ZERO_OID
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<Submission>(serde_json::json!({
+                "request_key":"mixed-schema",
+                "session_id":"session",
+                "repository":"owner/repo",
+                "branch":"feature",
+                "base_oid":"1111111111111111111111111111111111111111",
+                "base_branch":"main",
+                "expected_oid":ZERO_OID
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn version_one_push_store_is_archived_intact_and_replaced_with_empty_v2() {
+        let temp = TestDir::new();
+        let legacy = br#"{"version":1,"jobs":{"legacy":"retained verbatim"}}"#;
+        let metadata = temp.0.join("git-push-jobs.json");
+        let artifacts = temp.0.join("git-push-jobs");
+        std::fs::write(&metadata, legacy).unwrap();
+        std::fs::create_dir(&artifacts).unwrap();
+        std::fs::write(artifacts.join("legacy.bundle"), b"legacy artifact").unwrap();
+        let (changes, _) = tokio::sync::watch::channel(0);
+        let pushes = Pushes::load(&temp.0, changes).unwrap();
+        assert!(
+            pushes
+                .0
+                .data
+                .lock()
+                .expect("push jobs lock")
+                .jobs
+                .is_empty()
+        );
+        let current: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&metadata).unwrap()).unwrap();
+        assert_eq!(current["version"], 2);
+        assert_eq!(current["jobs"], serde_json::json!({}));
+        assert!(artifacts.is_dir());
+        let archives: Vec<_> = std::fs::read_dir(&temp.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("git-push-jobs-v1-archive-")
+            })
+            .collect();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(
+            std::fs::read(archives[0].join("git-push-jobs.json")).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            std::fs::read(archives[0].join("git-push-jobs/legacy.bundle")).unwrap(),
+            b"legacy artifact"
+        );
+    }
+
+    #[test]
+    fn version_one_archive_allows_missing_artifacts_and_rolls_back_partial_move() {
+        let temp = TestDir::new();
+        let metadata = temp.0.join("git-push-jobs.json");
+        let legacy = br#"{"version":1,"jobs":{}}"#;
+        std::fs::write(&metadata, legacy).unwrap();
+        let (changes, _) = tokio::sync::watch::channel(0);
+        Pushes::load(&temp.0, changes).unwrap();
+        assert!(temp.0.join("git-push-jobs").is_dir());
+
+        let rollback = TestDir::new();
+        let rollback_metadata = rollback.0.join("git-push-jobs.json");
+        std::fs::write(&rollback_metadata, legacy).unwrap();
+        let error = archive_version_one(&rollback.0, &rollback_metadata, &rollback.0)
+            .expect_err("moving a directory into its own child must fail");
+        assert!(error.to_string().contains("metadata move was rolled back"));
+        assert_eq!(std::fs::read(&rollback_metadata).unwrap(), legacy);
+        assert_eq!(
+            std::fs::read_dir(&rollback.0)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("git-push-jobs-v1-archive-"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn unknown_or_corrupt_push_store_names_absolute_path_and_is_untouched() {
+        for bytes in [br#"{"version":3,"jobs":{}}"#.as_slice(), b"not json"] {
+            let temp = TestDir::new();
+            let metadata = temp.0.join("git-push-jobs.json");
+            std::fs::write(&metadata, bytes).unwrap();
+            let (changes, _) = tokio::sync::watch::channel(0);
+            let error = match Pushes::load(&temp.0, changes) {
+                Ok(_) => panic!("unsupported store must not load"),
+                Err(error) => error,
+            };
+            assert!(metadata.is_absolute());
+            let message = error.to_string();
+            assert!(message.contains(&metadata.display().to_string()));
+            assert!(message.contains(&temp.0.join("git-push-jobs").display().to_string()));
+            assert!(message.contains("Move "));
+            assert!(message.contains("Nothing was changed"));
+            assert_eq!(std::fs::read(&metadata).unwrap(), bytes);
+            assert_eq!(
+                std::fs::read_dir(&temp.0)
+                    .unwrap()
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("git-push-jobs-v1-archive-"))
+                    .count(),
+                0
+            );
+        }
     }
 }

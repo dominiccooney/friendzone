@@ -14,8 +14,7 @@ const MAX_STEER_DETAILS = 4 * 1024;
 const observers = new Map();
 const REMINDER_MS = 20 * 60 * 1000;
 const POLL_MS = 15 * 1000;
-const GIT_AUTH_COMMAND=`git -c credential.helper= -c 'credential.helper=!f() { if test "$1" = get; then printf "%s\\n" "username=x-access-token" "password=$GITHUB_TOKEN"; fi; }; f' <rest of git command>`;
-const GIT_AUTH_GUIDANCE=`For an HTTPS Git read/fetch that needs authentication, GITHUB_TOKEN is Friendzone's fake escrow token; Git does not consume that variable automatically. Use this invocation-scoped helper from POSIX shell or PowerShell: ${GIT_AUTH_COMMAND}. Replace only <rest of git command>, for example with fetch origin main. The empty helper first disables inherited helpers for this invocation. Never print the token, put it in a URL, persist helper configuration, or use the real token in the guest. Ordinary git push remains blocked; publish only with this reviewed bundle tool.`;
+const GIT_AUTH_GUIDANCE=`Guest setup configures Git HTTPS authentication automatically. GITHUB_TOKEN is Friendzone's fake escrow token; ordinary commands such as git fetch origin main and git lfs fetch origin HEAD use it automatically. The managed helper applies only to exact HTTPS github.com, clears stale helpers for that origin, and is inherited by Git LFS; it returns nothing for HTTP, subdomains, lookalike hosts, or other origins. Rerun guest setup and restart the shell/Cline if this is not active. Friendzone automatically allows strict Git LFS download batches, but LFS uploads remain blocked. Never print the token, put it in a URL, or use the real token in the guest. Ordinary git push remains blocked; publish only with this reviewed bundle tool.`;
 function atomic(file, value) {
   fs.mkdirSync(path.dirname(file), {recursive:true,mode:0o700});
   const temp=file+'.'+crypto.randomUUID()+'.tmp';
@@ -203,17 +202,17 @@ const plugin={name:'friendzone',manifest:{capabilities:['tools','hooks']},setup(
     const accepted=await request(config,'POST','/guest/jobs',{request_key:input.request_key,session_id:session,query,variables,operation_name});
     return accepted;
   });
-  tool('friendzone_submit_git_bundle',`Submit an exact Git branch publication bundle for broker validation and host review. Create a Git bundle v2 with exactly one refs/heads/<branch> and one prerequisite, then pass its absolute path. Every call creates a distinct durable job; list/get before retrying. ${GIT_AUTH_GUIDANCE}`,{
+  tool('friendzone_submit_git_bundle',`Submit an exact Git branch publication bundle for broker validation and host review. Choose an exact ancestor commit as base, create a Git bundle v2 with exactly one refs/heads/<branch> and "^<base>", then pass that same commit as base_oid. base_oid need not name or equal the tip of any branch. expected_oid is separate: it is only the old target branch value used for force-with-lease. No named base branch is required. Every call creates a distinct durable job; list/get before retrying. ${GIT_AUTH_GUIDANCE}`,{
     request_key:{type:'string',description:'Human-readable correlation label. Not unique and does not deduplicate retries.'},
     bundle_file:{type:'string',description:'Absolute guest path to a Git bundle v2 up to 32 MiB.'},
     repository:{type:'string',description:'GitHub owner/repository.'},
     branch:{type:'string',description:'Target branch name without refs/heads/.'},
-    base_branch:{type:'string',description:'Existing GitHub branch containing the bundle prerequisite. For updates this must equal branch.'},
-    expected_oid:{type:'string',description:'Exact current target branch SHA-1, or forty zeroes to require branch creation.'},
-  },['request_key','bundle_file','repository','branch','base_branch','expected_oid'],async(input,{config,session})=>{
-    for(const name of ['request_key','bundle_file','repository','branch','base_branch','expected_oid'])if(typeof input[name]!=='string'||!input[name])throw new Error(`${name} required`);
+    base_oid:{type:'string',description:'Exact repository commit used as the bundle sole prerequisite and review boundary. It must be an ancestor strictly before the submitted head; it need not be a current branch tip.'},
+    expected_oid:{type:'string',description:'Exact current target branch SHA-1 captured before rebasing, or forty zeroes to require branch creation. This is the target force-with-lease, not necessarily the bundle prerequisite.'},
+  },['request_key','bundle_file','repository','branch','base_oid','expected_oid'],async(input,{config,session})=>{
+    for(const name of ['request_key','bundle_file','repository','branch','base_oid','expected_oid'])if(typeof input[name]!=='string'||!input[name])throw new Error(`${name} required`);
     const route=new URL('/guest/git-push',config.broker);
-    for(const name of ['request_key','repository','branch','base_branch','expected_oid'])route.searchParams.set(name,input[name]);route.searchParams.set('session_id',session);
+    for(const name of ['request_key','repository','branch','base_oid','expected_oid'])route.searchParams.set(name,input[name]);route.searchParams.set('session_id',session);
     return uploadBundle(config,route,input.bundle_file);
   },90000);
   tool('friendzone_get_request','Retrieve a submitted request result. Does not execute or retry it. Large results are saved to a guest file.',{id:{type:'string'}},['id'],async (input,{config,suffix,base,key})=>{

@@ -2,6 +2,13 @@
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 
+pub(crate) const GITHUB_GIT_CONFIG: &str = r#"# Friendzone managed Git configuration v1
+[credential "https://github.com"]
+	helper =
+	helper = "!fz_github_credential() { test \"$1\" = get || exit 0; protocol=; host=; while IFS= read -r line; do case \"$line\" in protocol=*) protocol=${line#protocol=} ;; host=*) host=${line#host=} ;; esac; done; test \"$protocol\" = https && test \"$host\" = github.com && test -n \"$GITHUB_TOKEN\" || exit 0; printf \"%s\\n\" \"username=x-access-token\" \"password=$GITHUB_TOKEN\"; }; fz_github_credential"
+"#;
+const EMPTY_GIT_CONFIG: &str = "# Friendzone managed Git configuration v1\n";
+
 pub enum Shell {
     Sh,
     Powershell,
@@ -68,7 +75,14 @@ pub fn script(
     let broker = broker_origin(broker)?;
     validate_container(container)?;
     let mut fakes = std::collections::BTreeMap::new();
+    let mut git_github_auth = false;
     for entry in settings.entries() {
+        git_github_auth |= entry.guest_env.as_deref() == Some("GITHUB_TOKEN")
+            && entry.header.eq_ignore_ascii_case("authorization")
+            && entry
+                .hosts
+                .iter()
+                .any(|host| host.eq_ignore_ascii_case("github.com"));
         if let Some(name) = entry.guest_env {
             if name.is_empty()
                 || !name.bytes().enumerate().all(|(i, c)| {
@@ -116,6 +130,7 @@ pub fn script(
         }
     }
     let payload = serde_json::json!({"broker":broker,"container":container,"ca":ca,"proxy_port":proxy_port,"fakes":fakes,
+        "git_credential_config":if git_github_auth {GITHUB_GIT_CONFIG} else {EMPTY_GIT_CONFIG},
         "plugin":STANDARD.encode(include_bytes!("plugin/friendzone.js")),
         "persistence":STANDARD.encode(include_bytes!("bootstrap/persist-environment.ps1"))});
     let encoded = STANDARD.encode(serde_json::to_vec(&payload)?);
@@ -179,6 +194,17 @@ mod tests {
     fn scripts_are_binary_free_and_payload_never_interpolates_guest_code() {
         let dir = std::env::temp_dir().join(format!("fz-bootstrap-{}", uuid::Uuid::new_v4()));
         let settings = crate::settings::Settings::load(&dir).unwrap();
+        settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "github".into(),
+                hosts: vec!["api.github.com".into(), "github.com".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fz-test-github-token".into(),
+                real_env: None,
+                guest_env: Some("GITHUB_TOKEN".into()),
+            })
+            .unwrap();
         for shell in [Shell::Sh, Shell::Powershell] {
             let powershell = matches!(shell, Shell::Powershell);
             let text = script(
@@ -216,12 +242,34 @@ mod tests {
                 .decode(payload["plugin"].as_str().unwrap())
                 .unwrap();
             assert_eq!(plugin, include_bytes!("plugin/friendzone.js"));
+            assert_eq!(payload["git_credential_config"], GITHUB_GIT_CONFIG);
             if !powershell && let Some(dir) = std::env::var_os("FZ_PLUGIN_TEST_ARTIFACT_DIR") {
                 let dir = std::path::PathBuf::from(dir);
                 std::fs::create_dir_all(&dir).unwrap();
                 std::fs::write(dir.join("linux-script.js"), plugin).unwrap();
             }
         }
+        settings.remove_entry("github").unwrap();
+        let text = script(
+            Shell::Sh,
+            "http://[::1]:9082",
+            "guest",
+            "CERTIFICATE",
+            9080,
+            &settings,
+        )
+        .unwrap();
+        let encoded = text
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("python3 - '")
+                    .and_then(|line| line.split('\'').next())
+            })
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+        assert_eq!(payload["git_credential_config"], EMPTY_GIT_CONFIG);
+        assert!(payload["fakes"].get("GITHUB_TOKEN").is_none());
         let cmds = commands("http://host:9082", "guest").unwrap();
         assert!(cmds["sh"].as_str().unwrap().starts_with("curl "));
         assert!(
@@ -247,6 +295,21 @@ mod tests {
     fn powershell_script_configures_temp_guest_with_mock_user_environment() {
         let dir = std::env::temp_dir().join(format!("fz-cleanup-ps-{}", uuid::Uuid::new_v4()));
         let settings = crate::settings::Settings::load(&dir).unwrap();
+        settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "github".into(),
+                hosts: vec!["api.github.com".into(), "github.com".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fz-test-github-token".into(),
+                real_env: None,
+                guest_env: Some("GITHUB_TOKEN".into()),
+            })
+            .unwrap();
+        let authority = crate::ca::AuthorityFiles::load_or_create(&dir.join("test-ca")).unwrap();
+        let rotated = crate::ca::AuthorityFiles::load_or_create(&dir.join("rotated-ca")).unwrap();
+        let rotated_path = dir.join("rotated-ca.pem");
+        std::fs::write(&rotated_path, &rotated.cert_pem).unwrap();
         let script_path = dir.join("guest.ps1");
         std::fs::write(
             &script_path,
@@ -254,7 +317,7 @@ mod tests {
                 Shell::Powershell,
                 "http://192.0.2.1:9082",
                 "guest'$(bad)",
-                "CERTIFICATE",
+                &authority.cert_pem,
                 9080,
                 &settings,
             )
@@ -283,7 +346,7 @@ mod tests {
             let home = dir.join(runtime);
             std::fs::create_dir_all(&home).unwrap();
             let inline = format!(
-                "& ([scriptblock]::Create([IO.File]::ReadAllText({}))) -Implementation {} -TemporaryDirectory {} -BootstrapScript {} -BootstrapCommand {}",
+                "& ([scriptblock]::Create([IO.File]::ReadAllText({}))) -Implementation {} -TemporaryDirectory {} -BootstrapScript {} -BootstrapCommand {} -RotationCertificate {}",
                 ps_quote(
                     &root
                         .join("tests/fixtures/test_user_environment.ps1")
@@ -296,7 +359,8 @@ mod tests {
                 ),
                 ps_quote(&home.to_string_lossy()),
                 ps_quote(&script_path.to_string_lossy()),
-                ps_quote(&command.to_string_lossy())
+                ps_quote(&command.to_string_lossy()),
+                ps_quote(&rotated_path.to_string_lossy())
             );
             let output = std::process::Command::new(executable)
                 .args(["-NoProfile", "-NonInteractive", "-Command", &inline])

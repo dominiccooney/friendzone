@@ -453,6 +453,16 @@ impl AppState {
         )
     }
 
+    pub fn admit_lfs_download(&self, id: Uuid, container: &str, peer: IpAddr, epoch: Uuid) -> bool {
+        self.admit_request(
+            id,
+            container,
+            peer,
+            epoch,
+            "Git LFS download batch; automatically allowed",
+        )
+    }
+
     /// Reads and manual approvals share the final epoch/IP/kill check; neither
     /// can bypass a policy change that happened while its body was buffered.
     fn admit_request(
@@ -768,6 +778,40 @@ impl AppState {
         // A pending gate check is a join request appearing: wake the UI.
         self.notify();
         verdict
+    }
+
+    /// Announces setup without letting a stale downloaded label override the
+    /// source-IP identity. A unique explicit pin is canonical; otherwise setup
+    /// creates/touches the requested pending label for host approval.
+    pub fn announce_guest(
+        &self,
+        requested: &str,
+        peer: IpAddr,
+    ) -> Result<(String, Authorization, bool)> {
+        let mut state = self.data.write().expect("state lock poisoned");
+        let pinned: Vec<_> = state
+            .containers
+            .iter()
+            .filter(|(_, record)| record.pinned_ip == Some(peer))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let (name, explicitly_pinned) = match pinned.as_slice() {
+            [] => (requested.to_owned(), false),
+            [owner] => (owner.clone(), true),
+            _ => anyhow::bail!("multiple guests are pinned to source address {peer}"),
+        };
+        state.touch_container(&name, Some(peer));
+        let record = state.containers.get(&name).expect("just touched");
+        let authorization = if !record.approved {
+            Authorization::Pending
+        } else if record.pinned_ip.is_some_and(|pin| pin != peer) {
+            Authorization::IpMismatch
+        } else {
+            Authorization::Allowed
+        };
+        drop(state);
+        self.notify();
+        Ok((name, authorization, explicitly_pinned))
     }
 
     /// Resolves and authorizes proxy traffic under one lock. Explicit names are

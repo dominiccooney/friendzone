@@ -39,10 +39,16 @@ async function discover(plugin) {
   ]);
   const description=tools.find(tool=>tool.name==='friendzone_submit_git_bundle').description;
   assert.match(description,/GITHUB_TOKEN is Friendzone's fake escrow token/);
-  assert.match(description,/git -c credential\.helper= -c 'credential\.helper=!f\(\) \{/);
-  assert.match(description,/username=x-access-token/);assert.match(description,/password=\$GITHUB_TOKEN/);
+  assert.match(description,/configures Git HTTPS authentication automatically/);
+  assert.match(description,/git fetch origin main/);assert.match(description,/git lfs fetch origin HEAD/);
+  assert.match(description,/only to exact HTTPS github\.com/);assert.match(description,/LFS uploads remain blocked/);
   assert.match(description,/Ordinary git push remains blocked/);
-  assert.doesNotMatch(description,/git config --global|https:\/\/[^ ]*\$GITHUB_TOKEN/);
+  const publish=tools.find(tool=>tool.name==='friendzone_submit_git_bundle');
+  assert.equal(publish.inputSchema.properties.base_branch,undefined);
+  assert.match(publish.inputSchema.properties.base_oid.description,/Exact repository commit/);
+  assert.match(publish.inputSchema.properties.base_oid.description,/need not be a current branch tip/);
+  assert.match(publish.inputSchema.properties.expected_oid.description,/captured before rebasing/);
+  assert.doesNotMatch(description,/credential\.helper=!|git config --global|https:\/\/[^ ]*\$GITHUB_TOKEN/);
   for(const tool of tools){
     assert.equal(typeof tool.execute,'function');
     assert.equal(tool.inputSchema.type,'object');

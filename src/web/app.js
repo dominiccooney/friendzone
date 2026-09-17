@@ -490,7 +490,7 @@ function renderGraphqlReview(graphql) {
 
 function renderGitPushReview(review) {
   $("#request-git-push").hidden=!review;
-  $("#request-git-push-refs").textContent=review?`Repository: ${review.repository}\nTarget: refs/heads/${review.branch}\nExpected current target: ${review.expected_oid}\nBase branch: refs/heads/${review.base_branch}\nBase OID: ${review.base_oid}\nReviewed head OID: ${review.head_oid}\nBundle: ${review.bundle_bytes} bytes · SHA-256 ${review.bundle_sha256}`:"";
+  $("#request-git-push-refs").textContent=review?`Repository: ${review.repository}\nTarget: refs/heads/${review.branch}\nExpected current target: ${review.expected_oid}\nReview base OID: ${review.base_oid}\nReviewed head OID: ${review.head_oid}\nBundle: ${review.bundle_bytes} bytes · SHA-256 ${review.bundle_sha256}`:"";
   $("#request-git-push-commits").innerHTML=review?(review.commits||[]).map(commit=>`<article class="graphql-field"><strong>${esc(commit.oid)}</strong><pre>${esc(commit.message)}</pre><p class="meta">${esc(commit.author)} &lt;${esc(commit.email)}&gt; · ${esc(commit.authored_at)} · parent: ${esc(commit.parents.join(", "))}</p></article>`).join(""):"";
   $("#request-git-push-files").innerHTML=review?(review.files||[]).map(file=>`<div class="graphql-value"><strong>${esc(file.status)}</strong> ${file.old_path?`${esc(file.old_path)} → `:""}${esc(file.path)} <span class="meta">in ${esc(file.commit_oid)}</span></div>`).join(""):"";
   $("#request-git-push-patch").textContent=review?.patch||"";

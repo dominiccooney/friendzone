@@ -171,24 +171,26 @@ head/base branches, body, file/line and review event—`APPROVE` and
 `REQUEST_CHANGES` are more than comment text. The host's token needs the
 appropriate GitHub write scopes. Ordinary direct `git push` remains blocked.
 
-For Git HTTPS, give Git the **fake** token as its password via a credential
-helper/prompt. Friendzone substitutes it inside HTTP Basic credentials,
-preserving the username and host restriction. Merely setting `GITHUB_TOKEN`
-does not configure plain Git. An initial `401` on `info/refs?service=git-receive-pack`
-is GitHub's authentication challenge, not a Friendzone read-policy denial.
+Guest setup configures Git HTTPS to use the **fake** `GITHUB_TOKEN` automatically
+for exact `https://github.com` origins. Friendzone substitutes it inside HTTP
+Basic credentials while preserving the username and host restriction. An initial
+`401` on `info/refs?service=git-receive-pack` is GitHub's authentication challenge,
+not a Friendzone read-policy denial.
 Authenticating discovery does not unblock ordinary `git push`. Publish a PR head
 branch with the reviewed bundle tool below. See [Git authentication](README.md#git-https-authentication).
 
-For an authenticated fetch from POSIX shell or PowerShell, use the fake token
-without persisting it or placing its value in a URL/command line:
+After rerunning setup and starting a fresh shell/Cline, ordinary commands work:
 
 ```sh
-git -c credential.helper= -c 'credential.helper=!f() { if test "$1" = get; then printf "%s\n" "username=x-access-token" "password=$GITHUB_TOKEN"; fi; }; f' fetch origin main
+git fetch origin main
+git lfs fetch origin HEAD
 ```
 
-Replace only the trailing Git operation/arguments. The empty helper disables
-inherited helpers for this invocation. Never print `GITHUB_TOKEN` or put the
-host's real token in the guest.
+The managed helper file contains no token value. It clears stale helpers and
+reads the fake environment token only for exact HTTPS `github.com`; it returns
+nothing for other origins. Git propagates it to `git-lfs`. Friendzone allows only
+strict LFS download batches; LFS uploads remain blocked. Never print
+`GITHUB_TOKEN`, put it in a URL, or use the host's real token in the guest.
 
 ### Publish a branch for a PR
 
@@ -203,19 +205,23 @@ git bundle create --version=2 "$PWD/feature.bundle" refs/heads/feature "^$base"
 ```
 
 Call `friendzone_submit_git_bundle` with the absolute bundle path,
-`repository=owner/repo`, `branch=feature`, `base_branch=main`, forty zeroes as
+`repository=owner/repo`, `branch=feature`, `base_oid=$base`, forty zeroes as
 `expected_oid`, and a human-readable `request_key`.
 
 The tool returns `preparing`; do not resubmit. Friendzone validates the exact
 bundle, then the host Inbox shows commit messages, paths, OIDs, digest, and patch.
 After **Approve once**, the broker rechecks the remote and publishes once with a
 creation lease. Use `friendzone_get_request` for the verified result. For updates,
-use the exact current target SHA as the bundle's sole prerequisite and
-`expected_oid`, and set `base_branch` equal to `branch`.
+use the exact current target SHA as `expected_oid`. For a normal update it is also
+the bundle prerequisite and `base_oid`. For a rebase onto `main`, capture
+the remote target SHA before rebasing, use the actual `origin/main` commit you
+rebased onto as the bundle's sole prerequisite and `base_oid`. No named base branch
+is required. Friendzone fetches that exact commit from the repository and uses the
+captured target SHA as the exact force-with-lease.
 
 Do not retry an uncertain submission or result blindly. List/get existing jobs
-and inspect the remote branch first. Ordinary `git push`, force pushes, tags,
-deletes, merges, LFS, multiple refs, and arbitrary remotes remain unsupported.
+and inspect the remote branch first. Ordinary `git push`, unleased updates, tags,
+deletes, merges, LFS uploads, multiple refs, and arbitrary remotes remain unsupported.
 
 Queries use the actual parsed `query` operation, including fragments and
 introspection. Ambiguous operation selection, unsupported directives/headers,
@@ -273,13 +279,20 @@ The script updates the guest's Cline provider file, so close guest Cline before
 running it. Existing model/other-provider settings are retained. Real keys
 stay on the host. Download scripts only over a trusted host/network; the first
 HTTP download is not authenticated. The script does not change the guest's
-firewall or system CA store; runtime CA variables are configured instead. On
-Windows it also makes Git's Schannel backend honor `GIT_SSL_CAINFO` without
+firewall. Runtime CA variables are configured on both platforms. On Windows it
+also installs the exact Friendzone CA in the guest user's Trusted Root store
+(`CurrentUser\Root`, not `LocalMachine\Root`) and makes Git's Schannel backend honor `GIT_SSL_CAINFO` without
 disabling certificate verification or changing Git configuration files, and
 sets Cargo's native `CARGO_HTTP_CAINFO` to the same managed CA bundle. Cargo's
 Windows-only revocation lookup is disabled because dynamically issued
 Friendzone certificates have no public revocation responder; chain and hostname
 verification remain enabled.
+It also configures the current user's Windows Internet proxy so WinINET-aware and
+modern .NET clients can route through Friendzone without relying on environment
+variables. Existing bypass entries are preserved. This is not machine-wide
+WinHTTP configuration. Setup tracks roots it installed, rotates only those roots,
+and removes only those exact roots during rollback. Restart applications that
+cache proxy or trust settings.
 
 ## 4. Guest: activate and approve
 
@@ -289,9 +302,10 @@ added again on reruns. Zsh reads .zshenv for non-interactive shells; bash uses
 BASH_ENV inherited from an activated parent. Plain sh and service launchers
 need explicit environment inheritance.
 
-Windows activates its PowerShell process and saves user environment variables.
+Windows activates its PowerShell process, saves user environment variables, sets
+the current-user Windows Internet proxy, and trusts the CA in `CurrentUser\Root`.
 Restart guest applications; sign out/in for other Windows launchers to acquire
-a fresh environment. Machine environment and execution policy are unchanged.
+a fresh environment. Machine environment, WinHTTP, and execution policy are unchanged.
 
 Approve/pin the guest in the host Inbox, then restart guest Cline. The generated
 environment includes broker and loopback NO_PROXY entries, both proxy cases on

@@ -6,8 +6,300 @@ use hudsucker::{
         header::{PROXY_AUTHENTICATE, PROXY_AUTHORIZATION},
     },
 };
+use std::{
+    collections::HashMap,
+    error::Error as _,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
 
 use crate::state::{AppState, Verdict};
+
+#[derive(Clone)]
+struct PendingUpstream {
+    id: uuid::Uuid,
+    host: String,
+    method: String,
+    path: String,
+    forwarding_at: std::time::Instant,
+    lifecycle: Option<Arc<UpstreamLifecycle>>,
+}
+
+static ACTIVE_UPSTREAM: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_BY_HOST: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+fn active_by_host() -> &'static Mutex<HashMap<String, usize>> {
+    ACTIVE_BY_HOST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn host_active(host: &str, delta: isize) -> usize {
+    let mut hosts = active_by_host().lock().expect("upstream counter lock");
+    let active = hosts.entry(host.to_owned()).or_default();
+    if delta > 0 {
+        *active = active.saturating_add(delta as usize);
+    } else {
+        *active = active.saturating_sub(delta.unsigned_abs());
+    }
+    let result = *active;
+    if result == 0 {
+        hosts.remove(host);
+    }
+    result
+}
+
+struct UpstreamLifecycle {
+    id: uuid::Uuid,
+    host: String,
+    method: String,
+    path: String,
+    started: std::time::Instant,
+    finished: AtomicBool,
+}
+
+impl UpstreamLifecycle {
+    fn start(pending: &PendingUpstream) -> Arc<Self> {
+        let active_total = ACTIVE_UPSTREAM.fetch_add(1, Ordering::AcqRel) + 1;
+        let active_host = host_active(&pending.host, 1);
+        tracing::info!(
+            request_id = %pending.id,
+            upstream_host = %pending.host,
+            method = %pending.method,
+            path = %pending.path,
+            active_total,
+            active_host,
+            "upstream request forwarding"
+        );
+        Arc::new(Self {
+            id: pending.id,
+            host: pending.host.clone(),
+            method: pending.method.clone(),
+            path: pending.path.clone(),
+            started: pending.forwarding_at,
+            finished: AtomicBool::new(false),
+        })
+    }
+
+    fn finish(
+        &self,
+        outcome: &'static str,
+        status: Option<u16>,
+        protocol: Option<&'static str>,
+        bytes: u64,
+    ) {
+        if self.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let active_total = ACTIVE_UPSTREAM
+            .fetch_sub(1, Ordering::AcqRel)
+            .saturating_sub(1);
+        let active_host = host_active(&self.host, -1);
+        tracing::info!(
+            request_id = %self.id,
+            upstream_host = %self.host,
+            method = %self.method,
+            path = %self.path,
+            outcome,
+            http_status = status.unwrap_or_default(),
+            protocol = protocol.unwrap_or("unknown"),
+            response_bytes = bytes,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            active_total,
+            active_host,
+            "upstream request finished"
+        );
+    }
+}
+
+impl Drop for UpstreamLifecycle {
+    fn drop(&mut self) {
+        self.finish("handler_dropped", None, None, 0);
+    }
+}
+
+struct ObservedResponseBody {
+    inner: Body,
+    lifecycle: Arc<UpstreamLifecycle>,
+    status: u16,
+    protocol: &'static str,
+    bytes: u64,
+    first_byte: bool,
+    ended: bool,
+}
+
+struct ObservedRequestBody {
+    inner: Body,
+    lifecycle: Arc<UpstreamLifecycle>,
+    bytes: u64,
+    first_byte: bool,
+    ended: bool,
+}
+
+impl hudsucker::hyper::body::Body for ObservedRequestBody {
+    type Data = hudsucker::hyper::body::Bytes;
+    type Error = hudsucker::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hudsucker::hyper::body::Frame<Self::Data>, Self::Error>>>
+    {
+        use std::task::Poll;
+
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        match &result {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.bytes = this.bytes.saturating_add(data.len() as u64);
+                    if !this.first_byte && !data.is_empty() {
+                        this.first_byte = true;
+                        tracing::info!(
+                            request_id = %this.lifecycle.id,
+                            upstream_host = %this.lifecycle.host,
+                            method = %this.lifecycle.method,
+                            path = %this.lifecycle.path,
+                            time_to_request_body_first_byte_ms = this.lifecycle.started.elapsed().as_millis() as u64,
+                            "upstream request body first byte"
+                        );
+                    }
+                }
+                if this.inner.is_end_stream() {
+                    this.ended = true;
+                    tracing::info!(
+                        request_id = %this.lifecycle.id,
+                        upstream_host = %this.lifecycle.host,
+                        method = %this.lifecycle.method,
+                        path = %this.lifecycle.path,
+                        request_bytes = this.bytes,
+                        request_body_complete_ms = this.lifecycle.started.elapsed().as_millis() as u64,
+                        "upstream request body complete"
+                    );
+                }
+            }
+            Poll::Ready(None) => {
+                this.ended = true;
+                tracing::info!(
+                    request_id = %this.lifecycle.id,
+                    upstream_host = %this.lifecycle.host,
+                    method = %this.lifecycle.method,
+                    path = %this.lifecycle.path,
+                    request_bytes = this.bytes,
+                    request_body_complete_ms = this.lifecycle.started.elapsed().as_millis() as u64,
+                    "upstream request body complete"
+                );
+            }
+            Poll::Ready(Some(Err(_))) => {
+                this.ended = true;
+                tracing::info!(
+                    request_id = %this.lifecycle.id,
+                    upstream_host = %this.lifecycle.host,
+                    method = %this.lifecycle.method,
+                    path = %this.lifecycle.path,
+                    request_bytes = this.bytes,
+                    request_body_error_ms = this.lifecycle.started.elapsed().as_millis() as u64,
+                    "upstream request body error"
+                );
+            }
+            Poll::Pending => {}
+        }
+        result
+    }
+}
+
+impl Drop for ObservedRequestBody {
+    fn drop(&mut self) {
+        if !self.ended {
+            tracing::info!(
+                request_id = %self.lifecycle.id,
+                upstream_host = %self.lifecycle.host,
+                method = %self.lifecycle.method,
+                path = %self.lifecycle.path,
+                request_bytes = self.bytes,
+                request_body_dropped_ms = self.lifecycle.started.elapsed().as_millis() as u64,
+                "upstream request body dropped"
+            );
+        }
+    }
+}
+
+impl hudsucker::hyper::body::Body for ObservedResponseBody {
+    type Data = hudsucker::hyper::body::Bytes;
+    type Error = hudsucker::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hudsucker::hyper::body::Frame<Self::Data>, Self::Error>>>
+    {
+        use std::task::Poll;
+
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        match &result {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.bytes = this.bytes.saturating_add(data.len() as u64);
+                    if !this.first_byte && !data.is_empty() {
+                        this.first_byte = true;
+                        tracing::info!(
+                            request_id = %this.lifecycle.id,
+                            upstream_host = %this.lifecycle.host,
+                            method = %this.lifecycle.method,
+                            path = %this.lifecycle.path,
+                            protocol = this.protocol,
+                            time_to_first_body_byte_ms = this.lifecycle.started.elapsed().as_millis() as u64,
+                            "upstream response first body byte"
+                        );
+                    }
+                }
+                if this.inner.is_end_stream() {
+                    this.ended = true;
+                    this.lifecycle.finish(
+                        "response_complete",
+                        Some(this.status),
+                        Some(this.protocol),
+                        this.bytes,
+                    );
+                }
+            }
+            Poll::Ready(None) => {
+                this.ended = true;
+                this.lifecycle.finish(
+                    "response_complete",
+                    Some(this.status),
+                    Some(this.protocol),
+                    this.bytes,
+                );
+            }
+            Poll::Ready(Some(Err(_))) => {
+                this.ended = true;
+                this.lifecycle.finish(
+                    "response_body_error",
+                    Some(this.status),
+                    Some(this.protocol),
+                    this.bytes,
+                );
+            }
+            Poll::Pending => {}
+        }
+        result
+    }
+}
+
+impl Drop for ObservedResponseBody {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.lifecycle.finish(
+                "downstream_body_dropped",
+                Some(self.status),
+                Some(self.protocol),
+                self.bytes,
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod basic_auth_tests;
@@ -132,8 +424,8 @@ pub struct EventHandler {
     state: AppState,
     settings: crate::settings::Settings,
     /// The in-flight request on this connection, for response
-    /// annotation: (log id, upstream host).
-    pending: Option<(uuid::Uuid, String)>,
+    /// annotation and bounded transport timing.
+    pending: Option<PendingUpstream>,
     /// Hudsucker clones the CONNECT handler into intercepted requests.
     /// Identity travels with that tunnel, never in an IP/port cache that
     /// could outlive a socket and authenticate a different connection.
@@ -192,6 +484,46 @@ impl EventHandler {
                 .and_then(basic_username);
             self.state.authorize_proxy_peer(peer, presented.as_deref())
         }
+    }
+
+    /// This is the diagnostics consistency boundary: count only requests that
+    /// passed every local gate and are about to be handed to Hyper.
+    fn begin_forwarding(&mut self, req: Request<Body>) -> Request<Body> {
+        use hudsucker::hyper::body::Body as _;
+
+        if let Some(pending) = &mut self.pending {
+            pending.forwarding_at = std::time::Instant::now();
+            let lifecycle = UpstreamLifecycle::start(pending);
+            pending.lifecycle = Some(lifecycle.clone());
+            let (parts, body) = req.into_parts();
+            if body.is_end_stream() {
+                tracing::info!(
+                    request_id = %lifecycle.id,
+                    upstream_host = %lifecycle.host,
+                    method = %lifecycle.method,
+                    path = %lifecycle.path,
+                    request_bytes = 0,
+                    request_body_complete_ms = 0_u64,
+                    "upstream request body complete"
+                );
+                return Request::from_parts(parts, body);
+            }
+            use http_body_util::BodyExt;
+            return Request::from_parts(
+                parts,
+                Body::from(
+                    ObservedRequestBody {
+                        inner: body,
+                        lifecycle,
+                        bytes: 0,
+                        first_byte: false,
+                        ended: false,
+                    }
+                    .boxed(),
+                ),
+            );
+        }
+        req
     }
 
     async fn handle_from_peer(
@@ -281,9 +613,11 @@ impl EventHandler {
         let needs_review = decision == crate::policy::Decision::RequireReview;
         let blocked = killed;
         let host = req.uri().host().unwrap_or_default().to_owned();
+        let method = req.method().to_string();
+        let path = req.uri().path().to_owned();
         let id = self.state.record(
             container.clone(),
-            req.method().to_string(),
+            method.clone(),
             req.uri().to_string(),
             if blocked {
                 Verdict::Blocked
@@ -294,7 +628,14 @@ impl EventHandler {
             },
         );
         if !blocked {
-            self.pending = Some((id, host.clone()));
+            self.pending = Some(PendingUpstream {
+                id,
+                host: host.clone(),
+                method,
+                path,
+                forwarding_at: std::time::Instant::now(),
+                lifecycle: None,
+            });
         }
         if killed {
             self.state
@@ -333,7 +674,7 @@ impl EventHandler {
                     .map(str::to_owned)
             });
             match substitution {
-                crate::settings::Substitution::None => req.into(),
+                crate::settings::Substitution::None => self.begin_forwarding(req).into(),
                 crate::settings::Substitution::Replace { header, value } => {
                     if let Ok(header_value) = value.parse() {
                         req.headers_mut().insert(
@@ -342,7 +683,7 @@ impl EventHandler {
                             header_value,
                         );
                     }
-                    req.into()
+                    self.begin_forwarding(req).into()
                 }
                 crate::settings::Substitution::Block(reason) => {
                     self.pending = None;
@@ -414,6 +755,21 @@ impl EventHandler {
         }
         let bytes = collected.to_bytes();
         let req = Request::from_parts(parts, Body::from(bytes.clone()));
+        if crate::lfs::is_batch_route(&req) {
+            if !crate::lfs::is_download(&req, &bytes) {
+                return Err(error(
+                    "Git LFS uploads and malformed/unsupported batch requests remain blocked"
+                        .into(),
+                ));
+            }
+            if !self.state.admit_lfs_download(event, container, peer, epoch) {
+                return Err(error(
+                    "container policy changed while reading the Git LFS batch body".into(),
+                ));
+            }
+            guard.finished = true;
+            return Ok(req); // Existing escrow substitution/response logging still run.
+        }
         let mut detail = crate::review::Detail::from_request(container, &req, &bytes)
             .map_err(|e| error(e.to_string()))?;
         // Keep the review ID searchable/correlatable with its single audit row.
@@ -572,27 +928,103 @@ impl HttpHandler for EventHandler {
         _ctx: &HttpContext,
         error: hudsucker::hyper_util::client::legacy::Error,
     ) -> Response<Body> {
-        if let Some((id, _)) = self.pending.take() {
-            self.state.reviews.observe(id, crate::review::Status::UpstreamError, Some(502), "Upstream connection failed. Delivery is uncertain; check upstream before retrying.");
-            self.state.annotate(
-                id,
+        let pending = self.pending.take();
+        let elapsed = pending
+            .as_ref()
+            .map_or(std::time::Duration::ZERO, |pending| {
+                pending.forwarding_at.elapsed()
+            });
+        let detail = upstream_failure_detail(&error, elapsed);
+        if let Some(pending) = pending {
+            let protocol = error.connect_info().map(|connection| {
+                if connection.is_negotiated_h2() {
+                    "h2"
+                } else {
+                    "http/1.1"
+                }
+            });
+            if let Some(lifecycle) = &pending.lifecycle {
+                lifecycle.finish("transport_error", None, protocol, 0);
+            }
+            self.state.reviews.observe(
+                pending.id,
+                crate::review::Status::UpstreamError,
                 Some(502),
-                Some(format!("upstream connection failed: {error}")),
+                if error.is_connect() {
+                    "Upstream connection could not be established. No request was sent."
+                } else {
+                    "Upstream request failed while sending. Delivery is uncertain; check upstream before retrying."
+                },
+            );
+            self.state
+                .annotate(pending.id, Some(502), Some(detail.clone()));
+            tracing::warn!(
+                request_id = %pending.id,
+                upstream_host = %pending.host,
+                diagnostic = %detail,
+                "upstream request failed"
             );
         }
         Response::builder()
             .status(StatusCode::BAD_GATEWAY)
-            .body(Body::from(
-                "friendzone: upstream connection failed (see broker log)",
-            ))
+            .body(Body::from(format!("friendzone: {detail}")))
             .expect("static error")
     }
 
     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
-        let Some((id, host)) = self.pending.take() else {
+        let Some(mut pending) = self.pending.take() else {
             return res;
         };
+        let lifecycle = pending
+            .lifecycle
+            .take()
+            .unwrap_or_else(|| UpstreamLifecycle::start(&pending));
+        let id = pending.id;
+        let host = pending.host;
         let status = res.status().as_u16();
+        let protocol = match res.version() {
+            hudsucker::hyper::Version::HTTP_2 => "h2",
+            hudsucker::hyper::Version::HTTP_11 => "http/1.1",
+            hudsucker::hyper::Version::HTTP_10 => "http/1.0",
+            _ => "other",
+        };
+        let content_type = res
+            .headers()
+            .get(hudsucker::hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or_default().trim())
+            .map(|value| match value {
+                "application/json" => "application/json",
+                "text/event-stream" => "text/event-stream",
+                "application/x-ndjson" => "application/x-ndjson",
+                _ => "other",
+            })
+            .unwrap_or("absent");
+        let socket = res
+            .extensions()
+            .get::<hudsucker::hyper_util::client::legacy::connect::HttpInfo>();
+        let upstream_remote = socket
+            .map(|info| info.remote_addr().to_string())
+            .unwrap_or_else(|| "unavailable".into());
+        let upstream_local = socket
+            .map(|info| info.local_addr().to_string())
+            .unwrap_or_else(|| "unavailable".into());
+        tracing::info!(
+            request_id = %id,
+            upstream_host = %host,
+            method = %pending.method,
+            path = %pending.path,
+            protocol,
+            http_status = status,
+            content_type,
+            time_to_headers_ms = lifecycle.started.elapsed().as_millis() as u64,
+            active_total = ACTIVE_UPSTREAM.load(Ordering::Acquire),
+            active_host = host_active(&host, 0),
+            upstream_remote,
+            upstream_local,
+            h2_connection = "unavailable_with_stock_hyper_connector",
+            "upstream response headers"
+        );
         self.state.reviews.observe(id, crate::review::Status::ResponseReceived, Some(status),
             if status >= 400 { "Upstream returned an HTTP error." } else { "Upstream response received. HTTP status alone does not confirm the operation succeeded." });
         let is_json = res
@@ -602,15 +1034,27 @@ impl HttpHandler for EventHandler {
             .is_some_and(|ct| ct.starts_with("application/json"));
         let reviewed_graphql =
             host.eq_ignore_ascii_case("api.github.com") && self.state.reviews.tracks_response(id);
+        use http_body_util::BodyExt;
+        let (parts, body) = res.into_parts();
+        let observed = Body::from(
+            ObservedResponseBody {
+                inner: body,
+                lifecycle,
+                status,
+                protocol,
+                bytes: 0,
+                first_byte: false,
+                ended: false,
+            }
+            .boxed(),
+        );
         if reviewed_graphql && is_json {
-            use http_body_util::BodyExt;
             self.state.annotate(id, Some(status), None);
-            let (parts, body) = res.into_parts();
             return Response::from_parts(
                 parts,
                 Body::from(
                     ReviewResponseBody {
-                        inner: body,
+                        inner: observed,
                         state: self.state.clone(),
                         id,
                         bytes: Some(Vec::new()),
@@ -624,7 +1068,148 @@ impl HttpHandler for EventHandler {
         // summaries. Returning the original body preserves first-byte delivery,
         // streaming, flow control, trailers, and connection reuse.
         self.state.annotate(id, Some(status), None);
-        res
+        Response::from_parts(parts, observed)
+    }
+}
+
+fn upstream_failure_detail(
+    error: &hudsucker::hyper_util::client::legacy::Error,
+    elapsed: std::time::Duration,
+) -> String {
+    let phase = if error.is_connect() {
+        "connect"
+    } else {
+        "send"
+    };
+    let protocol = error.connect_info().map(|connection| {
+        if connection.is_negotiated_h2() {
+            "h2"
+        } else {
+            "http/1.1"
+        }
+    });
+    let mut facts = vec![format!(
+        "upstream {phase} failed after {} ms",
+        elapsed.as_millis()
+    )];
+    if let Some(protocol) = protocol {
+        facts.push(format!("protocol={protocol}"));
+    }
+
+    let mut source = error.source();
+    let mut depth = 0;
+    let mut classified = false;
+    while let Some(cause) = source.filter(|_| depth < 12) {
+        if let Some(hyper) = cause.downcast_ref::<hudsucker::hyper::Error>() {
+            classified = true;
+            let class = if hyper.is_timeout() {
+                "timeout"
+            } else if hyper.is_canceled() {
+                "canceled"
+            } else if hyper.is_closed() {
+                "channel_closed"
+            } else if hyper.is_incomplete_message() {
+                "incomplete_message"
+            } else if hyper.is_body_write_aborted() {
+                "body_write_aborted"
+            } else if hyper.is_shutdown() {
+                "shutdown"
+            } else if hyper.is_parse() {
+                "parse"
+            } else if hyper.is_user() {
+                "request_body"
+            } else {
+                "transport"
+            };
+            facts.push(format!("hyper={class}"));
+        }
+        if let Some(h2) = cause.downcast_ref::<h2::Error>() {
+            classified = true;
+            let kind = if h2.is_reset() {
+                "stream_reset"
+            } else if h2.is_go_away() {
+                "goaway"
+            } else if h2.is_io() {
+                "io"
+            } else {
+                "protocol"
+            };
+            let origin = if h2.is_remote() {
+                "remote"
+            } else if h2.is_library() {
+                "library"
+            } else {
+                "local"
+            };
+            facts.push(format!("h2={origin}_{kind}"));
+            if let Some(reason) = h2.reason() {
+                facts.push(format!(
+                    "h2_reason={}({})",
+                    h2_reason_name(reason),
+                    u32::from(reason)
+                ));
+            }
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            classified = true;
+            let mut value = format!("io={:?}", io.kind());
+            if let Some(code) = io.raw_os_error() {
+                value.push_str(&format!("({code})"));
+            }
+            facts.push(value);
+        }
+        if let Some(tls) = cause.downcast_ref::<hudsucker::rustls::Error>() {
+            classified = true;
+            let class = match tls {
+                hudsucker::rustls::Error::InvalidCertificate(_) => "invalid_certificate",
+                hudsucker::rustls::Error::NoCertificatesPresented => "no_certificate",
+                hudsucker::rustls::Error::AlertReceived(_) => "peer_alert",
+                hudsucker::rustls::Error::PeerIncompatible(_) => "peer_incompatible",
+                hudsucker::rustls::Error::NoApplicationProtocol => "no_application_protocol",
+                _ => "protocol",
+            };
+            facts.push(format!("tls={class}"));
+        }
+        source = cause.source();
+        depth += 1;
+    }
+    if !classified {
+        facts.push("cause=unclassified".into());
+    }
+    facts.push(if error.is_connect() {
+        "delivery=not_started".into()
+    } else {
+        "delivery=uncertain".into()
+    });
+    facts.push("friendzone_retry=disabled".into());
+    let mut unique = Vec::with_capacity(facts.len());
+    for fact in facts {
+        if !unique.contains(&fact) {
+            unique.push(fact);
+        }
+    }
+    // All values are broker-generated enums, numeric codes, and elapsed time;
+    // no arbitrary error text, URL, header, body, or credential is copied.
+    unique.join("; ")
+}
+
+fn h2_reason_name(reason: h2::Reason) -> &'static str {
+    match reason {
+        h2::Reason::NO_ERROR => "NO_ERROR",
+        h2::Reason::PROTOCOL_ERROR => "PROTOCOL_ERROR",
+        h2::Reason::INTERNAL_ERROR => "INTERNAL_ERROR",
+        h2::Reason::FLOW_CONTROL_ERROR => "FLOW_CONTROL_ERROR",
+        h2::Reason::SETTINGS_TIMEOUT => "SETTINGS_TIMEOUT",
+        h2::Reason::STREAM_CLOSED => "STREAM_CLOSED",
+        h2::Reason::FRAME_SIZE_ERROR => "FRAME_SIZE_ERROR",
+        h2::Reason::REFUSED_STREAM => "REFUSED_STREAM",
+        h2::Reason::CANCEL => "CANCEL",
+        h2::Reason::COMPRESSION_ERROR => "COMPRESSION_ERROR",
+        h2::Reason::CONNECT_ERROR => "CONNECT_ERROR",
+        h2::Reason::ENHANCE_YOUR_CALM => "ENHANCE_YOUR_CALM",
+        h2::Reason::INADEQUATE_SECURITY => "INADEQUATE_SECURITY",
+        h2::Reason::HTTP_1_1_REQUIRED => "HTTP_1_1_REQUIRED",
+        _ => "UNKNOWN",
     }
 }
 
@@ -872,6 +1457,67 @@ mod tests {
             );
             assert!(state.reviews.summaries().is_empty());
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lfs_download_is_a_buffered_read_but_upload_and_policy_races_fail_closed() {
+        let dir = std::env::temp_dir().join(format!("fz-lfs-gates-{}", uuid::Uuid::new_v4()));
+        let state = AppState::default();
+        state.add_container("guest").unwrap();
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        let peer: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let oid = "a".repeat(64);
+        let body = |operation: &str| {
+            format!(
+                r#"{{"operation":"{operation}","transfers":["ssh","lfs-standalone-file","basic"],"objects":[{{"oid":"{oid}","size":12}}],"hash_algo":"sha256"}}"#
+            )
+        };
+        let request = |operation: &str| {
+            let mut request = request(
+                "POST",
+                "https://github.com/cline/cline.git/info/lfs/objects/batch",
+                Some("guest"),
+            );
+            request.headers_mut().insert(
+                "content-type",
+                "application/vnd.git-lfs+json; charset=utf-8"
+                    .parse()
+                    .unwrap(),
+            );
+            request
+                .headers_mut()
+                .insert("accept", "application/vnd.git-lfs+json".parse().unwrap());
+            *request.body_mut() = Body::from(body(operation));
+            request
+        };
+        let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081, 8082);
+        assert!(matches!(
+            handler.handle_from_peer(peer, request("download")).await,
+            RequestOrResponse::Request(_)
+        ));
+        assert!(state.reviews.summaries().is_empty());
+        assert!(matches!(state.view().requests[0].verdict, Verdict::Allowed));
+
+        assert_eq!(
+            status(handler.handle_from_peer(peer, request("upload")).await),
+            StatusCode::FORBIDDEN
+        );
+        assert!(state.reviews.summaries().is_empty());
+
+        let changed = state.clone();
+        let raced_body = body("download");
+        let mut raced = request("download");
+        *raced.body_mut() = Body::from_stream(futures_util::stream::once(async move {
+            changed.set_killed("guest".into(), true).unwrap();
+            changed.set_killed("guest".into(), false).unwrap();
+            Ok::<_, std::io::Error>(raced_body)
+        }));
+        assert_eq!(
+            status(handler.handle_from_peer(peer, raced).await),
+            StatusCode::FORBIDDEN
+        );
+        assert!(state.reviews.summaries().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

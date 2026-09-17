@@ -1,8 +1,15 @@
 //! All upstream traffic goes to a local fixture through a test-only connector.
 //! Git runs with a temporary home and empty config; never host helpers/tokens.
 use super::*;
-use axum::{Router, http::HeaderMap, response::IntoResponse, routing::get};
+use axum::{
+    Router,
+    body::Bytes,
+    http::HeaderMap,
+    response::IntoResponse,
+    routing::{get, post},
+};
 use hudsucker::{Proxy, certificate_authority::RcgenAuthority, rustls::crypto::aws_lc_rs};
+use sha2::Digest;
 use std::{
     path::PathBuf,
     sync::{
@@ -44,7 +51,13 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
     let ca = dir.0.join("guest-ca.pem");
     std::fs::write(&ca, &files.cert_pem).unwrap();
     let config = dir.0.join("empty-gitconfig");
-    std::fs::write(&config, "").unwrap();
+    std::fs::write(
+        &config,
+        "[credential]\n\thelper = !f() { if test \"$1\" = get; then printf \"%s\\n\" \"username=stale\" \"password=stale\"; fi; }; f\n",
+    )
+    .unwrap();
+    let helper_config = dir.0.join("friendzone.gitconfig");
+    std::fs::write(&helper_config, crate::bootstrap::GITHUB_GIT_CONFIG).unwrap();
     let settings = crate::settings::Settings::load(&dir.0).unwrap();
     settings
         .add_entry(crate::settings::EscrowEntry {
@@ -65,12 +78,20 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
         .unwrap();
     let seen = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
     let received = seen.clone();
+    let lfs_seen = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+    let lfs_received = lfs_seen.clone();
+    let lfs_object = b"Friendzone Git LFS fixture\n".to_vec();
+    let lfs_oid = format!("{:x}", sha2::Sha256::digest(&lfs_object));
+    let lfs_oid_response = lfs_oid.clone();
+    let lfs_object_response = lfs_object.clone();
+    let lfs_object_download = lfs_object.clone();
     let cargo_hits = Arc::new(AtomicUsize::new(0));
     let cargo_received = cargo_hits.clone();
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();
-    let _upstream = Task(tokio::spawn(async move {
-        axum::serve(
+    let _upstream =
+        Task(tokio::spawn(async move {
+            axum::serve(
             upstream,
             Router::new()
                 .route(
@@ -119,6 +140,59 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
                     ),
                 )
                 .route(
+                    "/cline/cline.git/info/lfs/objects/batch",
+                    post(move |headers: HeaderMap, body: Bytes| {
+                        let lfs_received = lfs_received.clone();
+                        let oid = lfs_oid_response.clone();
+                        async move {
+                            assert!(headers["content-type"]
+                                .to_str()
+                                .unwrap()
+                                .to_ascii_lowercase()
+                                .starts_with("application/vnd.git-lfs+json"));
+                            assert!(!headers.contains_key("proxy-authorization"));
+                            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                            assert_eq!(request["operation"], "download");
+                            assert_eq!(request["objects"][0]["oid"], oid);
+                            let auth = headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned);
+                            let expected = format!(
+                                "Basic {}",
+                                STANDARD.encode(b"x-access-token:fixture-real-token")
+                            );
+                            lfs_received.lock().unwrap().push(auth.clone());
+                            if auth.as_deref() != Some(&expected) {
+                                return (
+                                    StatusCode::UNAUTHORIZED,
+                                    [("lfs-authenticate", "Basic realm=\"Git LFS\"")],
+                                    axum::Json(serde_json::json!({"message":"Credentials needed"})),
+                                )
+                                    .into_response();
+                            }
+                            axum::Json(serde_json::json!({
+                                "transfer":"basic",
+                                "objects":[{
+                                    "oid":oid,
+                                    "size":lfs_object_response.len(),
+                                    "authenticated":true,
+                                    "actions":{"download":{"href":"https://github.com/lfs-object"}}
+                                }],
+                                "hash_algo":"sha256"
+                            }))
+                            .into_response()
+                        }
+                    }),
+                )
+                .route(
+                    "/lfs-object",
+                    get(move || {
+                        let object = lfs_object_download.clone();
+                        async move { object }
+                    }),
+                )
+                .route(
                     "/config.json",
                     get(|| async {
                         axum::Json(serde_json::json!({
@@ -156,7 +230,7 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
         )
         .await
         .unwrap();
-    }));
+        }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let connector = tower::service_fn(move |uri: hudsucker::hyper::Uri| {
@@ -225,17 +299,24 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
     );
     assert_eq!(state.view().requests[0].status, Some(200));
 
-    // A real Git process retries the server challenge using a command-scoped
-    // helper. Only dummy credentials exist, and the connector cannot go online.
+    // A real Git process retries the server challenge using the same managed
+    // include installed in guests. Only dummy credentials exist, and the
+    // connector cannot go online.
     let mut git = tokio::process::Command::new("git");
     git.env_clear();
     // Exercise the installed Windows backend and the guest setup fix: Schannel
     // keeps verification enabled but is explicitly allowed to honor the PEM.
     if cfg!(windows) {
         git.args(["-c", "http.sslBackend=schannel"])
-            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_COUNT", "2")
             .env("GIT_CONFIG_KEY_0", "http.schannelUseSSLCAInfo")
-            .env("GIT_CONFIG_VALUE_0", "true");
+            .env("GIT_CONFIG_VALUE_0", "true")
+            .env("GIT_CONFIG_KEY_1", "include.path")
+            .env("GIT_CONFIG_VALUE_1", &helper_config);
+    } else {
+        git.env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "include.path")
+            .env("GIT_CONFIG_VALUE_0", &helper_config);
     }
     for key in [
         "PATH",
@@ -250,13 +331,30 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
             git.env(key, value);
         }
     }
-    git.current_dir(&dir.0).env("HOME",&dir.0).env("USERPROFILE",&dir.0)
-        .env("XDG_CONFIG_HOME",&dir.0).env("APPDATA",&dir.0).env("LOCALAPPDATA",&dir.0)
-        .env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL",&config).env("GIT_TERMINAL_PROMPT","0")
-        .env("GIT_SSL_CAINFO",&ca).env("GITHUB_TOKEN","fake-github-token").kill_on_drop(true)
-        .args(["-c","credential.helper=","-c","credential.helper=!f() { if test \"$1\" = get; then printf \"%s\\n\" \"username=x-access-token\" \"password=$GITHUB_TOKEN\"; fi; }; f",
-            "-c","http.sslVerify=true","-c","protocol.version=0","-c","http.followRedirects=false",
-            "-c",&format!("http.proxy=http://{address}"),"ls-remote","https://github.com/cline/cline.git"]);
+    git.current_dir(&dir.0)
+        .env("HOME", &dir.0)
+        .env("USERPROFILE", &dir.0)
+        .env("XDG_CONFIG_HOME", &dir.0)
+        .env("APPDATA", &dir.0)
+        .env("LOCALAPPDATA", &dir.0)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &config)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSL_CAINFO", &ca)
+        .env("GITHUB_TOKEN", "fake-github-token")
+        .kill_on_drop(true)
+        .args([
+            "-c",
+            "http.sslVerify=true",
+            "-c",
+            "protocol.version=0",
+            "-c",
+            "http.followRedirects=false",
+            "-c",
+            &format!("http.proxy=http://{address}"),
+            "ls-remote",
+            "https://github.com/cline/cline.git",
+        ]);
     let before = seen.lock().unwrap().len();
     let output = tokio::time::timeout(Duration::from_secs(15), git.output())
         .await
@@ -282,6 +380,129 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
         STANDARD.encode(b"x-access-token:fixture-real-token")
     );
     assert!(observed.iter().flatten().all(|value| value == &expected));
+
+    // Git LFS is a separate process, but inherits the managed include through
+    // GIT_CONFIG_* environment entries. The first empty helper clears inherited
+    // helpers for GitHub; after the fixture's LFS-Authenticate 401, the second
+    // returns only the fake token and Friendzone substitutes it.
+    let repo = dir.0.join("lfs-repository");
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["config", "user.name", "Fixture"],
+        vec!["config", "user.email", "fixture@example.invalid"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/cline/cline.git",
+        ],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(
+        repo.join("asset.bin"),
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{lfs_oid}\nsize {}\n",
+            lfs_object.len()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".gitattributes"),
+        "asset.bin filter=lfs diff=lfs merge=lfs -text\n",
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["add", ".gitattributes", "asset.bin"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["commit", "--quiet", "-m", "LFS pointer"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut lfs = tokio::process::Command::new("git");
+    lfs.current_dir(&repo)
+        .env("GITHUB_TOKEN", "fake-github-token")
+        .env("HTTPS_PROXY", format!("http://{address}"))
+        .env("HTTP_PROXY", format!("http://{address}"))
+        .env("NO_PROXY", "")
+        .env("GIT_SSL_CAINFO", &ca)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &config)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true)
+        .args(["lfs", "fetch", "origin", "HEAD"]);
+    if cfg!(windows) {
+        lfs.env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "http.schannelUseSSLCAInfo")
+            .env("GIT_CONFIG_VALUE_0", "true")
+            .env("GIT_CONFIG_KEY_1", "include.path")
+            .env("GIT_CONFIG_VALUE_1", &helper_config);
+    } else {
+        lfs.env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "include.path")
+            .env("GIT_CONFIG_VALUE_0", &helper_config);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(20), lfs.output())
+        .await
+        .unwrap()
+        .expect("Git LFS must be installed for interoperability test");
+    assert!(
+        output.status.success(),
+        "git lfs fetch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let downloaded = repo
+        .join(".git/lfs/objects")
+        .join(&lfs_oid[..2])
+        .join(&lfs_oid[2..4])
+        .join(&lfs_oid);
+    assert_eq!(std::fs::read(downloaded).unwrap(), lfs_object);
+    let lfs_auth = lfs_seen.lock().unwrap().clone();
+    assert!(
+        lfs_auth.contains(&None),
+        "Git LFS must first receive a challenge"
+    );
+    assert!(lfs_auth.iter().any(Option::is_some));
+    assert!(lfs_auth.iter().flatten().all(|value| value == &expected));
+
+    let lfs_calls = lfs_auth.len();
+    let blocked = client
+        .post("https://github.com/cline/cline.git/info/lfs/objects/batch")
+        .basic_auth("x-access-token", Some("fake-github-token"))
+        .header("accept", "application/vnd.git-lfs+json")
+        .header("content-type", "application/vnd.git-lfs+json")
+        .body(format!(
+            r#"{{"operation":"upload","transfers":["basic"],"objects":[{{"oid":"{lfs_oid}","size":{}}}]}}"#,
+            lfs_object.len()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+    assert!(blocked.text().await.unwrap().contains("Git LFS uploads"));
+    assert_eq!(
+        lfs_seen.lock().unwrap().len(),
+        lfs_calls,
+        "upload reached upstream"
+    );
+    assert!(state.reviews.summaries().is_empty());
 
     // Cargo's vendored libcurl uses Schannel on Windows. Its native CA setting
     // must verify the same generated interception certificate. CARGO_HOME and

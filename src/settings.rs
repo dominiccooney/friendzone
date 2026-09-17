@@ -650,7 +650,7 @@ mod tests {
 
     #[test]
     fn settings_persist_and_guest_env_renders() {
-        let (settings, dir) = temp_settings();
+        let (_settings, dir) = temp_settings();
         let reloaded = Settings::load(&dir).unwrap();
         assert_eq!(reloaded.entries().len(), 1);
         assert_eq!(reloaded.secret("anthropic").as_deref(), Some("sk-ant-real"));

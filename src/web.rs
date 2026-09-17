@@ -1130,34 +1130,39 @@ async fn bootstrap_hello(
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
     axum::extract::Query(query): axum::extract::Query<HelloQuery>,
 ) -> axum::response::Response {
-    // Announce the label through the same source-owner check, then report whether
-    // this source is ready for credential-free traffic. Wildcard preapproval and
-    // a different label already owning this IP are not sufficient.
-    let named = state
-        .mcp
-        .app
-        .authorize_proxy_peer(peer.ip(), Some(&query.container));
-    if let Err(error) = named {
-        return (
+    // Setup is recovery/bootstrap, not runtime authorization. A unique explicit
+    // IP pin is the identity and wins over a stale downloaded label. This lets
+    // the same VM safely rerun setup without creating or impersonating a guest.
+    let (container, authorization, explicitly_pinned) =
+        match state.mcp.app.announce_guest(&query.container, peer.ip()) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "container": query.container,
+                "requested_container": query.container,
                 "approved": false,
                 "error": error.to_string(),
+                "action": "Fix duplicate IP pins in host Settings > Guests, then rerun setup.",
             })),
         )
             .into_response();
-    }
-    let approved = state
-        .mcp
-        .app
-        .authorize_proxy_peer(peer.ip(), None)
-        .is_ok_and(|(owner, authorization)| {
-            owner == query.container && authorization == crate::state::Authorization::Allowed
-        });
+            }
+        };
+    let canonicalized = container != query.container;
+    let approved = explicitly_pinned && authorization == crate::state::Authorization::Allowed;
     Json(serde_json::json!({
-        "container": query.container,
+        "requested_container": query.container,
+        "container": container,
         "approved": approved,
+        "canonicalized": canonicalized,
+        "message": if canonicalized {
+            format!("This VM's source IP is already pinned to guest '{container}'. Setup will update that guest.")
+        } else if approved {
+            "This guest is approved and pinned to this VM's source IP.".to_owned()
+        } else {
+            "Use Approve + pin IP for this guest in the host Inbox after setup.".to_owned()
+        },
     }))
     .into_response()
 }
@@ -3415,7 +3420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_hello_requires_the_requested_label_to_own_a_unique_ip_pin() {
+    async fn bootstrap_hello_uses_the_unique_pinned_identity_over_a_stale_requested_label() {
         let settings = test_settings();
         let registry =
             crate::mcp::ForwardRegistry::load(settings.data_dir(), settings.clone()).unwrap();
@@ -3473,7 +3478,17 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["requested_container"], "other");
+        assert_eq!(value["container"], "guest");
+        assert_eq!(value["approved"], true);
+        assert_eq!(value["canonicalized"], true);
         assert!(
             !app.view()
                 .containers
@@ -3511,7 +3526,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
             .await
             .unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();

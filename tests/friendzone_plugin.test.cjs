@@ -24,10 +24,18 @@ test('discovery without a session registers tools without config, timers, networ
     assert.deepEqual([...tools.keys()],toolNames);
     const publish=tools.get('friendzone_submit_git_bundle'),description=publish.description;
     assert.match(description,/GITHUB_TOKEN is Friendzone's fake escrow token/);
-    assert.match(description,/git -c credential\.helper= -c 'credential\.helper=!f\(\) \{/);
-    assert.match(description,/username=x-access-token/);assert.match(description,/password=\$GITHUB_TOKEN/);
-    assert.match(description,/Replace only <rest of git command>/);assert.match(description,/Ordinary git push remains blocked/);
-    assert.doesNotMatch(description,/git config --global|https:\/\/[^ ]*\$GITHUB_TOKEN/);
+    assert.match(description,/configures Git HTTPS authentication automatically/);
+    assert.match(description,/git fetch origin main/);assert.match(description,/git lfs fetch origin HEAD/);
+    assert.match(description,/only to exact HTTPS github\.com/);assert.match(description,/inherited by Git LFS/);
+    assert.match(description,/returns nothing for HTTP, subdomains, lookalike hosts, or other origins/);
+    assert.match(description,/LFS uploads remain blocked/);
+    assert.equal(publish.inputSchema.properties.base_branch,undefined);
+    assert.match(publish.inputSchema.properties.base_oid.description,/Exact repository commit/);
+    assert.match(publish.inputSchema.properties.base_oid.description,/need not be a current branch tip/);
+    assert.match(publish.inputSchema.properties.expected_oid.description,/captured before rebasing/);
+    assert.match(publish.inputSchema.properties.expected_oid.description,/force-with-lease/);
+    assert.match(description,/Rerun guest setup/);assert.match(description,/Ordinary git push remains blocked/);
+    assert.doesNotMatch(description,/credential\.helper=!|git config --global|https:\/\/[^ ]*\$GITHUB_TOKEN/);
     for(const tool of tools.values()){
       assert.equal(tool.retryable,false);assert.equal(typeof tool.execute,'function');
       await assert.rejects(()=>tool.execute({session_id:'not-a-real-context',sessionId:'not-a-real-context'},{}),/session.*required|requires.*session/i);
@@ -83,14 +91,14 @@ test('git bundle tool uploads exact bounded bytes and metadata without credentia
   const f=await fixture(t),plugin=f.load('push-session');
   const bundle=path.join(f.home,'feature.bundle'),bytes=Buffer.from('# v2 git bundle\n-fixture base\nfixture refs/heads/feature\n\nPACK\0bytes');
   fs.writeFileSync(bundle,bytes);
-  const accepted=await plugin.run('friendzone_submit_git_bundle',{request_key:'publish-feature',bundle_file:bundle,repository:'cline/cline',branch:'feature',base_branch:'master',expected_oid:'0'.repeat(40)});
+  const accepted=await plugin.run('friendzone_submit_git_bundle',{request_key:'publish-feature',bundle_file:bundle,repository:'cline/cline',branch:'feature',base_oid:'1'.repeat(40),expected_oid:'0'.repeat(40)});
   assert.equal(accepted.status,'preparing');assert.equal(accepted.session_id,'push-session');
   const call=f.calls.find(call=>call.url.startsWith('/guest/git-push?'));assert.ok(call);
   const url=new URL(call.url,'http://fixture');
-  assert.deepEqual(Object.fromEntries(url.searchParams),{request_key:'publish-feature',session_id:'push-session',repository:'cline/cline',branch:'feature',base_branch:'master',expected_oid:'0'.repeat(40)});
+  assert.deepEqual(Object.fromEntries(url.searchParams),{request_key:'publish-feature',session_id:'push-session',repository:'cline/cline',branch:'feature',base_oid:'1'.repeat(40),expected_oid:'0'.repeat(40)});
   assert.equal(call.headers['content-type'],'application/x-git-bundle');assert.equal(Number(call.headers['content-length']),bytes.length);assert.equal(call.authorization,undefined);assert.deepEqual(Buffer.from(call.body),bytes);
   const before=f.calls.length;
-  await assert.rejects(()=>plugin.run('friendzone_submit_git_bundle',{request_key:'bad',bundle_file:'relative.bundle',repository:'cline/cline',branch:'feature',base_branch:'master',expected_oid:'0'.repeat(40)}),/absolute/);
+  await assert.rejects(()=>plugin.run('friendzone_submit_git_bundle',{request_key:'bad',bundle_file:'relative.bundle',repository:'cline/cline',branch:'feature',base_oid:'1'.repeat(40),expected_oid:'0'.repeat(40)}),/absolute/);
   assert.equal(f.calls.length,before);
 });
 
