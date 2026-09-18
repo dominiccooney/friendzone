@@ -20,6 +20,7 @@ mod review;
 mod settings;
 mod state;
 mod storage;
+mod telemetry;
 mod web;
 
 use std::{net::SocketAddr, path::PathBuf};
@@ -64,6 +65,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    use opentelemetry::trace::TracerProvider as _;
     use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
     let normal = tracing_subscriber::fmt::layer().with_filter(
@@ -76,12 +78,21 @@ async fn main() -> Result<()> {
     let h2_settings = diagnostics::H2SettingsLayer::default().with_filter(
         tracing_subscriber::filter::filter_fn(diagnostics::h2_settings_metadata),
     );
+    let tracer_provider = telemetry::provider_from_env()?;
+    let otel = tracer_provider.as_ref().map(|provider| {
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("friendzone-proxy"))
+            .with_filter(tracing_subscriber::filter::filter_fn(
+                telemetry::proxy_metadata,
+            ))
+    });
     tracing_subscriber::registry()
         .with(normal)
         .with(h2_settings)
+        .with(otel)
         .init();
 
-    match Cli::parse().command {
+    let result = match Cli::parse().command {
         Command::Broker {
             proxy_addr,
             ui_addr,
@@ -97,7 +108,13 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Doctor { broker, proxy } => doctor::run(&broker, &proxy).await,
+    };
+    if let Some(provider) = tracer_provider
+        && let Err(error) = provider.shutdown()
+    {
+        tracing::warn!(%error, "could not flush OpenTelemetry traces during shutdown");
     }
+    result
 }
 
 async fn run_broker(

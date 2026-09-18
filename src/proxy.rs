@@ -24,6 +24,7 @@ struct PendingUpstream {
     method: String,
     path: String,
     forwarding_at: std::time::Instant,
+    server_span: tracing::Span,
     lifecycle: Option<Arc<UpstreamLifecycle>>,
 }
 
@@ -56,13 +57,40 @@ struct UpstreamLifecycle {
     path: String,
     started: std::time::Instant,
     finished: AtomicBool,
+    spans: Mutex<Option<TraceSpans>>,
+}
+
+struct TraceSpans {
+    client: tracing::Span,
+    server: tracing::Span,
 }
 
 impl UpstreamLifecycle {
     fn start(pending: &PendingUpstream) -> Arc<Self> {
         let active_total = ACTIVE_UPSTREAM.fetch_add(1, Ordering::AcqRel) + 1;
         let active_host = host_active(&pending.host, 1);
+        let client = tracing::info_span!(
+            parent: &pending.server_span,
+            "friendzone.proxy.upstream",
+            otel.kind = "client",
+            otel.name = %format!("{} {}", pending.method, pending.host),
+            "friendzone.request.id" = %pending.id,
+            "http.request.method" = %pending.method,
+            "server.address" = %pending.host,
+            "url.path" = %pending.path,
+            "http.response.status_code" = tracing::field::Empty,
+            "network.protocol.name" = tracing::field::Empty,
+            "http.response.body.size" = tracing::field::Empty,
+            "friendzone.outcome" = tracing::field::Empty,
+            "friendzone.active.total" = active_total,
+            "friendzone.active.host" = active_host,
+            "friendzone.transport.detail" = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            otel.status_description = tracing::field::Empty,
+        );
         tracing::info!(
+            parent: &client,
             request_id = %pending.id,
             upstream_host = %pending.host,
             method = %pending.method,
@@ -78,7 +106,32 @@ impl UpstreamLifecycle {
             path: pending.path.clone(),
             started: pending.forwarding_at,
             finished: AtomicBool::new(false),
+            spans: Mutex::new(Some(TraceSpans {
+                server: pending.server_span.clone(),
+                client,
+            })),
         })
+    }
+
+    fn client_span(&self) -> tracing::Span {
+        self.spans
+            .lock()
+            .expect("trace span lock")
+            .as_ref()
+            .map_or_else(tracing::Span::none, |spans| spans.client.clone())
+    }
+
+    fn server_span(&self) -> tracing::Span {
+        self.spans
+            .lock()
+            .expect("trace span lock")
+            .as_ref()
+            .map_or_else(tracing::Span::none, |spans| spans.server.clone())
+    }
+
+    fn context(&self) -> opentelemetry::Context {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        self.client_span().context()
     }
 
     fn finish(
@@ -95,7 +148,12 @@ impl UpstreamLifecycle {
             .fetch_sub(1, Ordering::AcqRel)
             .saturating_sub(1);
         let active_host = host_active(&self.host, -1);
+        let spans = self.spans.lock().expect("trace span lock").take();
+        let parent = spans
+            .as_ref()
+            .map_or_else(tracing::Span::none, |spans| spans.client.clone());
         tracing::info!(
+            parent: &parent,
             request_id = %self.id,
             upstream_host = %self.host,
             method = %self.method,
@@ -109,6 +167,39 @@ impl UpstreamLifecycle {
             active_host,
             "upstream request finished"
         );
+        if let Some(spans) = &spans {
+            let elapsed_ms = self.started.elapsed().as_millis() as u64;
+            spans.client.record("friendzone.outcome", outcome);
+            spans.client.record("friendzone.active.total", active_total);
+            spans.client.record("friendzone.active.host", active_host);
+            spans.client.record("http.response.body.size", bytes);
+            spans.server.record("friendzone.outcome", outcome);
+            spans
+                .server
+                .record("friendzone.upstream.elapsed_ms", elapsed_ms);
+            if let Some(status) = status {
+                spans.client.record("http.response.status_code", status);
+                spans.server.record("http.response.status_code", status);
+            }
+            if let Some(protocol) = protocol {
+                spans.client.record("network.protocol.name", protocol);
+            }
+            let error_type = if outcome == "response_complete" {
+                "http_status_error"
+            } else {
+                outcome
+            };
+            if outcome != "response_complete" || status.is_some_and(|status| status >= 400) {
+                spans.client.record("error.type", error_type);
+                spans.client.record("otel.status_code", "ERROR");
+                spans.client.record("otel.status_description", error_type);
+            }
+            if outcome != "response_complete" || status.is_some_and(|status| status >= 500) {
+                spans.server.record("error.type", error_type);
+                spans.server.record("otel.status_code", "ERROR");
+                spans.server.record("otel.status_description", error_type);
+            }
+        }
     }
 }
 
@@ -156,6 +247,7 @@ impl hudsucker::hyper::body::Body for ObservedRequestBody {
                     if !this.first_byte && !data.is_empty() {
                         this.first_byte = true;
                         tracing::info!(
+                            parent: &this.lifecycle.client_span(),
                             request_id = %this.lifecycle.id,
                             upstream_host = %this.lifecycle.host,
                             method = %this.lifecycle.method,
@@ -168,6 +260,7 @@ impl hudsucker::hyper::body::Body for ObservedRequestBody {
                 if this.inner.is_end_stream() {
                     this.ended = true;
                     tracing::info!(
+                        parent: &this.lifecycle.client_span(),
                         request_id = %this.lifecycle.id,
                         upstream_host = %this.lifecycle.host,
                         method = %this.lifecycle.method,
@@ -181,6 +274,7 @@ impl hudsucker::hyper::body::Body for ObservedRequestBody {
             Poll::Ready(None) => {
                 this.ended = true;
                 tracing::info!(
+                    parent: &this.lifecycle.client_span(),
                     request_id = %this.lifecycle.id,
                     upstream_host = %this.lifecycle.host,
                     method = %this.lifecycle.method,
@@ -193,6 +287,7 @@ impl hudsucker::hyper::body::Body for ObservedRequestBody {
             Poll::Ready(Some(Err(_))) => {
                 this.ended = true;
                 tracing::info!(
+                    parent: &this.lifecycle.client_span(),
                     request_id = %this.lifecycle.id,
                     upstream_host = %this.lifecycle.host,
                     method = %this.lifecycle.method,
@@ -212,6 +307,7 @@ impl Drop for ObservedRequestBody {
     fn drop(&mut self) {
         if !self.ended {
             tracing::info!(
+                parent: &self.lifecycle.client_span(),
                 request_id = %self.lifecycle.id,
                 upstream_host = %self.lifecycle.host,
                 method = %self.lifecycle.method,
@@ -244,6 +340,7 @@ impl hudsucker::hyper::body::Body for ObservedResponseBody {
                     if !this.first_byte && !data.is_empty() {
                         this.first_byte = true;
                         tracing::info!(
+                            parent: &this.lifecycle.client_span(),
                             request_id = %this.lifecycle.id,
                             upstream_host = %this.lifecycle.host,
                             method = %this.lifecycle.method,
@@ -499,9 +596,11 @@ impl EventHandler {
             pending.forwarding_at = std::time::Instant::now();
             let lifecycle = UpstreamLifecycle::start(pending);
             pending.lifecycle = Some(lifecycle.clone());
-            let (parts, body) = req.into_parts();
+            let (mut parts, body) = req.into_parts();
+            crate::telemetry::inject(&lifecycle.context(), &mut parts.headers);
             if body.is_end_stream() {
                 tracing::info!(
+                    parent: &lifecycle.client_span(),
                     request_id = %lifecycle.id,
                     upstream_host = %lifecycle.host,
                     method = %lifecycle.method,
@@ -533,7 +632,42 @@ impl EventHandler {
     async fn handle_from_peer(
         &mut self,
         peer: std::net::SocketAddr,
+        req: Request<Body>,
+    ) -> RequestOrResponse {
+        use tracing::Instrument as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+        let method = req.method().to_string();
+        let host = req.uri().host().unwrap_or_default();
+        let path = req.uri().path();
+        let server_span = tracing::info_span!(
+            "friendzone.proxy.request",
+            otel.kind = "server",
+            otel.name = %format!("{method} {host}"),
+            "http.request.method" = %method,
+            "server.address" = %host,
+            "url.path" = %path,
+            "client.address" = %peer.ip(),
+            "friendzone.container" = tracing::field::Empty,
+            "friendzone.request.id" = tracing::field::Empty,
+            "http.response.status_code" = tracing::field::Empty,
+            "friendzone.outcome" = tracing::field::Empty,
+            "friendzone.upstream.elapsed_ms" = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            otel.status_description = tracing::field::Empty,
+        );
+        let _ = server_span.set_parent(crate::telemetry::extract(req.headers()));
+        self.handle_from_peer_traced(peer, req, server_span.clone())
+            .instrument(server_span)
+            .await
+    }
+
+    async fn handle_from_peer_traced(
+        &mut self,
+        peer: std::net::SocketAddr,
         mut req: Request<Body>,
+        server_span: tracing::Span,
     ) -> RequestOrResponse {
         self.pending = None;
         self.response_watch = None;
@@ -546,6 +680,8 @@ impl EventHandler {
             Err(error) if !has_presented_identity => {
                 // Git/libcurl's anyauth mode waits for this challenge before
                 // sending a legacy username. New clients use a unique IP pin.
+                server_span.record("http.response.status_code", 407_u16);
+                server_span.record("friendzone.outcome", "proxy_authentication_required");
                 return Response::builder()
                     .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
                     .header(PROXY_AUTHENTICATE, "Basic realm=\"Friendzone\"")
@@ -556,6 +692,11 @@ impl EventHandler {
                     .into();
             }
             Err(error) => {
+                server_span.record("http.response.status_code", 403_u16);
+                server_span.record("friendzone.outcome", "identity_denied");
+                server_span.record("error.type", "identity_denied");
+                server_span.record("otel.status_code", "error");
+                server_span.record("otel.status_description", "guest identity denied");
                 return Response::builder()
                     .status(StatusCode::FORBIDDEN)
                     .body(Body::from(format!("friendzone: {error}")))
@@ -564,6 +705,7 @@ impl EventHandler {
             }
         };
         let (container, authorization) = container;
+        server_span.record("friendzone.container", &container);
         // Legacy proxy identity hints must never reach the upstream host.
         req.headers_mut().remove(PROXY_AUTHORIZATION);
         // The container gate comes before any policy: unknown names are
@@ -582,6 +724,12 @@ impl EventHandler {
                 req.uri().to_string(),
                 Verdict::Blocked,
             );
+            server_span.record("friendzone.request.id", id.to_string());
+            server_span.record("http.response.status_code", 403_u16);
+            server_span.record("friendzone.outcome", "authorization_denied");
+            server_span.record("error.type", "authorization_denied");
+            server_span.record("otel.status_code", "error");
+            server_span.record("otel.status_description", reason);
             self.state.annotate(id, Some(403), Some(reason.into()));
             return Response::builder()
                 .status(StatusCode::FORBIDDEN)
@@ -599,6 +747,12 @@ impl EventHandler {
                 req.uri().to_string(),
                 Verdict::Blocked,
             );
+            server_span.record("friendzone.request.id", id.to_string());
+            server_span.record("http.response.status_code", 403_u16);
+            server_span.record("friendzone.outcome", "destination_denied");
+            server_span.record("error.type", "destination_denied");
+            server_span.record("otel.status_code", "error");
+            server_span.record("otel.status_description", reason);
             self.state.annotate(id, Some(403), Some(reason.into()));
             return Response::builder()
                 .status(StatusCode::FORBIDDEN)
@@ -631,6 +785,7 @@ impl EventHandler {
                 Verdict::Allowed
             },
         );
+        server_span.record("friendzone.request.id", id.to_string());
         if !blocked {
             self.pending = Some(PendingUpstream {
                 id,
@@ -638,10 +793,16 @@ impl EventHandler {
                 method,
                 path,
                 forwarding_at: std::time::Instant::now(),
+                server_span: server_span.clone(),
                 lifecycle: None,
             });
         }
         if killed {
+            server_span.record("http.response.status_code", 403_u16);
+            server_span.record("friendzone.outcome", "container_killed");
+            server_span.record("error.type", "container_killed");
+            server_span.record("otel.status_code", "error");
+            server_span.record("otel.status_description", "container is killed");
             self.state
                 .annotate(id, Some(403), Some("container is killed".into()));
             Response::builder()
@@ -661,6 +822,11 @@ impl EventHandler {
                     }
                     Err(reason) => {
                         self.pending = None;
+                        server_span.record("http.response.status_code", 403_u16);
+                        server_span.record("friendzone.outcome", "review_denied");
+                        server_span.record("error.type", "review_denied");
+                        server_span.record("otel.status_code", "error");
+                        server_span.record("otel.status_description", &reason);
                         self.state.mark_blocked(id, 403, reason.clone());
                         return Response::builder()
                             .status(StatusCode::FORBIDDEN)
@@ -691,6 +857,11 @@ impl EventHandler {
                 }
                 crate::settings::Substitution::Block(reason) => {
                     self.pending = None;
+                    server_span.record("http.response.status_code", 403_u16);
+                    server_span.record("friendzone.outcome", "credential_denied");
+                    server_span.record("error.type", "credential_denied");
+                    server_span.record("otel.status_code", "error");
+                    server_span.record("otel.status_description", &reason);
                     self.state.mark_blocked(id, 403, reason.clone());
                     Response::builder()
                         .status(StatusCode::FORBIDDEN)
@@ -948,6 +1119,20 @@ impl HttpHandler for EventHandler {
                 }
             });
             if let Some(lifecycle) = &pending.lifecycle {
+                let client_span = lifecycle.client_span();
+                lifecycle
+                    .server_span()
+                    .record("http.response.status_code", 502_u16);
+                client_span.record("friendzone.transport.detail", &detail);
+                client_span.record("otel.status_code", "error");
+                client_span.record("otel.status_description", &detail);
+                tracing::warn!(
+                    parent: &client_span,
+                    request_id = %pending.id,
+                    upstream_host = %pending.host,
+                    diagnostic = %detail,
+                    "upstream request failed"
+                );
                 lifecycle.finish("transport_error", None, protocol, 0);
             }
             self.state.reviews.observe(
@@ -962,12 +1147,26 @@ impl HttpHandler for EventHandler {
             );
             self.state
                 .annotate(pending.id, Some(502), Some(detail.clone()));
-            tracing::warn!(
-                request_id = %pending.id,
-                upstream_host = %pending.host,
-                diagnostic = %detail,
-                "upstream request failed"
-            );
+            if pending.lifecycle.is_none() {
+                tracing::warn!(
+                    parent: &pending.server_span,
+                    request_id = %pending.id,
+                    upstream_host = %pending.host,
+                    diagnostic = %detail,
+                    "upstream request failed before lifecycle start"
+                );
+                pending
+                    .server_span
+                    .record("http.response.status_code", 502_u16);
+                pending
+                    .server_span
+                    .record("friendzone.outcome", "transport_error");
+                pending.server_span.record("error.type", "transport_error");
+                pending.server_span.record("otel.status_code", "error");
+                pending
+                    .server_span
+                    .record("otel.status_description", &detail);
+            }
         }
         Response::builder()
             .status(StatusCode::BAD_GATEWAY)
@@ -1014,6 +1213,7 @@ impl HttpHandler for EventHandler {
             .map(|info| info.local_addr().to_string())
             .unwrap_or_else(|| "unavailable".into());
         tracing::info!(
+            parent: &lifecycle.client_span(),
             request_id = %id,
             upstream_host = %host,
             method = %pending.method,
@@ -1030,7 +1230,7 @@ impl HttpHandler for EventHandler {
             "upstream response headers"
         );
         self.state.reviews.observe(id, crate::review::Status::ResponseReceived, Some(status),
-            if status >= 400 { "Upstream returned an HTTP error." } else { "Upstream response received. HTTP status alone does not confirm the operation succeeded." });
+                                   if status >= 400 { "Upstream returned an HTTP error." } else { "Upstream response received. HTTP status alone does not confirm the operation succeeded." });
         let is_json = res
             .headers()
             .get(hudsucker::hyper::header::CONTENT_TYPE)
@@ -1235,6 +1435,109 @@ pub fn basic_username(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_spans_continue_cline_trace_and_parent_the_upstream_lifecycle() {
+        use opentelemetry::trace::{SpanKind, TracerProvider as _};
+        use opentelemetry_sdk::testing::trace::new_test_exporter;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let (exporter, mut exported, _shutdown) = new_test_exporter();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter)
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer().with_tracer(provider.tracer("friendzone-proxy-test")),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = std::env::temp_dir().join(format!("fz-otel-{}", uuid::Uuid::new_v4()));
+        let state = AppState::default();
+        state.add_container("guest").unwrap();
+        state
+            .set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
+            .unwrap();
+        let mut handler = EventHandler::new(
+            state,
+            crate::settings::Settings::load(&dir).unwrap(),
+            8081,
+            8082,
+        );
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("https://api.cline.bot/v1/chat?secret=query")
+            .header(
+                "traceparent",
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            )
+            .body(Body::empty())
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("authorization", "Bearer must-not-export".parse().unwrap());
+        let RequestOrResponse::Request(forwarded) = handler
+            .handle_from_peer("127.0.0.1:12345".parse().unwrap(), request)
+            .await
+        else {
+            panic!("approved request was not forwarded")
+        };
+
+        let propagated = forwarded.headers()["traceparent"].to_str().unwrap();
+        let fields: Vec<_> = propagated.split('-').collect();
+        assert_eq!(fields[1], "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_ne!(fields[2], "00f067aa0ba902b7");
+        let client_span_id = fields[2].to_owned();
+        drop(forwarded);
+        handler
+            .pending
+            .as_ref()
+            .unwrap()
+            .lifecycle
+            .as_ref()
+            .unwrap()
+            .finish("response_complete", Some(200), Some("h2"), 37);
+        handler.pending = None;
+        drop(handler);
+        provider.force_flush().unwrap();
+
+        let mut spans = Vec::new();
+        while let Ok(span) = exported.try_recv() {
+            spans.push(span);
+        }
+        assert_eq!(spans.len(), 2, "{spans:#?}");
+        let server = spans
+            .iter()
+            .find(|span| span.span_kind == SpanKind::Server)
+            .unwrap();
+        let client = spans
+            .iter()
+            .find(|span| span.span_kind == SpanKind::Client)
+            .unwrap();
+        assert_eq!(
+            server.span_context.trace_id().to_string(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(server.parent_span_id.to_string(), "00f067aa0ba902b7");
+        assert!(server.parent_span_is_remote);
+        assert_eq!(
+            client.span_context.trace_id(),
+            server.span_context.trace_id()
+        );
+        assert_eq!(client.parent_span_id, server.span_context.span_id());
+        assert_eq!(client.span_context.span_id().to_string(), client_span_id);
+        let attributes = client
+            .attributes
+            .iter()
+            .map(|attribute| (attribute.key.as_str(), attribute.value.to_string()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(attributes["http.response.status_code"], "200");
+        assert_eq!(attributes["http.response.body.size"], "37");
+        assert_eq!(attributes["network.protocol.name"], "h2");
+        let rendered = format!("{spans:#?}");
+        assert!(!rendered.contains("must-not-export"));
+        assert!(!rendered.contains("secret=query"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn response_final_frame_does_not_need_an_extra_poll_to_record_completion() {

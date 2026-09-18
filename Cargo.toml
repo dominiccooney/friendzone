@@ -19,6 +19,9 @@ futures-util = "0.3"
 h2 = "=0.4.19"
 http-body-util = "0.1"
 hudsucker = { version = "0.25", features = ["http2"] }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
 rcgen = { version = "0.14", features = ["x509-parser"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -26,6 +29,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 tokio = { version = "1.48", features = ["full"] }
 tracing = "0.1"
+tracing-opentelemetry = { version = "0.33", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
 
@@ -33,4 +37,5 @@ uuid = { version = "1.18", features = ["serde", "v4"] }
 hyper-rustls = { version = "0.27", features = ["http2"] }
 tokio-rustls = "0.26"
 tower = { version = "0.5", features = ["util"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["testing", "trace"] }
 

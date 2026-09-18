@@ -14,6 +14,8 @@ import unittest
 from unittest import mock
 
 SOURCE = Path(__file__).resolve().parents[1] / "src/bootstrap/configure.py"
+# Fixed public certificate-only fixtures are source inputs, not generated files.
+# Stable, distinct bytes are required to exercise ownership and CA rotation.
 TEST_CA = (Path(__file__).resolve().parent / "fixtures/friendzone-test-ca.pem").read_text(encoding="utf-8")
 ROTATED_CA = (Path(__file__).resolve().parent / "fixtures/friendzone-rotated-test-ca.pem").read_text(encoding="utf-8")
 GIT_CONFIG = '''# Friendzone managed Git configuration v1

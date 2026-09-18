@@ -50,6 +50,12 @@ for common runtimes, and fake provider keys. NO_PROXY/no_proxy includes the
 broker host, localhost, 127.0.0.1, ::1 and [::1], preserving existing exclusions.
 Real credentials and OAuth refresh tokens never enter the script.
 
+Setup does not install or configure tracing packages. For timeout diagnosis,
+activate this environment first so the traced Cline process inherits its proxy
+and CA settings, then follow [Trace Cline proxy timeouts](TRACING.md). An existing
+Cline hub/core process must be restarted to inherit either tracing or changed
+proxy settings.
+
 The setup name remains the human-readable policy/log label. Runtime proxy,
 async-job, and MCP identity comes from a unique explicit source-IP pin. Use
 **Approve + pin IP** after setup. Host networking must prevent source spoofing,

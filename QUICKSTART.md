@@ -333,7 +333,29 @@ The first should return 200 before approval. The second requires **Approve + pin
 IP** and should then return 200. A 403/407 explains pending approval, Kill,
 missing/ambiguous pin, or source-IP mismatch. Do not disable TLS verification.
 
-## 5. Container: point the agent at MCP forwards
+## 5. Diagnose a timeout (optional)
+
+For a first client-side timeline, start Cline from the activated guest shell and
+inspect its documented logs:
+
+```sh
+# Terminal 1
+tail -F ~/.cline/cline-core-service.log ~/.cline/data/logs/hub-daemon.log
+
+# Terminal 2
+date -u
+cline --verbose --timeout 0 "minimal prompt that reproduces the timeout"
+```
+
+Friendzone can export proxy/upstream spans, but stock Cline's built-in
+OpenTelemetry support currently emits logs and metrics rather than distributed
+traces. To get one Cline → Friendzone → provider trace, instrument the Node Cline
+CLI/hub so its HTTP requests inject W3C `traceparent`. Follow
+[Trace Cline proxy timeouts](TRACING.md); it includes the temporary Node setup,
+collector configuration, and the extra host/switch rule required if the guest
+sends OTLP directly to host port 4318. Do not open that port broadly.
+
+## 6. Container: point the agent at MCP forwards
 
 In the host UI, each MCP server card has **Copy URL** next to its
 guest-facing URL; copying it requires no guest selection. The upstream URL
@@ -385,7 +407,7 @@ fields. Do not run `authorizeMcpServerOAuth` for Friendzone inside the container
 Authorize the **upstream** in the host Friendzone UI.
 Forward paths are case-sensitive: `Linear` uses `/mcp/Linear`.
 
-## 6. Smoke test — what should happen
+## 7. Smoke test — what should happen
 
 From the container (or the host with `127.0.0.1`):
 

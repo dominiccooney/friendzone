@@ -126,52 +126,25 @@ The request appears under the IP-pinned `reviewer` guest in the UI and request l
 The UI kill button rejects subsequent requests from that container until
 resumed.
 
-### Proxy transport and inference performance
+### Proxy transport and tracing
 
-Friendzone uses one shared upstream Hyper connection pool across all guest
-connections. TLS ALPN negotiates HTTP/2 when an origin supports it and falls
-back to HTTP/1.1 otherwise. Concurrent requests to an HTTP/2 origin multiplex
-over a shared connection instead of opening one TLS connection per inference.
-Idle upstream connections are retained for up to one minute, with at most 16
-idle connections per origin. HTTP/2 connections use adaptive flow control.
-Friendzone does not send application-level HTTP/2 keepalive PINGs: some provider
-edges reject aggressive ping schedules with GOAWAY. Active requests keep their
-connection alive normally; an uncertain POST failure is reported and never
-automatically replayed.
+Friendzone shares one upstream connection pool across guests, negotiates HTTP/2
+with HTTP/1.1 fallback, streams ordinary provider responses without buffering,
+and never retries an uncertain POST. Its request log and stderr diagnostics
+separate connection/send, response-header, first-byte, streaming, and completion
+phases and retain typed I/O/TLS/HTTP/2 failures without bodies, query strings,
+credentials, arbitrary headers, or raw HTTP/2 HEADERS frames.
 
-Ordinary provider response bodies—including `application/json`—stream directly
-to the guest with backpressure; Friendzone does not collect them for optional
-usage summaries. Only reviewed GitHub GraphQL JSON uses a bounded streaming
-observer, which does not delay or rewrite response bytes. Ordinary inference
-requests have no Friendzone concurrency semaphore; review and durable-job limits
-do not apply to them.
+Friendzone can also export OTLP/HTTP protobuf spans. Incoming W3C context becomes
+the parent of `friendzone.proxy.request`; its `friendzone.proxy.upstream` child is
+injected into the provider request. Both carry `friendzone.request.id` for the UI
+log. Stock Cline currently exports OpenTelemetry logs/metrics only—not distributed
+traces—so true automatic Cline-to-proxy parentage requires temporary Node
+auto-instrumentation or another client that injects `traceparent`.
 
-An upstream transport failure returns HTTP 502 with the same bounded diagnostic
-stored in the request log. It reports connect vs send phase, elapsed milliseconds,
-negotiated protocol when known, and typed I/O/TLS/HTTP/2 facts. For example,
-`h2=remote_stream_reset; h2_reason=REFUSED_STREAM(7)` identifies a peer reset,
-while `io=ConnectionRefused; delivery=not_started` proves no connection was made.
-`delivery=uncertain` means a POST may have reached the provider; Friendzone does
-not replay it. Diagnostics contain broker-generated categories and numeric codes,
-never request/response content, arbitrary error strings, or credentials. Rows
-recorded by older broker builds as only `client error (SendRequest)` cannot be
-enriched after the fact; restart onto the new binary to capture the next failure.
-
-While transport diagnosis is enabled, stdout/stderr also logs each h2 connection
-open/close and the peer's actual numeric SETTINGS, for example
-`friendzone h2_peer_settings h2_connection=7 direction=upstream ...
-max_concurrent_streams=2147483647 ...`. It separately logs each forwarded
-request's broker UUID, normalized host, method/path (never query), active request
-counts, request-body timing, response protocol/status/content-type, time to
-headers/first body byte, completion time and bytes. Response-header lines include
-the upstream local/remote socket tuple; identical tuples are sound evidence that
-requests used the same pooled TCP/TLS connection. Connection lines include an
-observation timestamp and connection age/lifetime. Raw h2 tracing stays disabled
-because it can include HEADERS and credentials. Stock Hyper does not expose its
-physical h2 session ID on each response, so do not infer an exact request-to-
-`h2_connection` mapping; compare timestamps, open connection count, protocol and
-`active_host` instead. No prompts, response bodies, authorization values, or
-query strings are emitted by these diagnostics.
+See [Trace Cline proxy timeouts](TRACING.md) for broker configuration, stock Cline
+logs, a shared-trace Cline CLI recipe, collector/firewall constraints, privacy,
+and a phase-by-phase timeout diagnosis table.
 
 ## GitHub policy
 
