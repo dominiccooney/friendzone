@@ -160,8 +160,10 @@ click "allow".
 - **Guest setup scripts** are retrieved with curl from the bootstrap listener.
   They configure CA/runtime environment, fake keys, Cline and persistent user
   environment without downloading a guest binary. The initial HTTP connection
-  is trust-on-first-use and requires a trusted host/network; system trust-store
-  installation and firewall changes are not performed by the scripts.
+  is trust-on-first-use and requires a trusted host/network. Setup installs the
+  exact broker CA into Kali/Debian/Ubuntu native trust using a narrow elevated
+  step and into Windows `CurrentUser\Root`; ownership state limits rotation and
+  removal to Friendzone-managed roots. Firewall changes are not performed.
 - **`fz doctor`** diagnoses from inside: direct IPs, DNS, UDP, and port
   22 must fail; CA trusted per runtime; broker reachable; fake
   credentials in place. Gates CI builds of images. Doctor diagnoses;

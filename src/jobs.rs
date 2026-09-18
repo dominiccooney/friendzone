@@ -22,6 +22,7 @@ const MAX_RESULT: usize = 4 * 1024 * 1024;
 const MAX_STORAGE: usize = 256 * 1024 * 1024;
 const MAX_JOBS: usize = 100;
 const REVIEW_HOURS: i64 = 24;
+const UNACKNOWLEDGED_RETENTION_HOURS: i64 = 1;
 
 /// Bounded metadata retained to distinguish approval/queue time, transport
 /// failures, and responses from GitHub or an intervening edge. Only explicitly
@@ -66,59 +67,6 @@ fn transport_error_kind(error: &reqwest::Error) -> &'static str {
     } else {
         "transport_failed"
     }
-}
-
-fn diagnostic_response_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
-    // These identify protocol/edge behavior or carry provider correlation and
-    // rate-limit facts. Never broaden this to cookies, auth, or arbitrary X-*.
-    const SAFE: &[&str] = &[
-        "date",
-        "server",
-        "via",
-        "content-type",
-        "content-length",
-        "x-github-request-id",
-        "x-github-media-type",
-        "x-github-api-version-selected",
-        "x-request-id",
-        "x-correlation-id",
-        "x-trace-id",
-        "traceparent",
-        "x-fastly-request-id",
-        "x-timer",
-        "x-served-by",
-        "x-cache",
-        "x-cache-hits",
-        "cf-ray",
-        "x-amz-cf-id",
-        "x-amz-request-id",
-        "x-azure-ref",
-        "x-envoy-upstream-service-time",
-        "x-ratelimit-limit",
-        "x-ratelimit-remaining",
-        "x-ratelimit-reset",
-        "x-ratelimit-resource",
-        "x-ratelimit-used",
-    ];
-    let mut result = Vec::new();
-    let mut total = 0usize;
-    for name in SAFE {
-        for value in headers.get_all(*name) {
-            let Ok(value) = value.to_str() else {
-                continue;
-            };
-            if value.len() > 1024 || value.chars().any(char::is_control) {
-                continue;
-            }
-            let size = name.len() + value.len();
-            if total + size > 8192 || result.len() >= 32 {
-                return result;
-            }
-            total += size;
-            result.push(((*name).to_owned(), value.to_owned()));
-        }
-    }
-    result
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -816,6 +764,220 @@ mod tests {
         );
         server.abort();
     }
+
+    #[test]
+    fn full_history_prunes_only_delivered_or_old_known_results_on_admission() {
+        let f = Fixture::new();
+        let seed = f.submit("seed", "mutation { example { id } }");
+        let seed_id = Fixture::id(&seed);
+        let now = Utc::now();
+        let (acknowledged_id, fresh_id, unknown_id) = f
+            .app
+            .jobs
+            .transaction(|saved| {
+                let template = saved.jobs.get(&seed_id).unwrap().clone();
+                saved.jobs.clear();
+                let mut acknowledged_id = None;
+                let mut fresh_id = None;
+                let mut unknown_id = None;
+                for index in 0..MAX_JOBS {
+                    let mut job = template.clone();
+                    job.id = Uuid::new_v4();
+                    job.submission.request_key = format!("history-{index}");
+                    job.status = Status::ResponseReceived;
+                    job.updated_at = now;
+                    job.result = Some(format!("result-{index}"));
+                    job.acknowledged_at = None;
+                    if index == 0 {
+                        job.updated_at = now - chrono::Duration::minutes(10);
+                        job.acknowledged_at = Some(now - chrono::Duration::minutes(9));
+                        acknowledged_id = Some(job.id);
+                    } else if index == 1 {
+                        fresh_id = Some(job.id);
+                    } else if index == 2 {
+                        job.status = Status::Unknown;
+                        job.updated_at = now - chrono::Duration::days(30);
+                        unknown_id = Some(job.id);
+                    }
+                    saved.jobs.insert(job.id, job);
+                }
+                Ok((
+                    acknowledged_id.unwrap(),
+                    fresh_id.unwrap(),
+                    unknown_id.unwrap(),
+                ))
+            })
+            .unwrap();
+
+        let accepted = f.submit("new-work", "mutation { another { id } }");
+        let accepted_id = Fixture::id(&accepted);
+        let saved = f.app.jobs.0.data.lock().expect("jobs lock");
+        assert_eq!(saved.jobs.len(), MAX_JOBS);
+        assert!(saved.jobs.contains_key(&accepted_id));
+        assert!(!saved.jobs.contains_key(&acknowledged_id));
+        assert!(saved.jobs.contains_key(&fresh_id));
+        assert!(saved.jobs.contains_key(&unknown_id));
+    }
+
+    #[test]
+    fn old_pre_acknowledgement_history_ages_out_but_fresh_history_rolls_back() {
+        let f = Fixture::new();
+        let seed = f.submit("seed", "mutation { example { id } }");
+        let seed_id = Fixture::id(&seed);
+        let now = Utc::now();
+        let oldest = f
+            .app
+            .jobs
+            .transaction(|saved| {
+                let template = saved.jobs.get(&seed_id).unwrap().clone();
+                saved.jobs.clear();
+                let mut oldest = None;
+                for index in 0..MAX_JOBS {
+                    let mut job = template.clone();
+                    job.id = Uuid::new_v4();
+                    job.status = Status::ResponseReceived;
+                    job.updated_at =
+                        now - chrono::Duration::hours(2) + chrono::Duration::seconds(index as i64);
+                    job.acknowledged_at = None;
+                    if index == 0 {
+                        oldest = Some(job.id);
+                    }
+                    saved.jobs.insert(job.id, job);
+                }
+                Ok(oldest.unwrap())
+            })
+            .unwrap();
+        let accepted = f.submit("after-old-plugin", "mutation { another { id } }");
+        let accepted_id = Fixture::id(&accepted);
+        let saved = f.app.jobs.0.data.lock().expect("jobs lock");
+        assert_eq!(saved.jobs.len(), MAX_JOBS);
+        assert!(!saved.jobs.contains_key(&oldest));
+        assert!(saved.jobs.contains_key(&accepted_id));
+        drop(saved);
+
+        f.app
+            .jobs
+            .transaction(|saved| {
+                for job in saved.jobs.values_mut() {
+                    if job.id != accepted_id {
+                        job.updated_at = now;
+                    }
+                }
+                if let Some(job) = saved.jobs.get_mut(&accepted_id) {
+                    job.status = Status::Unknown;
+                    job.updated_at = now - chrono::Duration::days(30);
+                }
+                Ok(())
+            })
+            .unwrap();
+        let before: Vec<_> = f
+            .app
+            .jobs
+            .0
+            .data
+            .lock()
+            .expect("jobs lock")
+            .jobs
+            .keys()
+            .copied()
+            .collect();
+        let error = f
+            .app
+            .jobs
+            .submit(
+                &f.app,
+                &f.settings,
+                "guest",
+                f.peer,
+                Submission {
+                    request_key: "too-soon".into(),
+                    session_id: "session".into(),
+                    query: "mutation { third { id } }".into(),
+                    variables: serde_json::Value::Null,
+                    operation_name: None,
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("recent results"));
+        let after: Vec<_> = f
+            .app
+            .jobs
+            .0
+            .data
+            .lock()
+            .expect("jobs lock")
+            .jobs
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(after, before, "failed admission must not change history");
+    }
+
+    #[test]
+    fn acknowledgement_requires_owner_session_and_known_terminal_result() {
+        let f = Fixture::new();
+        let accepted = f.submit("ack", "mutation { example { id } }");
+        let id = Fixture::id(&accepted);
+        let instance = f.app.async_identity("guest", f.peer).unwrap().0;
+        assert!(
+            f.app
+                .jobs
+                .acknowledge("guest", instance, id, "session")
+                .is_err(),
+            "active work must not become reclaimable"
+        );
+        f.app
+            .jobs
+            .transaction(|saved| {
+                let job = saved.jobs.get_mut(&id).unwrap();
+                job.status = Status::Unknown;
+                job.updated_at = Utc::now() - chrono::Duration::days(30);
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            f.app
+                .jobs
+                .acknowledge("guest", instance, id, "session")
+                .is_err(),
+            "uncertain work must remain manual-only"
+        );
+        f.app
+            .jobs
+            .transaction(|saved| {
+                let job = saved.jobs.get_mut(&id).unwrap();
+                job.status = Status::ResponseReceived;
+                job.updated_at = Utc::now();
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            f.app
+                .jobs
+                .acknowledge("guest", instance, id, "other-session")
+                .is_err()
+        );
+        assert!(
+            f.app
+                .jobs
+                .acknowledge("other", instance, id, "session")
+                .is_err()
+        );
+        f.app
+            .jobs
+            .acknowledge("guest", instance, id, "session")
+            .unwrap();
+        let first = f.app.jobs.0.data.lock().expect("jobs lock").jobs[&id].acknowledged_at;
+        f.app
+            .jobs
+            .acknowledge("guest", instance, id, "session")
+            .unwrap();
+        assert_eq!(
+            f.app.jobs.0.data.lock().expect("jobs lock").jobs[&id].acknowledged_at,
+            first,
+            "acknowledgement is idempotent"
+        );
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -840,6 +1002,10 @@ struct Job {
     facts: Option<crate::graphql::Facts>,
     #[serde(default)]
     upstream: Option<UpstreamDiagnostics>,
+    /// Set only after the guest plugin has durably checkpointed its completion
+    /// notification. Older plugins are covered by the bounded fallback age.
+    #[serde(default)]
+    acknowledged_at: Option<DateTime<Utc>>,
 }
 impl Job {
     fn summary(&self) -> Summary {
@@ -873,6 +1039,13 @@ impl Job {
         self.status = status;
         self.outcome = outcome.into();
         self.updated_at = Utc::now();
+    }
+
+    fn automatically_removable(&self, now: DateTime<Utc>) -> bool {
+        self.terminal()
+            && self.status != Status::Unknown
+            && (self.acknowledged_at.is_some()
+                || self.updated_at <= now - chrono::Duration::hours(UNACKNOWLEDGED_RETENTION_HOURS))
     }
 }
 
@@ -952,7 +1125,7 @@ impl Jobs {
         let reserved =
             next.jobs.values().filter(|j| !j.terminal()).count() * (MAX_RESULT * 6 + 4096);
         if bytes.len() + reserved > MAX_STORAGE {
-            bail!("async job storage full; remove completed jobs");
+            bail!("async job state exceeds its durable storage limit");
         }
         if let Some(path) = &self.0.path {
             crate::storage::atomic_write(path, &bytes)?;
@@ -961,6 +1134,42 @@ impl Jobs {
         drop(current);
         self.0.changes.send_modify(|v| *v = v.wrapping_add(1));
         Ok(result)
+    }
+
+    fn storage_usage(saved: &Saved) -> Result<usize> {
+        let bytes = serde_json::to_vec(saved)?.len();
+        let reserved = saved
+            .jobs
+            .values()
+            .filter(|job| !job.terminal())
+            .count()
+            .checked_mul(MAX_RESULT * 6 + 4096)
+            .context("async job storage reservation overflow")?;
+        bytes
+            .checked_add(reserved)
+            .context("async job storage size overflow")
+    }
+
+    /// Admission and history cleanup are one durable metadata transaction.
+    /// Active and uncertain work is never eligible; old plugins get a one-hour
+    /// delivery window before known terminal outcomes can age out.
+    fn prune_for_admission(saved: &mut Saved) -> Result<()> {
+        let now = Utc::now();
+        loop {
+            if saved.jobs.len() <= MAX_JOBS && Self::storage_usage(saved)? <= MAX_STORAGE {
+                return Ok(());
+            }
+            let candidate = saved
+                .jobs
+                .values()
+                .filter(|job| job.automatically_removable(now))
+                .min_by_key(|job| (job.updated_at, job.id))
+                .map(|job| job.id)
+                .context(
+                    "async job capacity is occupied by active, uncertain, or recent results; wait for completion delivery or explicitly remove a result",
+                )?;
+            saved.jobs.remove(&candidate);
+        }
     }
     pub fn submit(
         &self,
@@ -1036,24 +1245,27 @@ impl Jobs {
             result: None,
             facts: detail.summary.facts,
             upstream: None,
+            acknowledged_at: None,
         };
         self.transaction(|store| {
             // Every explicit POST is a distinct job. request_key is a human
             // correlation label, never an idempotency/deduplication key.
             // Workers execute by UUID and never submit/retry on their own.
-            if store.jobs.len() >= MAX_JOBS
-                || store.jobs.values().filter(|j| !j.terminal()).count() >= 32
-                || store
-                    .jobs
-                    .values()
-                    .filter(|j| j.container == container && !j.terminal())
-                    .count()
-                    >= 8
+            if store.jobs.values().filter(|job| !job.terminal()).count() >= 32 {
+                bail!("32 async jobs are still active; wait for them to finish or cancel pending jobs");
+            }
+            if store
+                .jobs
+                .values()
+                .filter(|job| job.container == container && !job.terminal())
+                .count()
+                >= 8
             {
-                bail!("async job capacity reached; finish/cancel jobs or remove old results");
+                bail!("this guest already has 8 active async jobs; wait for them to finish or cancel pending jobs");
             }
             let value = Self::guest_value(&job, false);
             store.jobs.insert(job.id, job);
+            Self::prune_for_admission(store)?;
             Ok(value)
         })
     }
@@ -1068,6 +1280,7 @@ impl Jobs {
             "http_status":job.http_status,
             "outcome":job.outcome,
             "terminal":job.terminal(),
+            "acknowledged":job.acknowledged_at.is_some(),
             "upstream":job.upstream,
             "result":if result {job.result.as_deref()}else{None}
         })
@@ -1127,6 +1340,30 @@ impl Jobs {
             Ok(())
         })
     }
+    pub fn acknowledge(
+        &self,
+        container: &str,
+        instance: Uuid,
+        id: Uuid,
+        session: &str,
+    ) -> Result<()> {
+        self.transaction(|data| {
+            let job = data
+                .jobs
+                .get_mut(&id)
+                .filter(|job| {
+                    job.container == container
+                        && job.instance == instance
+                        && job.submission.session_id == session
+                })
+                .context("job not found")?;
+            if !job.terminal() || job.status == Status::Unknown {
+                bail!("only known terminal results can be acknowledged");
+            }
+            job.acknowledged_at.get_or_insert_with(Utc::now);
+            Ok(())
+        })
+    }
     pub fn delete(&self, container: &str, instance: Uuid, id: Uuid, session: &str) -> Result<()> {
         self.transaction(|data| {
             let job = data
@@ -1175,6 +1412,24 @@ impl Jobs {
         )
         .ok()?;
         detail.summary = job.summary();
+        if job.status == Status::GraphqlError {
+            let headers = job
+                .upstream
+                .as_ref()
+                .map(|upstream| upstream.response_headers.clone())
+                .unwrap_or_default();
+            let content_type = headers
+                .iter()
+                .find(|(name, _)| name == "content-type")
+                .map(|(_, value)| value.clone());
+            detail.graphql_response = job.result.as_ref().and_then(|result| {
+                crate::review::graphql_response_diagnostics(
+                    result.as_bytes(),
+                    content_type,
+                    headers,
+                )
+            });
+        }
         Some(detail)
     }
     pub fn contains(&self, id: Uuid) -> bool {
@@ -1360,7 +1615,8 @@ impl Jobs {
                     let time_to_headers_ms = elapsed_ms(transfer_started);
                     let remote_addr = response.remote_addr().map(|address| address.to_string());
                     let http_version = format!("{:?}", response.version());
-                    let response_headers = diagnostic_response_headers(response.headers());
+                    let response_headers =
+                        crate::review::diagnostic_response_headers(response.headers());
                     tracing::info!(
                         request_id = %job.id,
                         http_status = http,

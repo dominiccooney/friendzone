@@ -1,17 +1,21 @@
 """Script-only Linux guest configuration; standard library, explicit test paths."""
 import base64
 import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
 import shlex
 import socket
+import subprocess
 import sys
 import tempfile
 import urllib.parse
 import urllib.request
 
 MARKER = "# Friendzone guest environment (managed)"
+SYSTEM_CA = Path("/usr/local/share/ca-certificates/friendzone-local-ca.crt")
+SYSTEM_CA_STATE = "linux-system-ca.json"
 
 
 def atomic_write(path, text, mode=0o600):
@@ -28,6 +32,123 @@ def atomic_write(path, text, mode=0o600):
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def certificate_digest(pem):
+    """Validate one bounded PEM certificate and return its DER SHA-256."""
+    if not isinstance(pem, str) or len(pem.encode("utf-8")) > 128 * 1024:
+        raise ValueError("Friendzone CA is missing or exceeds 128 KiB")
+    begin = "-----BEGIN CERTIFICATE-----"
+    end = "-----END CERTIFICATE-----"
+    if pem.count(begin) != 1 or pem.count(end) != 1:
+        raise ValueError("Friendzone CA must contain exactly one PEM certificate")
+    before, encoded = pem.split(begin, 1)
+    encoded, after = encoded.split(end, 1)
+    if before.strip() or after.strip():
+        raise ValueError("Friendzone CA contains data outside its PEM certificate")
+    try:
+        der = base64.b64decode("".join(encoded.split()), validate=True)
+    except Exception as error:
+        raise ValueError("Friendzone CA contains invalid PEM base64") from error
+    if not der:
+        raise ValueError("Friendzone CA certificate is empty")
+    return hashlib.sha256(der).hexdigest()
+
+
+def _command_path(name, known):
+    """Resolve only fixed administrator-owned paths, never the guest's PATH."""
+    for candidate in known:
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def install_linux_ca(cert, config, destination=SYSTEM_CA, run=None,
+                     updater=None, installer=None, remover=None, privilege=None):
+    """Install/rotate only Friendzone's owned Debian-family native trust anchor."""
+    cert, config, destination = map(lambda path: Path(path).absolute(),
+                                    (cert, config, destination))
+    pem = cert.read_text(encoding="utf-8")
+    digest = certificate_digest(pem)
+    state_path = config / SYSTEM_CA_STATE
+    state = None
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise ValueError("Invalid Friendzone Linux CA ownership state; repair or remove " + str(state_path)) from error
+        if (not isinstance(state, dict) or state.get("version") != 1 or
+                not isinstance(state.get("managed"), bool) or
+                not isinstance(state.get("sha256"), str) or
+                len(state["sha256"]) != 64 or
+                any(character not in "0123456789abcdef" for character in state["sha256"])):
+            raise ValueError("Invalid Friendzone Linux CA ownership state; repair or remove " + str(state_path))
+    previous = destination.read_bytes() if destination.exists() else None
+    previous_digest = certificate_digest(previous.decode("utf-8")) if previous is not None else None
+    if state is None and previous is not None and previous_digest != digest:
+        raise ValueError("Refusing to overwrite unowned system CA file " + str(destination))
+    if state is not None:
+        if state["managed"]:
+            if previous is not None and previous_digest != state["sha256"]:
+                raise ValueError("Friendzone-owned system CA was changed externally; refusing to overwrite " + str(destination))
+        elif previous_digest != state["sha256"] or digest != state["sha256"]:
+            raise ValueError("A pre-existing system CA occupies " + str(destination) + "; Friendzone will not replace it")
+    managed = state["managed"] if state is not None else previous is None
+    if previous_digest == digest:
+        if state is None:
+            config.mkdir(parents=True, exist_ok=True)
+            atomic_write(state_path, json.dumps(
+                dict(version=1, managed=False, sha256=digest), indent=2) + "\n")
+        return dict(installed=False, managed=managed, sha256=digest, destination=str(destination))
+
+    run = run or subprocess.run
+    updater = updater or _command_path("update-ca-certificates", (
+        "/usr/sbin/update-ca-certificates", "/usr/bin/update-ca-certificates"))
+    installer = installer or _command_path("install", ("/usr/bin/install", "/bin/install"))
+    remover = remover or _command_path("rm", ("/usr/bin/rm", "/bin/rm"))
+    if not updater or not installer or not remover:
+        raise ValueError("Linux native CA setup requires the ca-certificates package and install command")
+    if privilege is None:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            privilege = []
+        else:
+            sudo = _command_path("sudo", ("/usr/bin/sudo", "/bin/sudo"))
+            if not sudo:
+                raise ValueError("Linux native CA setup requires sudo; install sudo or run from a root login")
+            privilege = [sudo]
+    privilege = list(privilege)
+    config.mkdir(parents=True, exist_ok=True)
+    rollback = config / ".friendzone-system-ca-rollback.crt"
+    if previous is not None:
+        atomic_write(rollback, previous.decode("utf-8"))
+    attempted = False
+    def privileged(arguments):
+        return run(privilege + arguments, check=True)
+    def restore():
+        if previous is None:
+            privileged([remover, "-f", "--", str(destination)])
+        else:
+            privileged([installer, "-D", "-m", "0644", "--", str(rollback), str(destination)])
+        privileged([updater])
+    try:
+        print("Installing Friendzone CA into Linux system trust; sudo may prompt.")
+        attempted = True
+        privileged([installer, "-D", "-m", "0644", "--", str(cert), str(destination)])
+        privileged([updater])
+        atomic_write(state_path, json.dumps(dict(version=1, managed=managed, sha256=digest), indent=2) + "\n")
+    except Exception as error:
+        try:
+            if attempted:
+                restore()
+        except Exception:
+            raise RuntimeError("Linux CA update failed and automatic rollback also failed; inspect " + str(destination)) from error
+        raise RuntimeError("Linux CA update failed and was rolled back; verify sudo and update-ca-certificates") from error
+    finally:
+        try:
+            rollback.unlink()
+        except FileNotFoundError:
+            pass
+    return dict(installed=True, managed=managed, sha256=digest, destination=str(destination))
 
 
 def provider_update(path, fake):
@@ -211,6 +332,8 @@ def main(encoded):
     home = Path.home()
     config = Path(os.environ.get("XDG_CONFIG_HOME", str(home / ".config"))) / "friendzone"
     activation = configure(data, home, config, os.environ.get("ZDOTDIR", str(home)), os.environ)
+    trust = install_linux_ca(config / "friendzone-ca.pem", config)
+    print("Linux native trust ready at " + trust["destination"] + ".")
     if canonical != requested:
         print("Requested guest name " + requested + " was replaced with " + canonical + " because this VM source IP is already pinned to that guest.")
     message = approval.get("message") or ("Approved and pinned." if approval.get("approved") else "Use Approve + pin IP in the host Inbox.")

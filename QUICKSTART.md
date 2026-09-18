@@ -219,6 +219,10 @@ rebased onto as the bundle's sole prerequisite and `base_oid`. No named base bra
 is required. Friendzone fetches that exact commit from the repository and uses the
 captured target SHA as the exact force-with-lease.
 
+Routine completed jobs need no cleanup: after Cline durably checkpoints a completion
+message, Friendzone may rotate the oldest acknowledged history when admitting new
+work. It never automatically removes active work or uncertain outcomes.
+
 Do not retry an uncertain submission or result blindly. List/get existing jobs
 and inspect the remote branch first. Ordinary `git push`, unleased updates, tags,
 deletes, merges, LFS uploads, multiple refs, and arbitrary remotes remain unsupported.
@@ -279,7 +283,10 @@ The script updates the guest's Cline provider file, so close guest Cline before
 running it. Existing model/other-provider settings are retained. Real keys
 stay on the host. Download scripts only over a trusted host/network; the first
 HTTP download is not authenticated. The script does not change the guest's
-firewall. Runtime CA variables are configured on both platforms. On Windows it
+firewall. Runtime CA variables are configured on both platforms. On
+Kali/Debian/Ubuntu, setup invokes `sudo` only to install the Friendzone root in
+the native system trust store and run `update-ca-certificates`; run the setup
+script itself as the guest user. On Windows it
 also installs the exact Friendzone CA in the guest user's Trusted Root store
 (`CurrentUser\Root`, not `LocalMachine\Root`) and makes Git's Schannel backend honor `GIT_SSL_CAINFO` without
 disabling certificate verification or changing Git configuration files, and
@@ -309,7 +316,10 @@ a fresh environment. Machine environment, WinHTTP, and execution policy are unch
 
 Approve/pin the guest in the host Inbox, then restart guest Cline. The generated
 environment includes broker and loopback NO_PROXY entries, both proxy cases on
-Linux, fake provider keys and runtime CA paths. See
+Linux, fake provider keys and runtime CA paths. Linux setup also installs the
+native root. A Rust binary compiled with WebPKI-only roots must still be rebuilt
+with native-root support; system configuration cannot alter roots embedded in a
+binary. See
 [GUEST-BOOTSTRAP.md](GUEST-BOOTSTRAP.md) for rollback and persistence details.
 
 Read-only checks (use your guest name):

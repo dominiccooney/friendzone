@@ -42,7 +42,15 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
   }));
   const views = ["inbox", "log", "settings"].map(view => ({id:`${view}-view`, classList:classList()}));
   let copyButtons = [];
+  let fakeKeyButtons = [];
   let revokeButtons = [];
+  const windowListeners = {};
+  const history = {
+    entries:[], index:-1, state:null,
+    pushState(state) { this.entries.splice(this.index+1);this.entries.push(state);this.index++;this.state=state; },
+    replaceState(state) { if(this.index<0){this.entries.push(state);this.index=0;}else this.entries[this.index]=state;this.state=state; },
+    back() { if(this.index<=0)return;this.state=this.entries[--this.index];windowListeners.popstate?.({state:this.state}); },
+  };
   const sandbox = {
     document: {
       querySelector(selector) {
@@ -55,6 +63,10 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
         if (selector === "[data-comment-revoke]") {
           revokeButtons=[...elements.get("#comment-permissions").innerHTML.matchAll(/data-comment-revoke="([^"]*)" data-container="([^"]*)"/g)].map(match=>({dataset:{commentRevoke:match[1],container:match[2]}}));
           return revokeButtons;
+        }
+        if (selector === "[data-escrow-copy]") {
+          fakeKeyButtons=[...elements.get("#escrow-list").innerHTML.matchAll(/data-escrow-copy="([^"]*)"/g)].map(match=>({dataset:{escrowCopy:match[1]}}));
+          return fakeKeyButtons;
         }
         if (selector !== "[data-mcp-copy-url]") return [];
         // Model row-level controls from the real rendered markup so tests
@@ -74,7 +86,7 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
       setItem(key,value) { if(storageUnavailable)throw new Error("storage blocked");storage.set(key,value); },
     },
     EventSource: class {},
-    window: {addEventListener(){}, isSecureContext:secureContext, focus(){this.focused=true;}}, navigator: {}, URL, URLSearchParams, console,
+    window: {history,addEventListener(type,listener){windowListeners[type]=listener;}, isSecureContext:secureContext, focus(){this.focused=true;}}, navigator: {}, URL, URLSearchParams, console,
     confirm:()=>true,
     setTimeout(callback) { const timer = {callback, cancelled:false}; timers.push(timer); return timer; },
     clearTimeout(timer) { if (timer) timer.cancelled = true; },
@@ -105,7 +117,7 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
       }}}},
     }),
   });
-  return {run, element, sandbox, calls, seed, reply, timers, nav, views, storage, notifications, get permissionRequests(){return permissionRequests;}, copyButtons:()=>copyButtons, revokeButtons:()=>revokeButtons};
+  return {run, element, sandbox, calls, seed, reply, timers, nav, views, storage, notifications, history, get permissionRequests(){return permissionRequests;}, copyButtons:()=>copyButtons, fakeKeyButtons:()=>fakeKeyButtons, revokeButtons:()=>revokeButtons};
 }
 
 const pendingRequest = {id:"request-id",container:"guest<script>",method:"POST",url:"https://api.github.com/graphql?x=<script>",body_bytes:42,expires_at:"2099-01-01T00:00:00Z",fingerprint:"exact-hash",reason:"Review complete GraphQL payload",headers:[["authorization","[redacted]"]],body:'{"query":"<script>alert(1)</script>","variables":{"id":42}}'};
@@ -127,7 +139,8 @@ test("GraphQL review shows actual action, opaque target and comment separately w
   assert.match(markup,/Post comment/); assert.match(markup,/addComment/);
   assert.match(markup,/harmless/); assert.match(markup,/opaque-node/); assert.match(markup,/Not an issue\/PR number/);
   assert.match(markup,/Comment text/); assert.match(markup,/&lt;img/); assert.doesNotMatch(markup,/<img|<details/);
-  assert.match(markup,/Conditions:/);
+  assert.match(markup,/When this field is included:/);
+  assert.match(html,/Operation names are requester-controlled, untrusted text/);
   assert.equal(f.sandbox.document.querySelector("#request-review-body").textContent,pendingRequest.body);
   assert.equal(f.run("activeReview.fingerprint"),"exact-hash");
 });
@@ -153,6 +166,8 @@ test("unknown mutations expose every typed input without field expanders and sep
   for(const text of ["PR_fixture","input.futureFlag","false","input.items[0].label","9007199254740993","input.empty","[]","null","Not supplied ($optional)","first","@include(if: false)"]) assert.ok(markup.includes(text),text);
   assert.doesNotMatch(markup,/<details|<img/);assert.match(markup,/&lt;img/);
   assert.match(f.sandbox.document.querySelector("#request-graphql-response").textContent,/safeName → id/);
+  assert.equal(f.sandbox.document.querySelector("#request-graphql-no-arguments").open,false);
+  assert.equal(f.sandbox.document.querySelector("#request-graphql-no-arguments-count").textContent,"(1)");
   assert.match(f.sandbox.document.querySelector("#request-graphql-effective").innerHTML,/default.*5/s);
   assert.equal(f.sandbox.document.querySelector("#request-graphql-variables-panel").hidden,false);
 });
@@ -177,6 +192,24 @@ test("async upstream diagnostics separate approval latency and retain only broke
   assert.match(detail,/Admission → response headers: 7000 ms/);
   assert.match(detail,/x-github-request-id: ABC1:DEF2:3/);
   assert.match(detail,/Observed response body: 0 bytes/);
+});
+
+test("HTTP 200 GraphQL errors explain the separate transport and application results", async () => {
+  const f=fixture(), element=id=>f.sandbox.document.querySelector("#"+id);
+  const graphql_response={error_count:2,data_present:true,response_bytes:321,content_type:"application/json; charset=utf-8",response_headers:[["x-github-request-id","ABC:123"],["via","edge"]],errors:[
+    {message:"Field 'badField' doesn't exist <script>",path:"repository → issue",locations:["line 3, column 5"],kind:"undefinedField"},
+    {message:"Resource not accessible",path:null,locations:[],kind:"FORBIDDEN"},
+  ]};
+  const detail={...pendingRequest,status:"graphql_error",http_status:200,outcome:"old generic text",graphql_response};
+  const opening=f.run('openRequestReview("request-id")');
+  f.calls.at(-1).resolve({ok:true,json:async()=>detail});await opening;
+  assert.equal(element("request-review-badge").textContent,"GraphQL errors · HTTP 200 response");
+  assert.match(element("request-review-outcome").textContent,/response arrived.*application-level errors/i);
+  assert.equal(element("request-graphql-error").hidden,false);
+  assert.match(element("request-graphql-error-explanation").textContent,/syntax.*GitHub's schema/i);
+  const diagnostics=element("request-graphql-error-detail").textContent;
+  for(const expected of ["2 GraphQL errors","part of the operation may have succeeded","badField","path repository → issue","x-github-request-id: ABC:123"])assert.match(diagnostics,new RegExp(expected));
+  assert.equal(element("request-graphql-error-detail").innerHTML,"");
 });
 
 test("compact overview puts operation repository and HTTP errors in one row without repeated prose",()=>{
@@ -333,18 +366,20 @@ test("review outcomes stay visible, survive reopening and never enable resolved 
   f.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)}]`);
   const opening=f.run('openRequestReview("request-id")');
   f.calls.at(-1).resolve({ok:true,json:async()=>pendingRequest}); await opening;
-  for (const [status,code,label] of [["approved",null,"Approved"],["sending",null,"Sending"],["response_received",201,"Response received · HTTP 201"],["graphql_error",200,"GraphQL error · HTTP 200"],["denied",null,"Denied"],["expired",null,"Expired"],["cancelled",null,"Cancelled"],["blocked",null,"Blocked"],["upstream_error",502,"HTTP 502"]]) {
+  for (const [status,code,label] of [["approved",null,"Approved"],["sending",null,"Sending"],["response_received",201,"Response received · HTTP 201"],["graphql_error",200,"GraphQL errors · HTTP 200 response"],["denied",null,"Denied"],["expired",null,"Expired"],["cancelled",null,"Cancelled"],["blocked",null,"Blocked"],["upstream_error",502,"HTTP 502"]]) {
     const summary={...pendingRequest,status,http_status:code,outcome:"Exact outcome <script>",updated_at:"2099-01-01T00:00:00Z"};
     f.run(`snapshot.pending_requests=[];snapshot.recent_reviews=[${JSON.stringify(summary)}];renderPendingRequests()`);
     assert.equal(element("request-review-badge").textContent,label);
-    assert.equal(element("request-review-outcome").textContent,summary.outcome);
+    if(status==="graphql_error")assert.match(element("request-review-outcome").textContent,/response arrived.*application-level errors/i);
+    else assert.equal(element("request-review-outcome").textContent,summary.outcome);
     assert.equal(element("request-review-outcome").innerHTML,"");
     assert.equal(element("request-review-body").textContent,pendingRequest.body);
     assert.equal(element("request-review").hidden,false);
     assert.equal(element("request-review-actions").hidden,true);
     assert.equal(element("inbox-count").textContent,0);
     assert.equal(element("recent-count").textContent,1);
-    assert.match(element("recent-reviews").innerHTML,/Exact outcome &lt;script&gt;/);
+    if(status==="graphql_error")assert.match(element("recent-reviews").innerHTML,/application-level errors/);
+    else assert.match(element("recent-reviews").innerHTML,/Exact outcome &lt;script&gt;/);
     const calls=f.calls.length; await f.run('decideRequest("approve")'); assert.equal(f.calls.length,calls);
   }
   const reopening=f.run('openRequestReview("request-id")');
@@ -532,6 +567,30 @@ test("selected inbox/log/settings tab survives reload and loads its view", () =>
   }
 });
 
+test("browser back closes an opened review and restores the previous tab", async () => {
+  const f=fixture();
+  assert.equal(JSON.stringify(f.history.state),JSON.stringify({friendzone:true,view:"inbox",reviewId:null}));
+  const opening=f.run('openRequestReview("request-id")');
+  f.calls.at(-1).resolve({ok:true,json:async()=>pendingRequest});await opening;
+  assert.equal(f.history.state.reviewId,"request-id");
+  f.history.back();
+  assert.equal(f.run("activeReview"),null);
+  assert.equal(f.sandbox.document.querySelector("#request-review").hidden,true);
+
+  f.nav.find(node=>node.dataset.view==="settings").onclick();
+  const beforeOpen=f.history.index;
+  f.nav.find(node=>node.dataset.view==="inbox").onclick();
+  const reopened=f.run('openRequestReview("request-id")');
+  f.calls.at(-1).resolve({ok:true,json:async()=>pendingRequest});await reopened;
+  assert.equal(f.history.index,beforeOpen+2);
+  f.sandbox.document.querySelector("#request-close").onclick();
+  assert.equal(f.history.state.view,"inbox");
+  assert.equal(f.history.state.reviewId,null);
+  f.history.back();
+  assert.equal(f.history.state.view,"settings");
+  assert.equal(f.views.find(node=>node.classList.contains("active")).id,"settings-view");
+});
+
 test("invalid or unavailable browser storage cannot break navigation", () => {
   const invalid = fixture({storage:new Map([["fz-active-view", "not-a-tab"],["fz-order", "{"]])});
   assert.equal(invalid.nav.find(n=>n.classList.contains("active")).dataset.view, "inbox");
@@ -626,11 +685,23 @@ test("a lost policy response is reported as unconfirmed rather than unchanged", 
   assert.doesNotMatch(text,/Existing policy remains/);
 });
 
-async function resolveSettings(f, forwards = []) {
+async function resolveSettings(f, forwards = [], entries = []) {
   await new Promise(setImmediate);
-  f.calls.filter(c=>c.url==="/api/escrow").at(-1).resolve({json:async()=>({entries:[]})});
+  f.calls.filter(c=>c.url==="/api/escrow").at(-1).resolve({json:async()=>({entries})});
   f.calls.filter(c=>c.url==="/api/mcp").at(-1).resolve({json:async()=>({forwards,guest_host:"172.31.208.1",guest_port:8082})});
 }
+
+test("credential rows copy the selected fake key without exposing the real key", async () => {
+  const f=fixture(), entry={name:"github",hosts:["api.github.com"],header:"authorization",prefix:"Bearer ",fake:"ghp_friendzone_fake",connected:true};
+  const render=f.run("renderSettings()");await resolveSettings(f,[],[entry]);await render;
+  assert.match(f.sandbox.document.querySelector("#escrow-list").innerHTML,/Copy fake key/);
+  let copied;f.sandbox.navigator.clipboard={async writeText(value){copied=value;}};
+  const [button]=f.fakeKeyButtons();await button.onclick();
+  assert.equal(copied,entry.fake);
+  assert.equal(f.sandbox.document.querySelector("#escrow-copy-status").textContent,"Fake key for 'github' copied.");
+  delete f.sandbox.navigator.clipboard;await button.onclick();
+  assert.equal(f.sandbox.document.querySelector("#escrow-copy-value").selected,true);
+});
 
 test("guest bootstrap commands discard stale responses, use explicit platform choices and copy safely", async () => {
   const f=fixture(); const element=id=>f.sandbox.document.querySelector("#setup-"+id);

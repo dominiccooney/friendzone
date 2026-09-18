@@ -14,6 +14,8 @@ import unittest
 from unittest import mock
 
 SOURCE = Path(__file__).resolve().parents[1] / "src/bootstrap/configure.py"
+TEST_CA = (Path(__file__).resolve().parent / "fixtures/friendzone-test-ca.pem").read_text(encoding="utf-8")
+ROTATED_CA = (Path(__file__).resolve().parent / "fixtures/friendzone-rotated-test-ca.pem").read_text(encoding="utf-8")
 GIT_CONFIG = '''# Friendzone managed Git configuration v1
 [credential "https://github.com"]
 \thelper =
@@ -32,11 +34,89 @@ class GuestScriptTests(unittest.TestCase):
         self.config = self.home / "config"
         self.data = dict(broker="http://192.0.2.1:9082", container="guest", proxy_port=9080,
                          plugin=base64.b64encode((SOURCE.parents[1] / "plugin/friendzone.js").read_bytes()).decode(),
-                         ca="CERTIFICATE", git_credential_config=GIT_CONFIG,
+                         ca=TEST_CA, git_credential_config=GIT_CONFIG,
                          fakes={"CLINE_API_KEY": "fake'$(bad)", "OTHER_KEY": "other", "GITHUB_TOKEN": "fz-test-github-token"})
 
     def apply(self, env=None):
         return configure.configure(self.data, self.home, self.config, self.home / "zsh", env or {})
+
+    def ca_runner(self, destination, fail_update_once=False):
+        calls = []
+        failures = [fail_update_once]
+        def run(arguments, check):
+            self.assertTrue(check)
+            calls.append(list(arguments))
+            command = arguments[0]
+            if command == "fixture-install":
+                source, target = Path(arguments[-2]), Path(arguments[-1])
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(source.read_bytes())
+            elif command == "fixture-rm":
+                Path(arguments[-1]).unlink(missing_ok=True)
+            elif command == "fixture-update" and failures[0]:
+                failures[0] = False
+                raise subprocess.CalledProcessError(1, arguments)
+            return types.SimpleNamespace(returncode=0)
+        return run, calls
+
+    def install_ca(self, pem=None, fail_update_once=False):
+        self.config.mkdir(parents=True, exist_ok=True)
+        certificate = self.config / "friendzone-ca.pem"
+        certificate.write_text(pem or TEST_CA, encoding="utf-8")
+        destination = self.home / "system/friendzone-local-ca.crt"
+        runner, calls = self.ca_runner(destination, fail_update_once)
+        result = configure.install_linux_ca(
+            certificate, self.config, destination=destination, run=runner,
+            updater="fixture-update", installer="fixture-install",
+            remover="fixture-rm", privilege=[])
+        return result, destination, calls
+
+    def test_linux_native_ca_install_is_idempotent_and_rotates_only_owned_anchor(self):
+        result, destination, calls = self.install_ca()
+        self.assertTrue(result["installed"])
+        self.assertTrue(result["managed"])
+        self.assertEqual(destination.read_text(encoding="utf-8"), TEST_CA)
+        state = json.loads((self.config / configure.SYSTEM_CA_STATE).read_text())
+        self.assertTrue(state["managed"])
+        self.assertEqual(state["sha256"], configure.certificate_digest(TEST_CA))
+        result, _, repeated = self.install_ca()
+        self.assertFalse(result["installed"])
+        self.assertEqual(repeated, [])
+
+        result, _, repeated = self.install_ca(ROTATED_CA)
+        self.assertTrue(result["installed"])
+        self.assertTrue(result["managed"])
+        self.assertEqual(destination.read_text(encoding="utf-8"), ROTATED_CA)
+        self.assertEqual(len(repeated), 2)
+        self.assertGreaterEqual(len(calls), 2)
+
+    def test_linux_native_ca_preserves_preexisting_and_rejects_external_changes(self):
+        self.config.mkdir(parents=True)
+        certificate = self.config / "friendzone-ca.pem"
+        certificate.write_text(TEST_CA)
+        destination = self.home / "system/friendzone-local-ca.crt"
+        destination.parent.mkdir(parents=True)
+        destination.write_text(TEST_CA)
+        runner, calls = self.ca_runner(destination)
+        result = configure.install_linux_ca(
+            certificate, self.config, destination, runner, "fixture-update",
+            "fixture-install", "fixture-rm", [])
+        self.assertFalse(result["managed"])
+        self.assertFalse(result["installed"])
+        self.assertEqual(calls, [])
+        destination.write_text(ROTATED_CA)
+        with self.assertRaises(ValueError):
+            configure.install_linux_ca(
+                certificate, self.config, destination, runner, "fixture-update",
+                "fixture-install", "fixture-rm", [])
+        self.assertEqual(calls, [])
+
+    def test_linux_native_ca_refresh_failure_restores_previous_state(self):
+        with self.assertRaisesRegex(RuntimeError, "rolled back"):
+            self.install_ca(fail_update_once=True)
+        destination = self.home / "system/friendzone-local-ca.crt"
+        self.assertFalse(destination.exists())
+        self.assertFalse((self.config / configure.SYSTEM_CA_STATE).exists())
 
     def test_profiles_preserve_and_repeat_without_shadowing(self):
         profile = self.home / ".profile"
@@ -216,12 +296,16 @@ case "$output" in *fz-test-github-token*|*username=x-access-token*) exit 12;; es
         # inherited shell startup paths. Only the fixture listener is contacted.
         with mock.patch.object(configure, "sys", types.SimpleNamespace(platform="linux")), \
                 mock.patch.object(configure.Path, "home", return_value=self.home), \
-                mock.patch.dict(os.environ, environment, clear=True), contextlib.redirect_stdout(io.StringIO()) as output:
+                mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(configure, "install_linux_ca", return_value={"destination": "/fixture/friendzone.crt"}) as install_ca, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
             configure.main(encoded)
         self.assertEqual(requests, ["/bootstrap/hello?container=guest"])
         self.assertIn("was replaced with canonical-guest", output.getvalue())
         self.assertIn("Configured guest canonical-guest. Use host approval.", output.getvalue())
-        self.assertEqual((self.home / "xdg/friendzone/friendzone-ca.pem").read_text(), "CERTIFICATE")
+        self.assertIn("Linux native trust ready at /fixture/friendzone.crt.", output.getvalue())
+        install_ca.assert_called_once()
+        self.assertEqual((self.home / "xdg/friendzone/friendzone-ca.pem").read_text(), TEST_CA)
         plugin = json.loads((self.home / ".cline/friendzone.json").read_text())
         self.assertEqual(plugin["container"], "canonical-guest")
 

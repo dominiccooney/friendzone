@@ -119,18 +119,25 @@ function createSessionRuntime(session,ctx){
       if(observer.stopped)return;
       const next={};
       const active=[];
+      const acknowledgements=[];
       let emitted=false;
       for(const job of jobs){
         if(job.session_id!==session)continue;
         if(!job.terminal){active.push(job);continue;}
         const version=job.status+':'+job.updated_at;next[job.id]=version;
-        if(saved.terminal[job.id]===version)continue;
+        if(saved.terminal[job.id]===version){
+          if(!job.acknowledged&&job.status!=='unknown'){
+            try{await request(config,'GET',idRoute(job.id)+suffix);acknowledgements.push(job.id);}catch(error){ctx.logger?.debug?.('Friendzone completion details still unavailable',{message:String(error)});}
+          }
+          continue;
+        }
         if(!/^[0-9a-f-]{36}$/i.test(job.id)||!['response_received','graphql_error','denied','cancelled','expired','blocked','unknown','upstream_error'].includes(job.status))continue;
         let detail=null,loaded=false;
         try{detail=await request(config,'GET',idRoute(job.id)+suffix);loaded=true;}catch(error){ctx.logger?.debug?.('Friendzone completion details unavailable',{message:String(error)});}
         if(observer.stopped)return;
         // Retained upstream text is bounded, JSON-quoted, and labeled as data.
         emit('steer_message',{sessionId:session,prompt:terminalPrompt(job,detail,loaded)});
+        if(loaded&&job.status!=='unknown')acknowledgements.push(job.id);
         emitted=true;
       }
       const now=Date.now();
@@ -150,6 +157,10 @@ function createSessionRuntime(session,ctx){
       }
       if(!active.length)saved.lastReminderAt=0;
       saved.terminal=next;atomic(file,saved);
+      // Checkpoint first: acknowledgement means the completion message has been
+      // emitted and its local deduplication state is durable. Failed acks retry
+      // on later polls without emitting the message again.
+      for(const id of acknowledgements){try{await request(config,'POST',idRoute(id)+'/acknowledge'+suffix);}catch(error){ctx.logger?.debug?.('Friendzone completion acknowledgement unavailable',{message:String(error)});}}
     }catch(error){ctx.logger?.debug?.('Friendzone status poll unavailable',{message:String(error)});}
     finally{polling=false;}
   }
@@ -222,7 +233,7 @@ const plugin={name:'friendzone',manifest:{capabilities:['tools','hooks']},setup(
   });
   tool('friendzone_list_requests','List this guest/session’s submitted requests and statuses.',{},[],(_, {config,suffix})=>request(config,'GET','/guest/jobs'+suffix));
   tool('friendzone_cancel_request','Cancel a pending or queued job. Execution already started cannot be cancelled or undone.',{id:{type:'string'}},['id'],async (input,{config,suffix})=>{await request(config,'POST',idRoute(input.id)+'/cancel'+suffix);return {id:input.id,cancelled:true};});
-  tool('friendzone_remove_result','Remove a finished job to release storage. This does not undo its upstream effect.',{id:{type:'string'}},['id'],async (input,{config,suffix})=>{await request(config,'DELETE',idRoute(input.id)+suffix);return {id:input.id,removed:true};});
+  tool('friendzone_remove_result','Explicitly remove a finished job. Routine delivered results rotate automatically under storage pressure; use this for immediate cleanup or an uncertain result after independently checking upstream. Removal does not undo its upstream effect.',{id:{type:'string'}},['id'],async (input,{config,suffix})=>{await request(config,'DELETE',idRoute(input.id)+suffix);return {id:input.id,removed:true};});
   // A resumed session must recover notifications without submitting another job.
   // Bad configuration is an execution error, never a missing-tool/discovery error.
   if(setupSession){try{runtimeFor();}catch{ctx.logger?.log?.('Friendzone notifications could not start; tool execution will report configuration errors.');}}

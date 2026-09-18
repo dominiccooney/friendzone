@@ -780,6 +780,7 @@ fn bootstrap_router(state: BootstrapState) -> Router {
         .route("/guest/git-push", post(submit_git_push))
         .route("/guest/jobs/{id}", get(get_job).delete(delete_job))
         .route("/guest/jobs/{id}/cancel", post(cancel_job))
+        .route("/guest/jobs/{id}/acknowledge", post(acknowledge_job))
         .route("/mcp/{name}", post(mcp_message))
         .route("/health", get(|| async { "ok" }))
         .layer(axum::middleware::from_fn(
@@ -1041,6 +1042,32 @@ async fn cancel_job(
     }) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::CONFLICT, e.to_string()).into_response(),
+    }
+}
+async fn acknowledge_job(
+    State(state): State<BootstrapState>,
+    Path(id): Path<uuid::Uuid>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<JobSession>,
+) -> axum::response::Response {
+    match job_identity(&state, &headers, peer).and_then(|(name, instance)| {
+        if state.mcp.app.pushes.contains(id) {
+            state
+                .mcp
+                .app
+                .pushes
+                .acknowledge(&name, instance, id, &query.session_id)
+        } else {
+            state
+                .mcp
+                .app
+                .jobs
+                .acknowledge(&name, instance, id, &query.session_id)
+        }
+    }) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
     }
 }
 async fn delete_job(
@@ -2004,7 +2031,8 @@ mod tests {
                             observed.lock().unwrap().push(body);
                             (
                                 if http_error { StatusCode::FORBIDDEN } else { StatusCode::OK },
-                                Json(if graphql_error { serde_json::json!({"data":null,"errors":[{"message":"sensitive fixture error"}]}) } else { serde_json::json!({"data":{"ok":true}}) }),
+                                [("x-github-request-id", "fixture-request-id")],
+                                Json(if graphql_error { serde_json::json!({"data":null,"errors":[{"message":"sensitive fixture error","path":["createPullRequest"],"locations":[{"line":1,"column":9}],"extensions":{"type":"FORBIDDEN"}}]}) } else { serde_json::json!({"data":{"ok":true}}) }),
                             )
                         }
                     },
@@ -2246,10 +2274,37 @@ mod tests {
                 }
                 assert!(outcome["outcome"].as_str().is_some());
                 assert!(!outcome.to_string().contains("host-secret"));
-                assert!(
-                    !outcome.to_string().contains("sensitive fixture error"),
-                    "upstream error payload is not copied into review history"
-                );
+                if decision == "approve" && body.contains("OutcomeGraphqlError") {
+                    assert_eq!(outcome["graphql_response"]["error_count"], 1);
+                    assert_eq!(outcome["graphql_response"]["data_present"], false);
+                    assert_eq!(
+                        outcome["graphql_response"]["errors"][0]["message"],
+                        "sensitive fixture error"
+                    );
+                    assert_eq!(
+                        outcome["graphql_response"]["errors"][0]["path"],
+                        "createPullRequest"
+                    );
+                    assert_eq!(
+                        outcome["graphql_response"]["errors"][0]["kind"],
+                        "FORBIDDEN"
+                    );
+                    assert!(
+                        outcome["graphql_response"]["response_headers"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|pair| pair
+                                == &serde_json::json!([
+                                    "x-github-request-id",
+                                    "fixture-request-id"
+                                ]))
+                    );
+                    assert!(outcome.get("raw_response").is_none());
+                } else {
+                    assert!(outcome.get("graphql_response").is_none());
+                    assert!(!outcome.to_string().contains("sensitive fixture error"));
+                }
                 assert!(
                     state.reviews.detail(summary.id).is_none(),
                     "retained detail cannot authorize a grant"

@@ -95,8 +95,9 @@ compiler, or platform-specific build is needed. Linux requires Python 3;
 Windows requires curl.exe and PowerShell 5.1 or 7.
 
 The script saves the CA, credential-free proxy URL, loopback exclusions and fake credentials, merges
-Cline provider settings, and persists user configuration. Linux gets idempotent
-profile hooks; Windows gets user-scoped environment values plus the current-user
+Cline provider settings, and persists user configuration. Kali/Debian/Ubuntu
+gets idempotent profile hooks plus a narrowly elevated native-root installation;
+Windows gets user-scoped environment values plus the current-user
 Windows Internet proxy used by many .NET clients (not machine-wide WinHTTP).
 It also installs the exact Friendzone CA into the guest user's Windows Trusted
 Root store (`CurrentUser\Root`), not the machine-wide store. Prior proxy settings
@@ -177,6 +178,10 @@ query strings are emitted by these diagnostics.
 For operations that need human review or large GraphQL payloads, use the
 [async Cline plugin](ASYNC-GRAPHQL.md), installed by the guest setup script.
 It returns a job ID immediately and steers the originating session on completion.
+Completed known results are acknowledged only after the plugin durably checkpoints
+their completion message, then the oldest acknowledged history rotates automatically
+when capacity is needed. Routine jobs do not require manual deletion. Active work,
+fresh undelivered results, and uncertain outcomes are never automatically removed.
 The limits and connection-lifetime behavior below describe the proxy path.
 
 ### Git HTTPS authentication
@@ -351,7 +356,9 @@ received (with HTTP status), Denied, Expired, Cancelled, Blocked, or Upstream
 error. A response is not a claim of application success (GraphQL can report
 errors with HTTP 200). Reviewed GraphQL JSON responses up to 64 KiB are
 observed as they stream to the guest; a nonempty `errors` array produces a
-GraphQL error badge without copying upstream payloads into history. Larger,
+GraphQL error badge and retains bounded, explicitly untrusted error messages,
+paths/locations, body size, partial-data presence, and allowlisted provider/edge
+correlation headers. It never retains the complete response or arbitrary headers. Larger,
 encoded or unparseable responses remain HTTP-only outcomes. If the handler
 ends after admission without a response,
 the badge says **No response received**. If headers arrived but the response
@@ -496,9 +503,15 @@ with the broker host plus `localhost`, `127.0.0.1`, `::1`, and `[::1]`.
 Existing exclusions from both cases are merged without duplicates. This
 keeps guest Cline hub requests on guest loopback instead of sending them to
 the host proxy. `GIT_SSL_CAINFO` and other runtime CA variables are included.
-Windows setup also makes Git's Schannel backend honor that PEM using the scoped
-`http.schannelUseSSLCAInfo=true` environment config; it does not disable TLS
-verification, edit Git config files, or install the CA into the Windows store.
+On Kali/Debian/Ubuntu, Linux setup uses a narrow `sudo` step to install the exact
+Friendzone root in the native system trust store and run
+`update-ca-certificates`, with ownership checks, safe rotation, and rollback on
+refresh failure. Programs compiled with private WebPKI-only roots must enable
+native roots or accept an explicit custom CA; the OS cannot replace roots
+embedded in a binary. Windows setup also makes Git's Schannel backend honor that
+PEM using the scoped `http.schannelUseSSLCAInfo=true` environment config; it does
+not disable TLS verification or edit user Git config files. It installs the CA
+in the current user's Trusted Root store, not the machine-wide store.
 Cargo receives the same PEM through its native `CARGO_HTTP_CAINFO` setting. On
 Windows, Cargo revocation lookup is disabled because Friendzone's dynamic leaf
 certificates have no public CRL/OCSP responder; all other TLS verification stays

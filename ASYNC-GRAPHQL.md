@@ -25,8 +25,10 @@ the integration after restarting Cline; it does not cancel submitted jobs.
   plus an absolute guest result-file path.
 - `friendzone_list_requests`: outstanding and completed requests for this session.
 - `friendzone_cancel_request`: cancels pending/queued work, not a running mutation.
-- `friendzone_remove_result`: removes a finished job and releases storage. It
-  does not undo anything upstream.
+- `friendzone_remove_result`: explicitly removes a finished job. Routine known
+  results rotate automatically after delivery when capacity is needed; use this
+  for immediate cleanup or an uncertain result after checking upstream. It does
+  not undo anything upstream.
 
 `request_key` is a non-unique, human-readable correlation label. **Every submit
 call creates a fresh job and a fresh approval**, even for identical content/key.
@@ -96,11 +98,14 @@ until restarted; this migration does not kill them.
 
 Notification checkpoints persist per broker/guest/session in Cline's data
 directory (`CLINE_DATA_DIR` respected). Resuming the same session discovers
-completed jobs; a different session never receives its updates. The bridge has
-no delivery acknowledgement: a process crash between emitting and checkpointing
-can duplicate an update. It cannot duplicate execution. A missing bridge leaves
-get/list available and logs a diagnostic; older Cline without plugin support
-needs upgrading. No inferred minimum release number is claimed.
+completed jobs; a different session never receives its updates. After emitting a
+known terminal result, the plugin durably checkpoints its deduplication state and
+then acknowledges that result to the broker. A failed acknowledgement is retried
+without re-emitting. The Cline bridge itself has no delivery receipt, so a process
+crash between emitting and checkpointing can duplicate an update; it cannot
+duplicate execution. A missing bridge leaves get/list available and logs a
+diagnostic. Older plugins without broker acknowledgement get a one-hour result
+window before old known outcomes become eligible for pressure cleanup.
 
 Contract checked against Cline commit `dd50b97192e21e08408ee2ad1c5190aaf56d610e`:
 [background-terminal example](https://github.com/cline/cline/blob/dd50b97192e21e08408ee2ad1c5190aaf56d610e/sdk/examples/plugins/background-terminal.ts),
@@ -129,9 +134,9 @@ This is separate from the **unchanged 64 KiB, 120-second proxy review**:
 | Review lifetime | 24 hours | 24 hours |
 | Upload deadline | 15 seconds | 60 seconds; 4 concurrent uploads |
 | Execution | 90 seconds, serial worker | serial validation/publication worker; 120-second push |
-| Retained jobs | 100 | 32 |
+| Retained history | Up to 100 | Up to 32 |
 | Active jobs | 32 globally / 8 per guest | 8 globally / 4 per guest |
-| Durable storage | 256 MiB including reserved response space | 256 MiB of retained bundles; explicit removal releases space |
+| Durable storage | 256 MiB including reserved response space | 256 MiB of retained bundles |
 
 The 90-second execution limit starts at admission, after approval and queueing.
 `upstream.accepted_to_approval_ms` and `approval_to_admission_ms` separate human
@@ -141,6 +146,15 @@ durable request ID.
 Diagnostic headers are a fixed allowlist (for example `x-github-request-id`,
 `server`, `via`, tracing and rate-limit fields); credentials, cookies, request
 content, and arbitrary response headers are excluded.
+
+History limits do not require routine manual cleanup. On a new admission,
+Friendzone removes the oldest acknowledged known terminal results until the job
+count/storage reservation fits. For compatibility with older plugins, an
+unacknowledged known result becomes eligible after one hour. Active work, fresh
+unacknowledged results, and `unknown` outcomes are never automatically removed;
+if those alone occupy capacity, the admission fails without changing history.
+Git publication cleanup removes its metadata and matching bundle artifact
+together. Explicit removal remains available when immediate cleanup is desired.
 
 GraphQL lexical/nesting/structural display budgets still apply. Large strings such as
 base64 file contents are shared by display reference instead of repeatedly
@@ -232,7 +246,8 @@ comes from the guest.
 `git-push-jobs.json` and `git-push-jobs/<id>/` retain metadata and the exact bundle
 in the host data directory. Restart cancels preparing/pending/approved jobs;
 `Sending` becomes `Unknown` and is never replayed; completed outcomes remain
-retrievable. If upload/result delivery is uncertain, list/get existing jobs and
+retrievable until explicit removal or automatic acknowledged-history rotation.
+If upload/result delivery is uncertain, list/get existing jobs and
 inspect the remote branch before explicitly submitting again.
 
 The exact-`base_oid` contract uses push-job store version 2. On first startup,
@@ -253,7 +268,8 @@ power-loss in all environments, and it is not encrypted storage.
 `Sending` is persisted **before** sending to GitHub. On restart:
 - Pending/approved jobs become cancelled, not sent; submit again if needed.
 - Sending jobs become uncertain; never automatically replayed.
-- Completed/denied/cancelled jobs and results remain retrievable.
+- Completed/denied/cancelled jobs remain retrievable until explicit removal or
+  acknowledged-history rotation under capacity pressure.
 
 Guest policy gains a durable incarnation field. Back up `containers.json` before
 upgrading: older builds reject that new field rather than silently misreading it.
@@ -276,7 +292,9 @@ is accepted only during migration. No management routes are added to that listen
 
 `POST /guest/jobs` takes the submission plus `session_id`; `GET /guest/jobs`
 lists, `GET /guest/jobs/{id}` fetches, `POST /guest/jobs/{id}/cancel` cancels,
-and `DELETE /guest/jobs/{id}` removes a terminal record. Other than submit, add
+`POST /guest/jobs/{id}/acknowledge` marks a checkpointed known result eligible
+for pressure cleanup, and `DELETE /guest/jobs/{id}` removes a terminal record.
+Other than submit, add
 `?session_id=...`. No response is cacheable. Session IDs route work; they are
 not a security boundary against code already running as the same guest.
 

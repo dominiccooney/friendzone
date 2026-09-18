@@ -39,6 +39,7 @@ const MAX_COMMITS: usize = 100;
 const MAX_FILES: usize = 1_000;
 const MAX_JOBS: usize = 32;
 const REVIEW_HOURS: i64 = 24;
+const UNACKNOWLEDGED_RETENTION_HOURS: i64 = 1;
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
 pub fn upload_slots() -> &'static Arc<tokio::sync::Semaphore> {
@@ -128,6 +129,9 @@ struct Job {
     expires_at: DateTime<Utc>,
     outcome: String,
     result: Option<String>,
+    /// Set after the guest plugin durably checkpoints a completion message.
+    #[serde(default)]
+    acknowledged_at: Option<DateTime<Utc>>,
 }
 
 impl Job {
@@ -142,6 +146,13 @@ impl Job {
         self.status = status;
         self.outcome = outcome.into();
         self.updated_at = Utc::now();
+    }
+
+    fn automatically_removable(&self, now: DateTime<Utc>) -> bool {
+        self.terminal()
+            && self.status != Status::Unknown
+            && (self.acknowledged_at.is_some()
+                || self.updated_at <= now - chrono::Duration::hours(UNACKNOWLEDGED_RETENTION_HOURS))
     }
 
     fn summary(&self) -> Summary {
@@ -199,6 +210,7 @@ impl Job {
             ),
             graphql: None,
             git_push: self.review.clone(),
+            graphql_response: None,
             graphql_read: false,
             comment_permission_supported: false,
             resolved_target: None,
@@ -420,7 +432,7 @@ impl Pushes {
         let result = edit(&mut next)?;
         let bytes = serde_json::to_vec(&next)?;
         if bytes.len() > 64 * 1024 * 1024 {
-            bail!("Git push metadata storage full; remove completed jobs");
+            bail!("Git push metadata exceeds its durable storage limit");
         }
         if let Some(path) = &self.0.metadata_path {
             crate::storage::atomic_write(path, &bytes)?;
@@ -452,6 +464,30 @@ impl Pushes {
                     let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
+        }
+    }
+
+    fn prune_for_admission(saved: &mut Saved, incoming_bytes: u64) -> Result<Vec<Uuid>> {
+        let now = Utc::now();
+        let mut removed = Vec::new();
+        loop {
+            let stored_bytes: u64 = saved.jobs.values().map(|job| job.bundle_bytes).sum();
+            if saved.jobs.len() <= MAX_JOBS
+                && stored_bytes.saturating_add(incoming_bytes) <= MAX_STORAGE
+            {
+                return Ok(removed);
+            }
+            let candidate = saved
+                .jobs
+                .values()
+                .filter(|job| job.automatically_removable(now))
+                .min_by_key(|job| (job.updated_at, job.id))
+                .map(|job| job.id)
+                .context(
+                    "Git push capacity is occupied by active, uncertain, or recent results; wait for completion delivery or explicitly remove a result",
+                )?;
+            saved.jobs.remove(&candidate);
+            removed.push(candidate);
         }
     }
 
@@ -527,31 +563,44 @@ impl Pushes {
             expires_at: now + chrono::Duration::hours(REVIEW_HOURS),
             outcome: "Validating bundle and deriving review".into(),
             result: None,
+            acknowledged_at: None,
         };
         let result = self.transaction(|saved| {
-            let stored_bytes: u64 = saved.jobs.values().map(|job| job.bundle_bytes).sum();
-            if stored_bytes.saturating_add(bundle_bytes) > MAX_STORAGE {
-                bail!("Git push artifact storage full; remove completed jobs");
+            if saved.jobs.values().filter(|job| !job.terminal()).count() >= 8 {
+                bail!("8 Git publications are still active; wait for them to finish or cancel pending publications");
             }
-            if saved.jobs.len() >= MAX_JOBS
-                || saved.jobs.values().filter(|job| !job.terminal()).count() >= 8
-                || saved
-                    .jobs
-                    .values()
-                    .filter(|job| job.container == container && !job.terminal())
-                    .count()
-                    >= 4
+            if saved
+                .jobs
+                .values()
+                .filter(|job| job.container == container && !job.terminal())
+                .count()
+                >= 4
             {
-                bail!("Git push job capacity reached; finish/cancel or remove existing jobs");
+                bail!("this guest already has 4 active Git publications; wait for them to finish or cancel pending publications");
             }
             let value = guest_value(&job, false);
             saved.jobs.insert(job.id, job);
-            Ok(value)
+            let removed = Self::prune_for_admission(saved, 0)?;
+            Ok((value, removed))
         });
-        if result.is_err() {
-            let _ = std::fs::remove_dir_all(root);
+        match result {
+            Ok((value, removed)) => {
+                if let Some(artifacts) = &self.0.artifacts {
+                    for id in removed {
+                        if let Err(error) = std::fs::remove_dir_all(artifacts.join(id.to_string()))
+                            && error.kind() != std::io::ErrorKind::NotFound
+                        {
+                            tracing::warn!(%id, %error, "could not remove automatically expired Git push artifact");
+                        }
+                    }
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(root);
+                Err(error)
+            }
         }
-        result
     }
 
     pub fn contains(&self, id: Uuid) -> bool {
@@ -633,6 +682,23 @@ impl Pushes {
                 Status::Cancelled,
                 "Cancelled by submitting guest. Not sent.",
             );
+            Ok(())
+        })
+    }
+
+    pub fn acknowledge(
+        &self,
+        container: &str,
+        instance: Uuid,
+        id: Uuid,
+        session: &str,
+    ) -> Result<()> {
+        self.transaction(|saved| {
+            let job = owned_job_mut(saved, container, instance, id, session)?;
+            if !job.terminal() || job.status == Status::Unknown {
+                bail!("only known terminal results can be acknowledged");
+            }
+            job.acknowledged_at.get_or_insert_with(Utc::now);
             Ok(())
         })
     }
@@ -930,6 +996,7 @@ fn guest_value(job: &Job, include_result: bool) -> serde_json::Value {
         "http_status": null,
         "outcome": job.outcome,
         "terminal": job.terminal(),
+        "acknowledged": job.acknowledged_at.is_some(),
         "result": if include_result { job.result.as_deref() } else { None },
         "repository": job.submission.repository,
         "branch": job.submission.branch,
@@ -2154,6 +2221,7 @@ mod tests {
             expires_at: Utc::now() + chrono::Duration::hours(1),
             outcome: String::new(),
             result: None,
+            acknowledged_at: None,
         }
     }
 
@@ -2218,6 +2286,7 @@ mod tests {
             expires_at: Utc::now() + chrono::Duration::hours(1),
             outcome: String::new(),
             result: None,
+            acknowledged_at: None,
         };
         // Production moved the accepted bundle to this exact artifact path.
         std::fs::copy(&bundle, root.join("submission.bundle")).unwrap();
@@ -2609,6 +2678,207 @@ mod tests {
                 .status,
             Status::Cancelled,
             "pre-send restart must never resume publication"
+        );
+    }
+
+    #[test]
+    fn full_push_history_prunes_delivered_metadata_and_matching_artifact() {
+        let (temp, _remote, bundle, base, _head) = publication_fixture();
+        let data = temp.0.join("capacity-broker");
+        std::fs::create_dir(&data).unwrap();
+        let settings = Settings::load(&data).unwrap();
+        settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "github".into(),
+                hosts: vec!["api.github.com".into(), "github.com".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fixture-fake-token".into(),
+                real_env: None,
+                guest_env: Some("GITHUB_TOKEN".into()),
+            })
+            .unwrap();
+        settings.set_secret("github", "fixture-real-token").unwrap();
+        let app = AppState::load(&data).unwrap();
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        app.authorize("guest", peer);
+        app.approve_container("guest", true).unwrap();
+        let submission = Submission {
+            request_key: "seed".into(),
+            session_id: "session".into(),
+            repository: "fixture/repository".into(),
+            branch: "feature".into(),
+            base_oid: base,
+            expected_oid: ZERO_OID.into(),
+        };
+        let staging = app.pushes.staging_path().unwrap();
+        std::fs::copy(&bundle, &staging).unwrap();
+        let accepted = app
+            .pushes
+            .submit(
+                &app,
+                &settings,
+                "guest",
+                peer,
+                UploadedBundle {
+                    submission: submission.clone(),
+                    staging,
+                    bytes: std::fs::metadata(&bundle).unwrap().len(),
+                },
+            )
+            .unwrap();
+        let seed_id = Uuid::parse_str(accepted["id"].as_str().unwrap()).unwrap();
+        let now = Utc::now();
+        let (candidate, fresh, ids) = app
+            .pushes
+            .transaction(|saved| {
+                let template = saved.jobs.get(&seed_id).unwrap().clone();
+                saved.jobs.clear();
+                let mut candidate = None;
+                let mut fresh = None;
+                let mut ids = Vec::new();
+                for index in 0..MAX_JOBS {
+                    let mut job = template.clone();
+                    job.id = Uuid::new_v4();
+                    job.status = Status::Blocked;
+                    job.updated_at = now;
+                    job.outcome = "fixture terminal result".into();
+                    job.acknowledged_at = None;
+                    if index == 0 {
+                        job.updated_at = now - chrono::Duration::minutes(10);
+                        job.acknowledged_at = Some(now - chrono::Duration::minutes(9));
+                        candidate = Some(job.id);
+                    } else if index == 1 {
+                        fresh = Some(job.id);
+                    }
+                    ids.push(job.id);
+                    saved.jobs.insert(job.id, job);
+                }
+                Ok((candidate.unwrap(), fresh.unwrap(), ids))
+            })
+            .unwrap();
+        let artifacts = app.pushes.0.artifacts.as_ref().unwrap();
+        for id in &ids {
+            let root = artifacts.join(id.to_string());
+            private_dir(&root).unwrap();
+            std::fs::copy(&bundle, root.join("submission.bundle")).unwrap();
+        }
+        let candidate_root = artifacts.join(candidate.to_string());
+        assert!(candidate_root.exists());
+
+        let staging = app.pushes.staging_path().unwrap();
+        std::fs::copy(&bundle, &staging).unwrap();
+        let accepted = app
+            .pushes
+            .submit(
+                &app,
+                &settings,
+                "guest",
+                peer,
+                UploadedBundle {
+                    submission: Submission {
+                        request_key: "new-publication".into(),
+                        ..submission
+                    },
+                    staging,
+                    bytes: std::fs::metadata(&bundle).unwrap().len(),
+                },
+            )
+            .unwrap();
+        let accepted_id = Uuid::parse_str(accepted["id"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            app.pushes.0.data.lock().expect("push jobs lock").jobs.len(),
+            MAX_JOBS
+        );
+        assert!(app.pushes.contains(accepted_id));
+        assert!(!app.pushes.contains(candidate));
+        assert!(app.pushes.contains(fresh));
+        assert!(!candidate_root.exists());
+        assert!(artifacts.join(accepted_id.to_string()).exists());
+    }
+
+    #[test]
+    fn push_acknowledgement_rejects_active_unknown_and_wrong_owner() {
+        let (temp, _remote, bundle, base, _head) = publication_fixture();
+        let data = temp.0.join("ack-broker");
+        std::fs::create_dir(&data).unwrap();
+        let settings = Settings::load(&data).unwrap();
+        settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "github".into(),
+                hosts: vec!["api.github.com".into(), "github.com".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fixture-fake-token".into(),
+                real_env: None,
+                guest_env: Some("GITHUB_TOKEN".into()),
+            })
+            .unwrap();
+        settings.set_secret("github", "fixture-real-token").unwrap();
+        let app = AppState::load(&data).unwrap();
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        app.authorize("guest", peer);
+        app.approve_container("guest", true).unwrap();
+        let staging = app.pushes.staging_path().unwrap();
+        std::fs::copy(&bundle, &staging).unwrap();
+        let accepted = app
+            .pushes
+            .submit(
+                &app,
+                &settings,
+                "guest",
+                peer,
+                UploadedBundle {
+                    submission: Submission {
+                        request_key: "ack".into(),
+                        session_id: "session".into(),
+                        repository: "fixture/repository".into(),
+                        branch: "feature".into(),
+                        base_oid: base,
+                        expected_oid: ZERO_OID.into(),
+                    },
+                    staging,
+                    bytes: std::fs::metadata(&bundle).unwrap().len(),
+                },
+            )
+            .unwrap();
+        let id = Uuid::parse_str(accepted["id"].as_str().unwrap()).unwrap();
+        let instance = app.async_identity("guest", peer).unwrap().0;
+        assert!(
+            app.pushes
+                .acknowledge("guest", instance, id, "session")
+                .is_err()
+        );
+        app.pushes
+            .transaction(|saved| {
+                let job = saved.jobs.get_mut(&id).unwrap();
+                job.status = Status::Unknown;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            app.pushes
+                .acknowledge("guest", instance, id, "session")
+                .is_err()
+        );
+        app.pushes
+            .transaction(|saved| {
+                let job = saved.jobs.get_mut(&id).unwrap();
+                job.status = Status::Blocked;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            app.pushes
+                .acknowledge("guest", instance, id, "other-session")
+                .is_err()
+        );
+        app.pushes
+            .acknowledge("guest", instance, id, "session")
+            .unwrap();
+        assert_eq!(
+            app.pushes.get("guest", instance, id, "session").unwrap()["acknowledged"],
+            true
         );
     }
 

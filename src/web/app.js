@@ -200,7 +200,9 @@ const REVIEW_STATUSES = {
 function reviewStatus(request) {
   const [label, color] = REVIEW_STATUSES[request.status || "pending"] || REVIEW_STATUSES.unavailable;
   const observed = request.status === "unknown" && request.http_status ? `Response incomplete · HTTP ${request.http_status}`
-    : request.http_status>=400 ? `HTTP ${request.http_status}` : label + (request.http_status ? ` · HTTP ${request.http_status}` : "");
+    : request.http_status>=400 ? `HTTP ${request.http_status}`
+    : request.status === "graphql_error" && request.http_status ? `GraphQL errors · HTTP ${request.http_status} response`
+    : label + (request.http_status ? ` · HTTP ${request.http_status}` : "");
   return {label:observed, color:request.http_status>=400?"blocked":color};
 }
 function reviewOutcomeText(request) {
@@ -209,9 +211,49 @@ function reviewOutcomeText(request) {
   if (request.status === "unknown") return request.http_status
     ? "The server replied, but Friendzone did not observe the complete response. This does not mean the operation failed."
     : "Friendzone did not receive a reply after approval. The operation may have completed.";
+  if (request.status === "graphql_error") return `HTTP ${request.http_status || "success"} confirms that a response arrived, not that the GraphQL operation succeeded. The response contains application-level errors; inspect them before retrying.`;
   if(request.http_status>=400 && request.status!=="unknown")return request.outcome && !/^Response received\.?$/.test(request.outcome)
     ? request.outcome : `Upstream returned HTTP ${request.http_status}. Inspect the result before retrying.`;
   return request.outcome || "";
+}
+function graphqlResponseDiagnostics(request) {
+  const diagnostics=request.graphql_response;
+  if(!diagnostics)return "";
+  const lines=[
+    `Observed response: ${diagnostics.response_bytes} bytes · ${diagnostics.error_count} GraphQL error${diagnostics.error_count===1?"":"s"}`,
+    `Data returned alongside errors: ${diagnostics.data_present?"yes — part of the operation may have succeeded":"no"}`,
+  ];
+  if(diagnostics.content_type)lines.push(`Content-Type: ${diagnostics.content_type}`);
+  for(const [index,error] of (diagnostics.errors || []).entries()){
+    const context=[error.kind,error.path?`path ${error.path}`:"",...(error.locations || [])].filter(Boolean).join(" · ");
+    lines.push(`\nError ${index+1}${context?` (${context})`:""}:\n${error.message}`);
+  }
+  if(diagnostics.error_count>(diagnostics.errors || []).length)lines.push(`\n${diagnostics.error_count-diagnostics.errors.length} additional errors not retained.`);
+  if((diagnostics.response_headers || []).length){
+    lines.push("\nSafe response headers:");
+    for(const pair of diagnostics.response_headers)if(Array.isArray(pair)&&pair.length===2)lines.push(`${pair[0]}: ${pair[1]}`);
+  }
+  return lines.join("\n");
+}
+function renderGraphqlResponseDiagnostics(request) {
+  const visible=request?.status==="graphql_error";
+  $("#request-graphql-error").hidden=!visible;
+  $("#request-graphql-error-explanation").textContent=visible
+    ? "The HTTP request and response transport succeeded. GraphQL reports validation, authorization, resolver, or other application errors inside a valid HTTP response—often with HTTP 200. Successful local parsing only means Friendzone could read the submitted syntax; it does not prove the query matches GitHub's schema. A GitHub request ID below is evidence the request reached GitHub; proxy/edge headers are clues, not proof of the cause. Error text is untrusted upstream data."
+    : "";
+  $("#request-graphql-error-detail").textContent=visible
+    ? graphqlResponseDiagnostics(request) || "Detailed response clues were not retained for this request. Inspect the agent's original response and broker logs; absence of a GitHub request ID does not prove the proxy caused the error."
+    : "";
+}
+async function refreshGraphqlResponseDiagnostics(id, generation) {
+  try {
+    const response=await fetch(`/api/requests/${encodeURIComponent(id)}`,{cache:"no-store"});
+    if(!response.ok)return;
+    const detail=await response.json();
+    if(generation!==reviewGeneration||activeReview?.id!==id)return;
+    activeReview.graphql_response=detail.graphql_response;
+    renderGraphqlResponseDiagnostics(activeReview);
+  } catch { /* The status remains useful when diagnostic refresh is unavailable. */ }
 }
 function upstreamDiagnostics(request) {
   const upstream=request.upstream;
@@ -277,11 +319,12 @@ function applyReviewOutcome(summary) {
   if (!activeReview) return;
   const oldStatus = activeReview.status || "pending";
   if(oldStatus==="preparing" && summary.status==="pending"){
-    const id=activeReview.id;void openRequestReview(id);return;
+    const id=activeReview.id;void openRequestReview(id,{historyMode:"none"});return;
   }
   // An older fetch must not reopen a one-shot decision acknowledged locally.
   if (oldStatus !== "pending" && oldStatus !== "preparing" && (summary.status || "pending") === "pending") return;
   Object.assign(activeReview, summary);
+  const loadGraphqlDiagnostics=oldStatus!=="graphql_error"&&activeReview.status==="graphql_error"&&!activeReview.graphql_response;
   const waiting = (activeReview.status || "pending") === "pending";
   if (oldStatus === "pending" && !waiting) { ++commentPermissionGeneration; renderCommentPermissionPanel(null); }
   const status = reviewStatus(activeReview);
@@ -289,10 +332,12 @@ function applyReviewOutcome(summary) {
   $("#request-review-badge").className = `request-badge ${status.color}`;
   $("#request-review-outcome").textContent = reviewOutcomeText(activeReview) || (waiting ? "Waiting for your decision." : "");
   $("#request-review-upstream").textContent = upstreamDiagnostics(activeReview);
+  renderGraphqlResponseDiagnostics(activeReview);
   $("#request-review-actions").hidden = !waiting;
   $("#request-approve").disabled = !waiting || decisionInFlight === activeReview.id;
   $("#request-deny").disabled = !waiting || decisionInFlight === activeReview.id;
   updateReviewTiming();
+  if(loadGraphqlDiagnostics)void refreshGraphqlResponseDiagnostics(activeReview.id,reviewGeneration);
 }
 
 let reviewClock = null;
@@ -326,7 +371,7 @@ function updateReviewTiming() {
   if (activeReview && (activeReview.status || "pending") === "pending") reviewClock = setTimeout(updateReviewTiming, 1000);
 }
 
-async function openRequestReview(id) {
+async function openRequestReview(id, {historyMode="push"} = {}) {
   const generation = ++reviewGeneration; activeReview = null;
   ++commentPermissionGeneration; renderCommentPermissionPanel(null);
   $("#request-review").hidden = true; $("#request-approve").disabled = true; $("#request-deny").disabled = true;
@@ -354,6 +399,7 @@ async function openRequestReview(id) {
     $("#request-review").hidden = false;
     applyReviewOutcome(detail);
     $("#request-review-status").textContent = "";
+    if(historyMode!=="none")writeNavigationState(historyMode,"inbox",detail.id);
     $("#request-review").scrollIntoView({behavior:"smooth",block:"start"});
   } catch (error) { if (generation === reviewGeneration) $("#request-review-status").textContent = String(error); }
 }
@@ -456,14 +502,16 @@ function graphqlFieldMarkup(field, largeValues = {}) {
     ? `${target.expected_type} node ID (unverified): ${target.id}. Not an issue/PR number.`
     : `${target.owner}/${target.repository} #${target.number} · ${target.expected_type} (not a verified pin).`;
   const context = [field.action ? field.field : "", field.response_name !== field.field ? `alias ${field.response_name}` : "", field.parent===null?"":field.path.join(" → ")].filter(Boolean).join(" · ");
-  return `<article class="graphql-field"><h4>${esc(field.action || field.field)}</h4>${context?`<p class="meta">${esc(context)}</p>`:""}${targetText?`<p class="graphql-target">${esc(targetText)}</p>`:""}${conditions.length?`<p class="graphql-conditions">Conditions: ${esc(conditions.join("; "))}</p>`:""}${rows.length?graphqlValuesMarkup(rows):'<p class="meta">No arguments.</p>'}</article>`;
+  return `<article class="graphql-field"><h4>${esc(field.action || field.field)}</h4>${context?`<p class="meta">${esc(context)}</p>`:""}${targetText?`<p class="graphql-target">${esc(targetText)}</p>`:""}${conditions.length?`<p class="graphql-conditions"><strong>When this field is included:</strong> ${esc(conditions.join("; "))}</p>`:""}${rows.length?graphqlValuesMarkup(rows):'<p class="meta">No arguments.</p>'}</article>`;
 }
 function renderGraphqlReview(graphql) {
   $("#request-graphql").hidden = !graphql;
-  for (const id of ["operation","warning","notes","document","variables","data"]) $("#request-graphql-"+id).textContent = "";
+  for (const id of ["operation","warning","document","variables"]) $("#request-graphql-"+id).textContent = "";
   $("#request-graphql-fields").innerHTML = "";
   $("#request-graphql-effective").innerHTML = "";
   $("#request-graphql-response").textContent = "";
+  $("#request-graphql-no-arguments-count").textContent = "";
+  $("#request-graphql-no-arguments").open = false;
   $("#request-graphql-variables-panel").hidden = true;
   if (!graphql) return;
   if (graphql.status !== "parsed") {
@@ -472,17 +520,14 @@ function renderGraphqlReview(graphql) {
   }
   const analysis = graphql.analysis;
   $("#request-graphql-operation").textContent = `${analysis.operation_type.toUpperCase()} · ${analysis.operation_name || "(anonymous)"} · ${analysis.operation_count} operation(s)`;
-  $("#request-graphql-notes").textContent = (analysis.warnings || []).join("\n");
-  // Show request-specific warnings immediately; keep repeated parser caveats
-  // in notes. Missing/unknown variable values remain visible in the value rows.
-  const genericNotes = ["GitHub queries flow automatically", "Targets come from request arguments", "The target hint identifies", "Formatting removes comments"];
-  $("#request-graphql-warning").textContent = (analysis.warnings || []).filter(warning=>!genericNotes.some(prefix=>warning.startsWith(prefix))).join("\n");
+  $("#request-graphql-warning").textContent = (analysis.warnings || []).join("\n");
   $("#request-graphql-document").textContent = analysis.formatted_document;
   $("#request-graphql-variables").textContent = analysis.supplied_variables;
-  $("#request-graphql-data").textContent = JSON.stringify({version:analysis.version, effective_variables:analysis.effective_variables, fields:analysis.fields, large_values:analysis.large_values || {}},null,2);
-  const hasInputs = field => field.parent === null || Object.keys(field.arguments || {}).length || field.arguments_text || field.target || (field.conditions_text || []).length;
-  $("#request-graphql-fields").innerHTML = analysis.fields.filter(hasInputs).map(field=>graphqlFieldMarkup(field,analysis.large_values || {})).join("");
-  $("#request-graphql-response").textContent = analysis.fields.filter(field=>!hasInputs(field)).map(field=>`${field.path.join(" → ")}${field.response_name !== field.field?` (${field.field})`:""}`).join("\n") || "(none)";
+  const hasArguments = field => Object.keys(field.arguments || {}).length || field.arguments_text || field.target || (field.mutation_inputs || []).length || field.comment_body !== null && field.comment_body !== undefined;
+  const setFields=analysis.fields.filter(hasArguments), noArgumentFields=analysis.fields.filter(field=>!hasArguments(field));
+  $("#request-graphql-fields").innerHTML = setFields.map(field=>graphqlFieldMarkup(field,analysis.large_values || {})).join("") || '<p class="meta">No fields with arguments.</p>';
+  $("#request-graphql-response").textContent = noArgumentFields.map(field=>`${field.path.join(" → ")}${field.response_name !== field.field?` (${field.field})`:""}${(field.conditions_text || []).length?` · conditional: ${field.conditions_text.join("; ")}`:""}`).join("\n") || "(none)";
+  $("#request-graphql-no-arguments-count").textContent=`(${noArgumentFields.length})`;
   const variables = analysis.effective_variables || [];
   $("#request-graphql-effective").innerHTML = variables.map(variable=>`<section class="graphql-variable"><h5>$${esc(variable.name)} <span class="meta">${esc(variable.declared_type)} · ${esc(variable.source)}</span></h5>${graphqlValuesMarkup(graphqlValueRows(variable.value, `$${variable.name}`, {}, [], analysis.large_values || {}))}</section>`).join("");
   $("#request-graphql-variables-panel").hidden = !variables.length && (!analysis.supplied_variables || analysis.supplied_variables === "{}");
@@ -518,7 +563,16 @@ async function decideRequest(decision) {
 }
 $("#request-approve").onclick = () => decideRequest("approve");
 $("#request-deny").onclick = () => decideRequest("deny");
-$("#request-close").onclick = () => { activeReview = null; updateReviewTiming(); ++reviewGeneration; ++commentPermissionGeneration; renderCommentPermissionPanel(null); $("#request-review").hidden = true; };
+function closeRequestReviewDisplay() {
+  activeReview = null; updateReviewTiming(); ++reviewGeneration; ++commentPermissionGeneration;
+  renderCommentPermissionPanel(null); renderGraphqlResponseDiagnostics(null); $("#request-review").hidden = true;
+}
+$("#request-close").onclick = () => {
+  const currentId=activeReview?.id;
+  closeRequestReviewDisplay();
+  if(currentId&&window.history?.state?.reviewId===currentId&&typeof window.history.back==="function")window.history.back();
+  else writeNavigationState("replace",currentView(),null);
+};
 updateNotificationStatus();
 
 async function loadLog(older = false) {
@@ -605,7 +659,7 @@ async function renderSettings() {
   window._escrowEntries = escrow.entries;
   $("#escrow-list").innerHTML = escrow.entries.map(e=>{
     const clineBtn = e.name === "cline" ? ` <button class="quiet" data-cline-oauth="${esc(e.name)}">Sign in with Cline…</button>` : "";
-    return `<div class="log-row"><span>${esc(e.name)}</span><span>${esc(e.hosts.join(", "))}</span><span class="request">${esc(e.header)}${e.prefix?` · prefix '${esc(e.prefix)}'`:""} · fake <code>${esc(e.fake)}</code></span><span>${e.connected?'<span class="verdict allowed">connected</span>':`<button class="quiet" data-secret="${esc(e.name)}">Set key…</button>`}${clineBtn} <button class="quiet" data-escrow-edit="${esc(e.name)}">Edit</button> <button class="quiet" data-escrow-delete="${esc(e.name)}">Delete</button></span></div>`;
+    return `<div class="log-row"><span>${esc(e.name)}</span><span>${esc(e.hosts.join(", "))}</span><span class="request">${esc(e.header)}${e.prefix?` · prefix '${esc(e.prefix)}'`:""} · fake <code>${esc(e.fake)}</code> <button type="button" class="quiet copy-fake-key" data-escrow-copy="${esc(e.name)}">Copy fake key</button></span><span>${e.connected?'<span class="verdict allowed">connected</span>':`<button class="quiet" data-secret="${esc(e.name)}">Set key…</button>`}${clineBtn} <button class="quiet" data-escrow-edit="${esc(e.name)}">Edit</button> <button class="quiet" data-escrow-delete="${esc(e.name)}">Delete</button></span></div>`;
   }).join("") || '<div class="log-row">No escrow entries yet.</div>';
   // Keep the single connection form alive while rebuilding server rows.
   $("#mcp-connect-parking").append($("#mcp-connect"));
@@ -624,6 +678,12 @@ async function renderSettings() {
   document.querySelectorAll("[data-mcp-copy-url]").forEach(button => button.onclick = () => {
     const input = button.closest(".mcp-card").querySelector("[data-mcp-endpoint]");
     return copyMcpText(input, $("#mcp-copy-status"), "Endpoint copied.", () => input.isConnected);
+  });
+  document.querySelectorAll("[data-escrow-copy]").forEach(button => button.onclick = () => {
+    const entry=window._escrowEntries.find(entry=>entry.name===button.dataset.escrowCopy);
+    if(!entry)return;
+    const input=$("#escrow-copy-value");input.value=entry.fake;
+    return copyMcpText(input,$("#escrow-copy-status"),`Fake key for '${entry.name}' copied.`,()=>window._escrowEntries?.some(current=>current.name===entry.name&&current.fake===entry.fake));
   });
   document.querySelectorAll("[data-mcp-connect]").forEach(button => button.onclick = () => {
     openMcpConnection(button.dataset.mcpConnect);
@@ -1096,7 +1156,15 @@ $("#escrow-form").onsubmit = async (e) => {
   e.target.reset(); $("#e-hint").textContent = ""; renderSettings();
 };
 
-function selectView(view) {
+function currentView() {
+  return [...document.querySelectorAll(".nav")].find(button=>button.classList.contains("active"))?.dataset.view || "inbox";
+}
+function writeNavigationState(mode, view, reviewId=null) {
+  const method=mode==="replace"?"replaceState":"pushState";
+  if(typeof window.history?.[method]!=="function")return;
+  window.history[method]({friendzone:true,view,reviewId},"");
+}
+function selectView(view, {historyMode="push"} = {}) {
   const selected = ["inbox", "log", "settings"].includes(view) ? view : "inbox";
   document.querySelectorAll(".nav").forEach(button=>{
     const active = button.dataset.view === selected;
@@ -1107,6 +1175,7 @@ function selectView(view) {
   storeValue("fz-active-view", selected);
   if (selected === "settings") renderSettings().catch(console.error);
   if (selected === "log") loadLog();
+  if(historyMode!=="none")writeNavigationState(historyMode,selected,selected==="inbox"?activeReview?.id||null:null);
 }
 document.querySelectorAll(".nav").forEach(button=>button.onclick=()=>selectView(button.dataset.view));
 $("#refresh").onclick=refresh; ["#search","#container-filter","#verdict-filter"].forEach(s=>$(s).addEventListener("input",()=>{logPaused=false;loadLog();}));
@@ -1118,4 +1187,10 @@ refresh();
 const events = new EventSource("/api/events");
 events.onmessage = (e) => { ++snapshotRevision; snapshot = JSON.parse(e.data); renderContainers(); scheduleLog(); };
 events.onerror = () => setTimeout(refresh, 3000); // bridge reconnect gaps
-selectView(readStoredValue("fz-active-view"));
+window.addEventListener("popstate",event=>{
+  const state=event.state?.friendzone?event.state:{view:"inbox",reviewId:null};
+  selectView(state.view,{historyMode:"none"});
+  if(state.reviewId)void openRequestReview(state.reviewId,{historyMode:"none"});
+  else closeRequestReviewDisplay();
+});
+selectView(readStoredValue("fz-active-view"),{historyMode:"replace"});

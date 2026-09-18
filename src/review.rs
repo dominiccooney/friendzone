@@ -21,6 +21,165 @@ pub const MAX_PER_GUEST: usize = 8;
 pub const WAIT_LIMIT: Duration = Duration::from_secs(120);
 pub const HISTORY_LIMIT: usize = 100;
 
+/// Bounded, host-visible clues from a GraphQL error response. Error text is
+/// untrusted upstream data and is never used for policy or rendered as markup.
+#[derive(Clone, Debug, Serialize)]
+pub struct GraphqlResponseDiagnostics {
+    pub error_count: usize,
+    pub errors: Vec<GraphqlErrorDiagnostic>,
+    pub data_present: bool,
+    pub response_bytes: usize,
+    pub content_type: Option<String>,
+    pub response_headers: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GraphqlErrorDiagnostic {
+    pub message: String,
+    pub path: Option<String>,
+    pub locations: Vec<String>,
+    pub kind: Option<String>,
+}
+
+fn bounded_text(value: &str, limit: usize) -> String {
+    let mut chars = value.chars();
+    let mut result: String = chars.by_ref().take(limit).collect();
+    if chars.next().is_some() {
+        result.push('…');
+    }
+    result
+}
+
+/// Use one allowlist for proxy and async-job diagnostics. Never broaden this
+/// to cookies, auth, or arbitrary X-* headers.
+pub fn diagnostic_response_headers(headers: &hudsucker::hyper::HeaderMap) -> Vec<(String, String)> {
+    const SAFE: &[&str] = &[
+        "date",
+        "server",
+        "via",
+        "content-type",
+        "content-length",
+        "x-github-request-id",
+        "x-github-media-type",
+        "x-github-api-version-selected",
+        "x-request-id",
+        "x-correlation-id",
+        "x-trace-id",
+        "traceparent",
+        "x-fastly-request-id",
+        "x-timer",
+        "x-served-by",
+        "x-cache",
+        "x-cache-hits",
+        "cf-ray",
+        "x-amz-cf-id",
+        "x-amz-request-id",
+        "x-azure-ref",
+        "x-envoy-upstream-service-time",
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+        "x-ratelimit-resource",
+        "x-ratelimit-used",
+    ];
+    let mut result = Vec::new();
+    let mut total = 0usize;
+    for name in SAFE {
+        for value in headers.get_all(*name) {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            if value.len() > 1024 || value.chars().any(char::is_control) {
+                continue;
+            }
+            let size = name.len() + value.len();
+            if total + size > 8192 || result.len() >= 32 {
+                return result;
+            }
+            total += size;
+            result.push(((*name).to_owned(), value.to_owned()));
+        }
+    }
+    result
+}
+
+pub fn graphql_response_diagnostics(
+    bytes: &[u8],
+    content_type: Option<String>,
+    response_headers: Vec<(String, String)>,
+) -> Option<GraphqlResponseDiagnostics> {
+    let json = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    let errors = json.get("errors")?.as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    let details = errors
+        .iter()
+        .take(8)
+        .map(|error| {
+            let path = error
+                .get("path")
+                .and_then(|path| path.as_array())
+                .map(|path| {
+                    bounded_text(
+                        &path
+                            .iter()
+                            .take(16)
+                            .map(|part| {
+                                part.as_str()
+                                    .map(str::to_owned)
+                                    .or_else(|| part.as_u64().map(|value| value.to_string()))
+                                    .unwrap_or_else(|| "[invalid path value]".into())
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" → "),
+                        512,
+                    )
+                });
+            let locations = error
+                .get("locations")
+                .and_then(|locations| locations.as_array())
+                .into_iter()
+                .flatten()
+                .take(8)
+                .filter_map(|location| {
+                    Some(format!(
+                        "line {}, column {}",
+                        location.get("line")?.as_u64()?,
+                        location.get("column")?.as_u64()?
+                    ))
+                })
+                .collect();
+            let kind = error
+                .get("type")
+                .or_else(|| error.get("extensions").and_then(|value| value.get("type")))
+                .or_else(|| error.get("extensions").and_then(|value| value.get("code")))
+                .and_then(|value| value.as_str())
+                .map(|value| bounded_text(value, 128));
+            GraphqlErrorDiagnostic {
+                message: bounded_text(
+                    error
+                        .get("message")
+                        .and_then(|message| message.as_str())
+                        .unwrap_or("GraphQL error without a message"),
+                    1000,
+                ),
+                path,
+                locations,
+                kind,
+            }
+        })
+        .collect();
+    Some(GraphqlResponseDiagnostics {
+        error_count: errors.len(),
+        errors: details,
+        data_present: json.get("data").is_some_and(|data| !data.is_null()),
+        response_bytes: bytes.len(),
+        content_type,
+        response_headers,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
@@ -88,6 +247,11 @@ pub struct Detail {
     /// The bundle itself stays in the host-only durable artifact store.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_push: Option<crate::pushes::Review>,
+    /// Bounded evidence explaining an application-level GraphQL error. This is
+    /// separate from HTTP status because a valid HTTP 200 response can contain
+    /// GraphQL execution/validation errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graphql_response: Option<GraphqlResponseDiagnostics>,
     /// Classified by the same parse used for the view, before display limits.
     #[serde(skip)]
     pub graphql_read: bool,
@@ -229,6 +393,7 @@ impl Detail {
             body: body.into(),
             graphql,
             git_push: None,
+            graphql_response: None,
             graphql_read,
             comment_permission_supported: false,
             resolved_target: None,
@@ -434,6 +599,24 @@ impl Queue {
         detail.summary.status = status;
         detail.summary.outcome = Some(outcome.into());
         detail.summary.updated_at = Utc::now();
+        drop(entries);
+        self.notify();
+    }
+    pub fn graphql_response_detail(&self, id: Uuid, diagnostics: GraphqlResponseDiagnostics) {
+        let mut entries = self.0.entries.lock().expect("review queue");
+        let Some(detail) = entries.recent.iter_mut().find(|item| item.summary.id == id) else {
+            return;
+        };
+        if detail.summary.status != Status::ResponseReceived {
+            return;
+        }
+        detail.summary.status = Status::GraphqlError;
+        detail.summary.outcome = Some(
+            "The HTTP exchange completed, but the GraphQL response reported application errors. Inspect the diagnostics below before retrying."
+                .into(),
+        );
+        detail.summary.updated_at = Utc::now();
+        detail.graphql_response = Some(diagnostics);
         drop(entries);
         self.notify();
     }

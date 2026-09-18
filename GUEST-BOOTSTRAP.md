@@ -62,7 +62,8 @@ Friendzone does not override Cline's global plugin sandbox lifetime. While a
 request remains pending, the plugin emits a grouped reminder every 20 minutes;
 an idle Cline session processes it through no-op Friendzone hooks, providing
 normal host-to-sandbox activity. Closed, failed or continuously busy sessions can
-still miss delivery; results remain retrievable. Rerunning setup removes the
+still miss delivery; results remain retrievable through their delivery window and
+are never automatically replayed. Rerunning setup removes the
 exact temporary 25-hour override written by Friendzone release `ebfa82b` when
 previous managed metadata proves ownership. User-authored values are preserved.
 
@@ -74,7 +75,14 @@ OAuth fields so they cannot override the fake key. Invalid provider JSON fails
 before environment/profile writes. Existing provider files get a backup.
 
 The script does not modify firewall rules, global/repository Git configuration,
-or the Windows **LocalMachine** CA store. On Windows it installs the exact
+or the Windows **LocalMachine** CA store. On Kali/Debian/Ubuntu, Linux setup uses
+`sudo` to install the exact Friendzone root as
+`/usr/local/share/ca-certificates/friendzone-local-ca.crt` and runs
+`update-ca-certificates`. It records whether it owns that file, is idempotent,
+rotates only a Friendzone-owned root, refuses to overwrite external content, and
+rolls back a failed trust refresh. This covers native-root TLS clients; programs
+compiled with a private WebPKI-only root set must enable native roots or accept an
+explicit CA bundle. On Windows it installs the exact
 Friendzone CA into the guest user's Trusted Root Certification Authorities store
 (`CurrentUser\Root`), so same-user .NET/Schannel applications trust intercepted
 HTTPS without disabling verification. Runtime CA variables remain configured for
@@ -107,7 +115,10 @@ edited.
 
 ## Linux persistence
 
-Run as the guest user without sudo. Files are written under
+Run the setup script as the guest user; do not invoke the whole script with
+`sudo`. Setup invokes `sudo` only for the native CA install and trust refresh.
+Kali/Debian/Ubuntu require the `ca-certificates` package and `sudo` (or a root
+login). User files are written under
 `${XDG_CONFIG_HOME:-$HOME/.config}/friendzone`. Managed hooks source
 `activate.sh` from `.profile`, `.bashrc`, existing `.bash_profile`/`.bash_login`,
 and `${ZDOTDIR:-$HOME}/.zshenv`. Existing contents are retained; the first edit
@@ -126,8 +137,13 @@ current terminal, or start a new login shell, then restart guest Cline.
 
 Rollback: remove only the marked hooks, restore the original BASH_ENV recorded
 in `previous-bash-env`, and start a clean session. Restore profile backups only
-if you have not edited those profiles since installation. CA/provider files
-are separate; do not overwrite unrelated later edits.
+if you have not edited those profiles since installation. Native-root ownership
+is recorded in `linux-system-ca.json`: remove
+`/usr/local/share/ca-certificates/friendzone-local-ca.crt` and run
+`update-ca-certificates` only when that state says `managed: true` and its SHA-256
+still matches the installed certificate. A `managed: false` root predated
+Friendzone and must be preserved. CA/provider files are separate; do not
+overwrite unrelated later edits.
 
 ## Windows persistence
 

@@ -348,6 +348,8 @@ struct ReviewResponseBody {
     state: AppState,
     id: uuid::Uuid,
     bytes: Option<Vec<u8>>,
+    content_type: Option<String>,
+    response_headers: Vec<(String, String)>,
     ended: bool,
 }
 impl ReviewResponseBody {
@@ -357,13 +359,15 @@ impl ReviewResponseBody {
         }
         self.ended = true;
         if let Some(bytes) = &self.bytes
-            && let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes)
-            && json
-                .get("errors")
-                .and_then(|errors| errors.as_array())
-                .is_some_and(|errors| !errors.is_empty())
+            && let Some(diagnostics) = crate::review::graphql_response_diagnostics(
+                bytes,
+                self.content_type.clone(),
+                self.response_headers.clone(),
+            )
         {
-            self.state.reviews.response_detail(self.id, crate::review::Status::GraphqlError, "GitHub returned GraphQL errors; the operation may have partially executed. Check upstream before retrying.");
+            self.state
+                .reviews
+                .graphql_response_detail(self.id, diagnostics);
         }
     }
 }
@@ -1034,6 +1038,11 @@ impl HttpHandler for EventHandler {
             .is_some_and(|ct| ct.starts_with("application/json"));
         let reviewed_graphql =
             host.eq_ignore_ascii_case("api.github.com") && self.state.reviews.tracks_response(id);
+        let response_headers = crate::review::diagnostic_response_headers(res.headers());
+        let content_type = response_headers
+            .iter()
+            .find(|(name, _)| name == "content-type")
+            .map(|(_, value)| value.clone());
         use http_body_util::BodyExt;
         let (parts, body) = res.into_parts();
         let observed = Body::from(
@@ -1058,6 +1067,8 @@ impl HttpHandler for EventHandler {
                         state: self.state.clone(),
                         id,
                         bytes: Some(Vec::new()),
+                        content_type,
+                        response_headers,
                         ended: false,
                     }
                     .boxed(),
@@ -1257,6 +1268,8 @@ mod tests {
                 state: state.clone(),
                 id,
                 bytes: Some(Vec::new()),
+                content_type: Some("application/json".into()),
+                response_headers: vec![],
                 ended: false,
             };
             assert_eq!(
@@ -1264,9 +1277,17 @@ mod tests {
                 payload
             );
             drop(body); // HTTP implementations may not ask for a trailing None.
-            let outcome = state.reviews.inspect(id).unwrap().summary;
-            assert_eq!(outcome.status, expected);
-            assert!(!outcome.outcome.unwrap().contains("private"));
+            let detail = state.reviews.inspect(id).unwrap();
+            assert_eq!(detail.summary.status, expected);
+            assert!(!detail.summary.outcome.unwrap().contains("private"));
+            if expected == Status::GraphqlError {
+                let diagnostics = detail.graphql_response.unwrap();
+                assert_eq!(diagnostics.error_count, 1);
+                assert_eq!(diagnostics.errors[0].message, "private");
+                assert_eq!(diagnostics.response_bytes, payload.len());
+            } else {
+                assert!(detail.graphql_response.is_none());
+            }
         }
     }
 
@@ -1317,6 +1338,8 @@ mod tests {
                 state: state.clone(),
                 id,
                 bytes: Some(Vec::new()),
+                content_type: Some("application/json".into()),
+                response_headers: vec![],
                 ended: false,
             };
             assert_eq!(
@@ -1347,6 +1370,8 @@ mod tests {
             state: state.clone(),
             id,
             bytes: Some(Vec::new()),
+            content_type: Some("application/json".into()),
+            response_headers: vec![],
             ended: false,
         });
         let summary = state.reviews.inspect(id).unwrap().summary;

@@ -876,7 +876,7 @@ impl Condition {
     fn text(&self) -> String {
         match self {
             Self::Directive { name, arguments } => format!(
-                "@{}{} (not evaluated)",
+                "selected only when @{}{} allows it; Friendzone did not evaluate this directive",
                 name,
                 if arguments.is_empty() {
                     String::new()
@@ -884,9 +884,13 @@ impl Condition {
                     format!("({})", format_args(arguments))
                 }
             ),
-            Self::Type { name } => format!("on {name} (type condition not verified)"),
+            Self::Type { name } => format!(
+                "applies only when the parent value is a {name}; Friendzone did not verify the runtime type"
+            ),
             Self::Fragment { name, on_type } => {
-                format!("fragment {name} on {on_type} (type condition not verified)")
+                format!(
+                    "fragment {name} applies only to {on_type}; Friendzone did not verify the runtime type"
+                )
             }
         }
     }
@@ -1506,10 +1510,9 @@ fn analyze_parsed(parsed: &ParsedRequest) -> Result<Analysis> {
     let document = &parsed.document;
     let selected = &document.operations[parsed.selected];
     let supplied = &parsed.supplied;
-    let mut warnings=vec!["GitHub queries flow automatically on supported transports. Mutations require one-shot approval unless covered by an explicitly saved narrow comment permission. Parsing is not full GitHub schema validation.".into(),
-        "Targets come from request arguments and are unverified. Opaque node IDs are not issue/PR numbers; no GitHub lookup has run.".into(),
-        "The target hint identifies a primary subject only. Other arguments may change permissions, reference other objects, or perform additional effects; a future rule must constrain the entire operation.".into(),
-        "Formatting removes comments and normalizes whitespace/string escapes. The exact original body below remains the approval identity.".into()];
+    // Repeated parser caveats belong beside the operation, targets, arguments,
+    // and exact request in the review UI. Keep this list request-specific.
+    let mut warnings = Vec::new();
     if document.operations.len() > 1 {
         warnings.push("Only the selected operation is expanded below; the complete document includes other operations.".into());
     }

@@ -205,13 +205,14 @@ mod tests {
                 guest_env: Some("GITHUB_TOKEN".into()),
             })
             .unwrap();
+        let authority = crate::ca::AuthorityFiles::load_or_create(&dir.join("script-ca")).unwrap();
         for shell in [Shell::Sh, Shell::Powershell] {
             let powershell = matches!(shell, Shell::Powershell);
             let text = script(
                 shell,
                 "http://[::1]:9082",
                 "guest'$(bad)",
-                "CERTIFICATE",
+                &authority.cert_pem,
                 9080,
                 &settings,
             )
@@ -242,7 +243,13 @@ mod tests {
                 .decode(payload["plugin"].as_str().unwrap())
                 .unwrap();
             assert_eq!(plugin, include_bytes!("plugin/friendzone.js"));
+            assert_eq!(payload["ca"], authority.cert_pem);
             assert_eq!(payload["git_credential_config"], GITHUB_GIT_CONFIG);
+            if !powershell {
+                assert!(text.contains("/usr/local/share/ca-certificates/friendzone-local-ca.crt"));
+                assert!(text.contains("update-ca-certificates"));
+                assert!(text.contains("install_linux_ca(config / \"friendzone-ca.pem\", config)"));
+            }
             if !powershell && let Some(dir) = std::env::var_os("FZ_PLUGIN_TEST_ARTIFACT_DIR") {
                 let dir = std::path::PathBuf::from(dir);
                 std::fs::create_dir_all(&dir).unwrap();
@@ -254,7 +261,7 @@ mod tests {
             Shell::Sh,
             "http://[::1]:9082",
             "guest",
-            "CERTIFICATE",
+            &authority.cert_pem,
             9080,
             &settings,
         )
