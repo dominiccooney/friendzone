@@ -1,228 +1,228 @@
-# Trace Cline proxy timeouts
+# Trace commands and Cline proxy timeouts
 
-Use this runbook to determine whether a timeout starts in Cline, at the
-Friendzone policy/connection boundary, at the provider, or while streaming the
-response back to the guest.
+Friendzone exports traces but does not embed a trace database or UI. The
+repository supplies one Windows command that starts a verified portable Jaeger
+executable as the collector, in-memory store, and trace viewer, then starts
+Friendzone with export enabled.
 
-## What Friendzone records
+There is no Docker, database, Windows service, or collector configuration file.
 
-For each application request admitted for forwarding, Friendzone creates:
+## 1. Start traced Friendzone on the Windows host
 
-1. `friendzone.proxy.request`, a server span parented to an incoming W3C
-   `traceparent` when one is present; and
-2. `friendzone.proxy.upstream`, its client child, whose context is injected into
-   the provider request.
+From the repository root:
 
-The spans and their events include `friendzone.request.id`, method, normalized
-host/path, active-request counts, request-body timing, time to response headers
-and first body byte, protocol/status, observed response bytes, and typed
-transport outcomes. They never include query strings, bodies, credentials,
-arbitrary headers, or raw HTTP/2 HEADERS frames.
-
-Friendzone also emits the same request ID and phase boundaries to its normal
-stderr diagnostics and stores the final bounded transport detail in the UI log.
-
-## Important Cline limitation
-
-Cline's documented built-in OpenTelemetry integration (checked 2026-09-18) exports
-**metrics and structured log events, not spans**. Its documentation explicitly
-lists distributed tracing as not implemented. Stock Cline therefore does not
-inject the W3C `traceparent` required to make the Cline operation the parent of
-Friendzone's spans.
-
-You have two useful modes:
-
-- **Stock Cline diagnostics:** collect Cline verbose/core logs and optional Cline
-  OTLP log events, then align them with Friendzone by UTC timestamp,
-  provider/model, and failure phase. This does not produce one distributed
-  trace.
-- **Shared trace for a focused reproduction:** temporarily start the Node-based
-  Cline CLI/hub with OpenTelemetry Node auto-instrumentation. Its HTTP/Undici
-  client spans inject `traceparent`, producing the chain **Cline HTTP client →
-  Friendzone request → Friendzone upstream → provider**.
-
-The shared-trace recipe below is diagnostic instrumentation, not something the
-Friendzone guest setup installs or manages.
-
-## 1. Send Friendzone spans to a collector
-
-Friendzone supports OTLP/HTTP protobuf. Configure the broker before startup;
-the environment is read once, so restart the broker after changing it.
-
-```powershell
-$env:OTEL_SERVICE_NAME = 'friendzone'
-$env:OTEL_EXPORTER_OTLP_TRACES_PROTOCOL = 'http/protobuf'
-$env:OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = 'http://HOST_IP:4318/v1/traces'
-
-cargo run -- broker `
-  --proxy-addr HOST_IP:8080 `
-  --ui-addr 127.0.0.1:8081 `
-  --bootstrap-addr HOST_IP:8082
+```cmd
+tools\trace-viewer.cmd Broker -BrokerAddress HOST_IP
 ```
 
-Use `127.0.0.1` instead of `HOST_IP` for a host-only local demo. The
-signal-specific endpoint is used exactly as supplied, including
-`/v1/traces`. Alternatively, `OTEL_EXPORTER_OTLP_ENDPOINT` is a base URL and the
-exporter appends `/v1/traces`. Standard OTLP headers/timeouts,
-`OTEL_RESOURCE_ATTRIBUTES`, and batch processor variables are supported. This
-build does not support OTLP/gRPC or compression, and its provider currently uses
-the SDK default sampler rather than reading `OTEL_TRACES_SAMPLER`.
+Use the same `HOST_IP` that the guest uses for Friendzone. For a host-only local
+test, omit `-BrokerAddress`; it defaults to `127.0.0.1`.
 
-With no endpoint, Friendzone still continues valid incoming W3C context
-upstream but does not export its own spans. `OTEL_TRACES_EXPORTER=none` has the
-same propagation-only behavior. `OTEL_SDK_DISABLED=true` disables span creation
-and propagation entirely.
+On first use, the command downloads the official Jaeger 2.21.0 Windows AMD64 ZIP
+(about 65 MB) to `%LOCALAPPDATA%\Friendzone\trace-viewer` and verifies pinned
+SHA-256 hashes for both the archive and `jaeger.exe`. It then:
 
-## 2. Collect the stock Cline side first
+- starts Jaeger OTLP/HTTP on `127.0.0.1:4318`;
+- keeps the Jaeger UI and query API on `127.0.0.1:16686`;
+- enables the bounded guest trace relay on Friendzone's existing bootstrap port;
+  and
+- runs `fz broker` with its OTLP exporter pointed at loopback Jaeger.
 
-Run Cline from the activated Friendzone guest shell so it inherits the proxy and
-CA environment. For a CLI reproduction, make the task timeout explicit and ask
-for verbose output:
+The `.cmd` wrapper works when Windows PowerShell script execution is disabled by
+using a process-scoped policy bypass. It does not change user or machine policy.
 
-`--timeout 0` means no overall Cline task deadline; it does not disable provider
-or network timeouts. Check both documented default log locations because the
-active path depends on whether the CLI uses its core service or background hub:
+## 2. Run a traced command inside the guest
+
+Complete normal Friendzone guest setup and **Approve + pin IP** first. In an
+activated guest shell, download the command wrapper over the already-allowed
+bootstrap connection:
 
 ```sh
-# Terminal 1
-tail -F ~/.cline/cline-core-service.log ~/.cline/data/logs/hub-daemon.log
-
-# Terminal 2
-date -u
-cline --verbose --timeout 0 "minimal prompt that reproduces the timeout"
+curl --noproxy '*' -fsS "$FZ_BROKER/bootstrap/trace-command.sh" -o trace-command.sh
+sh ./trace-command.sh cline --verbose --timeout 0 "minimal prompt that reproduces the timeout"
 ```
 
-If `--data-dir` or `CLINE_DATA_DIR` is set, inspect that configured data root
-instead. Also run `cline doctor` and verify the exact installed flags with
-`cline --help`; Cline's CLI changes independently of Friendzone.
-
-### Optional Cline OTLP log events
-
-Cline documents these controls under Enterprise Monitoring. If the installed
-build supports them, console output is the safest first check because it does
-not require another guest network exception:
+Everything after `trace-command.sh` is the exact command and argument list. The
+wrapper does not insert `cline`, add flags, evaluate a shell expression, or
+change the current directory. For example:
 
 ```sh
-export CLINE_OTEL_TELEMETRY_ENABLED=true
-export CLINE_OTEL_LOGS_EXPORTER=console
-export CLINE_OTEL_METRICS_EXPORTER=console
-export TEL_DEBUG_DIAGNOSTICS=true
+sh ./trace-command.sh cline --help
+sh ./trace-command.sh cline --verbose --timeout 0 "another prompt"
+sh ./trace-command.sh node ./reproduction.cjs "argument with spaces"
+sh ./trace-command.sh sh -c 'command-one | command-two'
 ```
 
-Restart every Cline CLI/core/hub process after setting them. Useful documented
-events include `task.created`, `task.completed`, `task.retry_clicked`, and
-`task.provider_api_error`, with fields such as `task_id`, `provider`, `model`,
-`duration_ms`, `error_code`, and `error_message`. These are log records, not
-trace spans; they do not supply a shared trace ID.
+The wrapper requires Node.js. On first use only, npm installs pinned
+OpenTelemetry Node packages under
+`${XDG_DATA_HOME:-$HOME/.local/share}/friendzone`. It creates one
+`friendzone.command` span around every command and preserves the command's
+stdio, exit status, cwd, and argument boundaries. The supervisor forwards HUP,
+INT, and TERM, then ends and flushes the outer command span when the child exits;
+it does not replace the command's own signal handlers. Shell builtins, pipelines,
+redirection, and compound commands need an explicit `sh -c`, as in the example
+above. For a `cline` executable the wrapper also selects Cline's local backend,
+avoiding an old uninstrumented hub process outside the wrapper.
 
-To export those Cline logs/metrics to an OTLP collector instead, use
-`CLINE_OTEL_LOGS_EXPORTER=otlp`, `CLINE_OTEL_METRICS_EXPORTER=otlp`, and Cline's
-`CLINE_OTEL_EXPORTER_OTLP_*` variables. Do not confuse those Cline-prefixed
-settings with the standard `OTEL_*` variables used by Friendzone and Node
-auto-instrumentation.
+Node commands and Node descendants load HTTP and Undici instrumentation. Cline
+is Node-based, so its outbound provider call becomes a child of the command
+span and injects the W3C context that Friendzone continues. A native executable
+still gets the outer command-duration/exit span, but its internal work is not
+automatically visible unless that executable has its own OpenTelemetry SDK.
 
-## 3. Produce a real shared trace from Cline CLI
+The wrapper and its instrumented Node processes send OTLP batches to
+`$FZ_BROKER/v1/traces`. Friendzone accepts them only from an approved, uniquely
+IP-pinned, non-killed guest, applies concurrency, size, media-type, and timeout
+bounds, strips guest headers, and relays the protobuf body only to Jaeger on host
+loopback. **No additional guest-facing port or firewall rule is required.**
 
-This is an opt-in, temporary diagnostic for Node.js Cline CLI installations.
-Install the instrumentation in an isolated directory inside the guest; do not
-add it to the project under review.
+The wrapper is diagnostic instrumentation. Normal Friendzone guest setup does
+not install it or make tracing persistent.
 
-```sh
-otel_dir="$HOME/.local/share/friendzone-otel"
-mkdir -p "$otel_dir"
-npm install --prefix "$otel_dir" \
-  @opentelemetry/api \
-  @opentelemetry/auto-instrumentations-node
+### If `invalid tracing preload` appears
 
-export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require=$otel_dir/node_modules/@opentelemetry/auto-instrumentations-node/register"
-export OTEL_SERVICE_NAME=cline-guest
-export OTEL_TRACES_EXPORTER=otlp
-export OTEL_METRICS_EXPORTER=none
-export OTEL_LOGS_EXPORTER=none
-export OTEL_TRACES_SAMPLER=always_on
-export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
-export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT="http://$FZ_HOST:4318/v1/traces"
-export OTEL_NODE_ENABLED_INSTRUMENTATIONS=http,undici
-export OTEL_NODE_RESOURCE_DETECTORS=env,process,container
+This means an older running broker served Windows CRLF bytes. The corrected
+broker always serves LF and the corrected wrapper also normalizes downloaded
+JavaScript assets. On the host, stop the old `cargo run` with Ctrl+C and start
+the traced broker instead:
+
+```cmd
+tools\trace-viewer.cmd Broker -BrokerAddress 172.24.80.1
 ```
 
-The current Node auto-instrumentation package includes both Node HTTP and Undici
-instrumentation, covering the usual HTTP clients and Node `fetch`. Confirm it
-loaded with `OTEL_LOG_LEVEL=debug` only if needed; that output is extremely
-verbose and can itself affect timing.
+Use your actual guest-facing host IP if it differs. Then redownload
+`trace-command.sh` in the guest and run it again. The successful package
+install is recorded under
+`${XDG_DATA_HOME:-$HOME/.local/share}/friendzone/otel-node-v1`, so the retry does
+not reinstall the 25 packages. The old `/bootstrap/trace-cline.sh` download URL
+remains an alias, but the downloaded wrapper still expects the complete command.
 
-The process that actually sends the model request must inherit these variables.
-An already-running Cline hub/core service will not. Stop it first or restart the
-guest/container, then launch Cline from this instrumented environment:
+## 3. Inspect or export the trace
 
-```sh
-date -u
-cline --verbose --timeout 0 "minimal prompt that reproduces the timeout"
+Open <http://127.0.0.1:16686>. Select service **cline-guest**, click **Find
+Traces**, and open the reproduction. The same trace contains:
+
+```text
+friendzone.command
+└── cline-guest HTTP client
+    └── friendzone.proxy.request
+        └── friendzone.proxy.upstream
 ```
 
-This recipe is for the Cline CLI/hub running inside the guest. A local editor
-extension or remote extension host has a different process boundary; setting
-variables only in a guest terminal does not instrument an already-running
-editor process.
+Jaeger keeps up to 10,000 traces in memory. To save one before stopping, copy
+the 32-character trace ID from Jaeger and run:
 
-### Collector reachability is an explicit security exception
+```cmd
+tools\trace-viewer.cmd Export -TraceId TRACE_ID -OutputPath timeout-trace.json
+```
 
-Friendzone setup puts `$FZ_HOST` in `NO_PROXY`, so the guest exporter connects
-directly to `$FZ_HOST:4318`. The default confinement example permits only ports
-8080 and 8082, so 4318 remains blocked unless you deliberately:
+This writes the complete OTLP-based Jaeger JSON returned by Jaeger's stable v3
+query API. Keep the JSON with the matching Friendzone request ID if another
+person or tool will analyze the failure.
 
-1. bind an OTLP collector receiver to the guest-facing host address used by
-   both examples;
-2. allow TCP 4318 only from the one diagnostic guest in both switch ACL and host
-   firewall policy; and
-3. remove that temporary allow after the reproduction.
+After the investigation, stop Friendzone with Ctrl+C, then stop Jaeger:
 
-Never expose the collector broadly, never open the management UI, and never
-weaken the terminal egress deny. If adding a collector port is unacceptable,
-set `OTEL_TRACES_EXPORTER=console` in the guest. The emitted Cline client span
-still carries the trace ID injected into Friendzone, but you must match that
-console trace ID to Friendzone's exported trace manually.
+```cmd
+tools\trace-viewer.cmd Stop
+```
 
-## 4. Read the result
+Stopping Jaeger discards its in-memory traces. `Status` reports whether the
+viewer is running and where its logs are stored:
 
-Start with the Cline HTTP client span, then inspect its Friendzone descendants:
+```cmd
+tools\trace-viewer.cmd Status
+```
+
+## How Friendzone traces are exported
+
+The `Broker` action starts `fz` with:
+
+```text
+OTEL_SERVICE_NAME=friendzone
+OTEL_TRACES_EXPORTER=otlp
+OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4318/v1/traces
+FZ_TRACE_RELAY_ENABLED=true
+```
+
+At startup, Friendzone creates a Rust OpenTelemetry tracer provider with a batch
+OTLP/HTTP exporter. When a proxy request finishes, the exporter POSTs its spans
+as protobuf to Jaeger's loopback `/v1/traces` receiver. Jaeger stores and indexes
+them for its browser UI. Friendzone flushes the provider during a clean shutdown.
+
+Only events under the `fz::proxy` tracing target are exported. `RUST_LOG` affects
+console diagnostics but does not enable or disable OTLP export.
+
+For every application request admitted for forwarding, Friendzone creates:
+
+1. `friendzone.proxy.request`, a server span parented to Cline's W3C
+   `traceparent`; and
+2. `friendzone.proxy.upstream`, a child client span whose context is injected
+   into the provider request.
+
+Both carry `friendzone.request.id`, which matches the Friendzone UI log. Their
+attributes and events include normalized host/path, method, active request
+counts, request-body timing, time to headers, time to first body byte, protocol,
+HTTP status, response bytes, and typed transport outcomes. They exclude query
+strings, bodies, credentials, arbitrary headers, and raw HTTP/2 HEADERS frames.
+
+### `api.cline.bot` HTTP/1.1 workaround
+
+Friendzone currently forces exact HTTPS `api.cline.bot:443` upstream connections
+to HTTP/1.1. Traces showed multiple 2–5 minute requests overlapping on the same
+H2 connection while fresh connections initially remained healthy. This targeted,
+reversible workaround removes H2 multiplexing and connection-wide flow control
+from Cline inference traffic without disabling H2 for any other origin.
+
+The choice is made by TLS ALPN, not by relabeling a request version. Concurrent
+Cline requests can therefore open separate H1 connections instead of sharing one
+H2 connection. Restart the broker after updating; existing connections and a
+running binary do not change in place. New Cline upstream spans should contain:
+
+```text
+server.address=api.cline.bot
+network.protocol.name=http/1.1
+```
+
+This is an A/B mitigation, not proof of an H2 implementation defect. If the long
+pre-header stalls disappear, the H2 connection path is strongly implicated. If
+they remain, compare `request_body_complete_ms`, `time_to_headers_ms`, and the
+response timing to distinguish upload backpressure from provider-side delay.
+
+## Reading a timeout
 
 | Observation | Likely boundary |
 |---|---|
-| Cline reports a timeout but no Friendzone server span exists | Cline/hub never sent through this proxy, instrumentation was attached to the wrong process, or proxy/CA setup failed before HTTP admission |
-| `friendzone.proxy.request` exists without `friendzone.proxy.upstream` | Friendzone denied identity, destination, policy/review, or credential substitution before forwarding |
-| Upstream span ends `transport_error` before response headers | DNS/connect/TLS/send/HTTP2 failure; inspect `friendzone.transport.detail` and `error.type` |
-| Response headers arrive but no first body byte | Provider/edge accepted the request but stalled before response content |
-| First body byte arrives, then `response_body_error` | Provider/edge or upstream HTTP/2 stream failed mid-response |
-| `downstream_body_dropped` | The guest/Cline side stopped consuming or disconnected while Friendzone was streaming |
-| Friendzone records `response_complete` before Cline times out | Investigate Cline hub/client processing after the proxy, not the provider connection |
+| `friendzone.command` only | The command ran but made no instrumented Node HTTP/Undici request; check that Cline used its local backend |
+| No `cline-guest` HTTP span | The wrapped process stopped before making HTTP, or the actual network process was not a Node descendant |
+| Cline client span but no Friendzone server child | Proxy/CA/routing failed before Friendzone admitted the request |
+| Friendzone request without an upstream child | Identity, destination, policy/review, or credential substitution denied forwarding |
+| Upstream ends `transport_error` before headers | DNS, connect, TLS, send, or HTTP/2 failure; inspect `friendzone.transport.detail` and `error.type` |
+| Headers arrive but no first body byte | Provider or edge stalled before response content |
+| First byte arrives, then `response_body_error` | Provider, edge, or upstream HTTP/2 stream failed mid-response |
+| `downstream_body_dropped` | Cline disconnected or stopped consuming while Friendzone streamed the response |
+| Friendzone records `response_complete` before Cline times out | Investigate Cline processing after the proxy rather than the provider connection |
 
-For non-shared stock diagnostics, synchronize host/guest clocks and compare UTC
-timestamps with Friendzone's `request_id`, host, method/path, and phase timing.
-Do not infer that adjacent requests share one physical HTTP/2 connection merely
-because they overlap; use the socket tuple and connection diagnostics described
-in the README.
+## Cline limitation and privacy
 
-## Privacy and cleanup
+Cline's documented built-in OpenTelemetry integration, checked on 2026-09-18,
+exports metrics and log records but does not implement distributed tracing. The
+wrapper uses generic Node auto-instrumentation specifically so Cline's outbound
+HTTP request injects the W3C context Friendzone can continue.
 
-Cline's built-in telemetry applies its documented anonymization. Generic Node
-auto-instrumentation does not apply Cline's privacy policy and may record URL or
-runtime metadata. Do not enable request/response header capture, inspect your
-collector before sharing traces, and use this only for a narrow reproduction.
-
-Afterward, stop instrumented Cline processes, remove the temporary collector
-network allow, and start a clean shell/container without `NODE_OPTIONS` and the
-`OTEL_*`/`CLINE_OTEL_*` variables. Remove the isolated packages if no longer
-needed:
+Generic Node instrumentation does not inherit Cline's telemetry privacy policy
+and may record URL or runtime metadata. Friendzone does not enable header or body
+capture, and the command span records no arguments, cwd, environment values, or
+output. Inspect exported JSON before sharing it and use tracing only for a focused
+reproduction. Remove the guest packages afterward if desired:
 
 ```sh
-rm -rf "$HOME/.local/share/friendzone-otel"
+rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/friendzone/otel-node-v1"
 ```
 
-References checked for this runbook:
+References:
 
 - [Cline OpenTelemetry integration](https://docs.cline.bot/enterprise-solutions/monitoring/opentelemetry.md)
-- [Cline OpenTelemetry environment variables](https://docs.cline.bot/enterprise-solutions/monitoring/opentelemetry_override.md)
-- [Cline OpenTelemetry events](https://docs.cline.bot/enterprise-solutions/monitoring/opentelemetry-events.md)
 - [Cline CLI reference](https://docs.cline.bot/cline-cli/cli-reference.md)
 - [OpenTelemetry Node zero-code instrumentation](https://opentelemetry.io/docs/zero-code/js/)
+- [Jaeger APIs](https://www.jaegertracing.io/docs/2.21/apis/)

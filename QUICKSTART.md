@@ -335,25 +335,30 @@ missing/ambiguous pin, or source-IP mismatch. Do not disable TLS verification.
 
 ## 5. Diagnose a timeout (optional)
 
-For a first client-side timeline, start Cline from the activated guest shell and
-inspect its documented logs:
+Start the portable Jaeger viewer and traced Friendzone from the host repository:
 
-```sh
-# Terminal 1
-tail -F ~/.cline/cline-core-service.log ~/.cline/data/logs/hub-daemon.log
-
-# Terminal 2
-date -u
-cline --verbose --timeout 0 "minimal prompt that reproduces the timeout"
+```cmd
+tools\trace-viewer.cmd Broker -BrokerAddress HOST_IP
 ```
 
-Friendzone can export proxy/upstream spans, but stock Cline's built-in
-OpenTelemetry support currently emits logs and metrics rather than distributed
-traces. To get one Cline → Friendzone → provider trace, instrument the Node Cline
-CLI/hub so its HTTP requests inject W3C `traceparent`. Follow
-[Trace Cline proxy timeouts](TRACING.md); it includes the temporary Node setup,
-collector configuration, and the extra host/switch rule required if the guest
-sends OTLP directly to host port 4318. Do not open that port broadly.
+Then, from an activated and approved guest:
+
+```sh
+curl --noproxy '*' -fsS "$FZ_BROKER/bootstrap/trace-command.sh" -o trace-command.sh
+sh ./trace-command.sh cline --verbose --timeout 0 "minimal prompt that reproduces the timeout"
+```
+
+The wrapper takes a complete command: it does not insert `cline` or flags. It can
+also run `node script.cjs`, `cline --help`, or any other executable. Every
+command gets an outer duration/exit span; Node-based commands additionally get
+HTTP/Undici spans. Open <http://127.0.0.1:16686> and select **cline-guest**. Trace
+batches use Friendzone's existing bootstrap port; Jaeger remains host-loopback
+only and no firewall exception is added. See
+[Trace commands and Cline proxy timeouts](TRACING.md) for export and interpretation.
+
+If the wrapper reports an invalid tracing asset, the host is still running an
+older broker. Stop it, start the `Broker` command above, redownload the wrapper,
+and retry. The completed one-time package install is reused.
 
 ## 6. Container: point the agent at MCP forwards
 

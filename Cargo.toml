@@ -19,6 +19,7 @@ futures-util = "0.3"
 h2 = "=0.4.19"
 http-body-util = "0.1"
 hudsucker = { version = "0.25", features = ["http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "logging", "tls12", "webpki-tokio"] }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
@@ -31,11 +32,10 @@ tokio = { version = "1.48", features = ["full"] }
 tracing = "0.1"
 tracing-opentelemetry = { version = "0.33", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower = { version = "0.5", features = ["util"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
 
 [dev-dependencies]
-hyper-rustls = { version = "0.27", features = ["http2"] }
 tokio-rustls = "0.26"
-tower = { version = "0.5", features = ["util"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["testing", "trace"] }
 

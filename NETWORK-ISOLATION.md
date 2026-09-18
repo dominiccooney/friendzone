@@ -30,7 +30,7 @@ remain policy/log labels, not proxy credentials.
 | Guest destination | Protocol | Policy | Purpose |
 |---|---|---|---|
 | Broker's guest-facing IP, port 8080 | TCP | Allow | Explicit HTTP/HTTPS proxy |
-| Same IP, port 8082 | TCP | Allow | Setup scripts, CA/env, health, guest announcement, MCP forwards |
+| Same IP, port 8082 | TCP | Allow | Setup/health, async jobs, MCP, and opt-in bounded trace relay |
 | Any address, UI port 8081 | Any | Deny | Host management only |
 | Internet, LAN, other host ports, other guests | Any | Deny | Prevent direct bypass and host access |
 | Direct DNS (53), DoT (853), QUIC (UDP/443), SSH (22), other UDP | Any | Deny | No alternate guest egress |
@@ -38,9 +38,16 @@ remain policy/log labels, not proxy credentials.
 
 Use the actual configured ports, not these defaults if you changed them.
 With today's architecture, **"only through the proxy" also needs the narrow
-8082 exception**. Blocking it prevents setup/recovery and direct MCP access.
+8082 exception**. Blocking it prevents setup/recovery, direct MCP access, and
+the opt-in tracing workflow.
 It is not the management port. `/api/containers` and other management routes
 are not exposed on the bootstrap listener.
+
+Tracing mode adds `/v1/traces` on this existing listener. It is disabled by
+default. When enabled by the Windows trace-viewer launcher, it accepts only
+bounded OTLP protobuf batches from an approved, uniquely IP-pinned, non-killed
+guest and forwards them to an unauthenticated loopback-only collector endpoint.
+It does not expose the collector or Jaeger UI to the guest.
 
 The host broker itself still needs Internet/DNS access for inference,
 upstream HTTP requests, MCP, and OAuth. Do not apply the guest egress deny to

@@ -36,6 +36,7 @@ struct BootstrapState {
     mcp: crate::mcp::McpState,
     settings: crate::settings::Settings,
     proxy_port: u16,
+    trace_relay: Option<crate::telemetry::TraceRelay>,
 }
 
 /// Scans `<data-dir>/guest-bin/` for cross-built `fz` binaries to serve
@@ -88,6 +89,7 @@ pub async fn serve_bootstrap(
     mcp: crate::mcp::McpState,
     settings: crate::settings::Settings,
     proxy_port: u16,
+    trace_relay: Option<crate::telemetry::TraceRelay>,
 ) -> Result<()> {
     let executable = std::env::current_exe().context("locate fz executable")?;
     let binary = tokio::fs::read(&executable)
@@ -103,6 +105,7 @@ pub async fn serve_bootstrap(
             mcp,
             settings,
             proxy_port,
+            trace_relay,
         }),
         "bootstrap server",
     )
@@ -776,12 +779,21 @@ fn bootstrap_router(state: BootstrapState) -> Router {
                 )
             }),
         )
+        .route("/bootstrap/trace-command.sh", get(trace_command_script))
+        .route("/bootstrap/trace-cline.sh", get(trace_command_script))
+        .route("/bootstrap/trace-node.cjs", get(trace_node_preload))
+        .route("/bootstrap/trace-cline.cjs", get(trace_node_preload))
+        .route(
+            "/bootstrap/trace-command.cjs",
+            get(trace_command_supervisor),
+        )
         .route("/guest/jobs", post(submit_job).get(list_jobs))
         .route("/guest/git-push", post(submit_git_push))
         .route("/guest/jobs/{id}", get(get_job).delete(delete_job))
         .route("/guest/jobs/{id}/cancel", post(cancel_job))
         .route("/guest/jobs/{id}/acknowledge", post(acknowledge_job))
         .route("/mcp/{name}", post(mcp_message))
+        .route("/v1/traces", post(relay_traces))
         .route("/health", get(|| async { "ok" }))
         .layer(axum::middleware::from_fn(
             |request: axum::extract::Request, next: axum::middleware::Next| async move {
@@ -793,6 +805,78 @@ fn bootstrap_router(state: BootstrapState) -> Router {
             },
         ))
         .with_state(state)
+}
+
+fn tracing_asset(source: &'static str) -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        source.replace("\r\n", "\n"),
+    )
+}
+
+async fn trace_command_script() -> impl IntoResponse {
+    tracing_asset(include_str!("bootstrap/trace-command.sh"))
+}
+
+async fn trace_node_preload() -> impl IntoResponse {
+    tracing_asset(include_str!("bootstrap/trace-node.cjs"))
+}
+
+async fn trace_command_supervisor() -> impl IntoResponse {
+    tracing_asset(include_str!("bootstrap/trace-command.cjs"))
+}
+
+async fn relay_traces(
+    State(state): State<BootstrapState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    let Some(relay) = &state.trace_relay else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let (container, authorization) = match state.mcp.app.authorize_proxy_peer(peer.ip(), None) {
+        Ok(identity) => identity,
+        Err(_) => return StatusCode::FORBIDDEN.into_response(),
+    };
+    if authorization != crate::state::Authorization::Allowed || state.mcp.app.is_killed(&container)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    if content_type != Some("application/x-protobuf") {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "trace relay accepts application/x-protobuf only",
+        )
+            .into_response();
+    }
+    let slot = match relay.try_reserve() {
+        Ok(slot) => slot,
+        Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+    };
+    let body = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        axum::body::to_bytes(request.into_body(), crate::telemetry::MAX_RELAY_BODY),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+    };
+    match relay.forward(body, slot).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => {
+            tracing::warn!(%error, guest = %peer.ip(), "trace relay failed");
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+    }
 }
 
 fn job_identity(
@@ -1165,15 +1249,15 @@ async fn bootstrap_hello(
             Ok(identity) => identity,
             Err(error) => {
                 return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
                 "requested_container": query.container,
                 "approved": false,
                 "error": error.to_string(),
                 "action": "Fix duplicate IP pins in host Settings > Guests, then rerun setup.",
             })),
-        )
-            .into_response();
+                )
+                    .into_response();
             }
         };
     let canonicalized = container != query.container;
@@ -1191,7 +1275,7 @@ async fn bootstrap_hello(
             "Use Approve + pin IP for this guest in the host Inbox after setup.".to_owned()
         },
     }))
-    .into_response()
+        .into_response()
 }
 
 /// Connection facts a guest needs to compose its environment: the
@@ -1398,15 +1482,15 @@ async fn resolve_github_target(
     if !host_decision(&state, &headers) {
         return (StatusCode::FORBIDDEN, "use host UI to resolve targets").into_response();
     }
-    let result=async {
-        let detail=state.app.reviews.detail(id).context("request no longer waiting")?;
-        if detail.summary.fingerprint!=request.fingerprint {anyhow::bail!("fingerprint mismatch");}
-        let context=detail.comment_context.context("request is not eligible for a narrow comment permission (shape or escrow credential unsupported)")?;
-        let revision=state.app.comment_revision(&detail.summary.container).context("container removed")?;
-        let credential=crate::github::Credential::current(&state.settings,&context.binding).context("credential changed; make a new request")?;
-        let target=state.app.github.resolve(&context.subject_id,&credential).await?;
-        if crate::github::Credential::current(&state.settings,&context.binding).is_none(){anyhow::bail!("credential changed during lookup");}
-        state.app.reviews.set_resolved(id,&request.fingerprint,crate::github::Resolved{target,credential:context.binding.entry},revision)
+    let result = async {
+        let detail = state.app.reviews.detail(id).context("request no longer waiting")?;
+        if detail.summary.fingerprint != request.fingerprint { anyhow::bail!("fingerprint mismatch"); }
+        let context = detail.comment_context.context("request is not eligible for a narrow comment permission (shape or escrow credential unsupported)")?;
+        let revision = state.app.comment_revision(&detail.summary.container).context("container removed")?;
+        let credential = crate::github::Credential::current(&state.settings, &context.binding).context("credential changed; make a new request")?;
+        let target = state.app.github.resolve(&context.subject_id, &credential).await?;
+        if crate::github::Credential::current(&state.settings, &context.binding).is_none() { anyhow::bail!("credential changed during lookup"); }
+        state.app.reviews.set_resolved(id, &request.fingerprint, crate::github::Resolved { target, credential: context.binding.entry }, revision)
     }.await;
     match result {
         Ok(detail) => Json(detail).into_response(),
@@ -1428,18 +1512,18 @@ async fn grant_comment_permission(
     if !host_decision(&state, &headers) {
         return (StatusCode::FORBIDDEN, "use host UI to grant permissions").into_response();
     }
-    let result=async {
-        let detail=state.app.reviews.detail(id).context("request no longer waiting")?;
-        if detail.summary.fingerprint!=request.fingerprint || detail.resolution_id!=Some(request.resolution_id) {anyhow::bail!("review/target changed; resolve again");}
-        let context=detail.comment_context.context("no supported comment command")?;
-        let resolved=detail.resolved_target.context("resolve and inspect the GitHub target first")?;
-        let credential=crate::github::Credential::current(&state.settings,&context.binding).context("credential changed; resolve a new request")?;
-        let target=state.app.github.resolve(&context.subject_id,&credential).await?;
-        if !resolved.target.same_identity(&target) || crate::github::Credential::current(&state.settings,&context.binding).is_none(){anyhow::bail!("target or credential changed; resolve again");}
-        let current=state.app.reviews.detail(id).context("request no longer waiting")?;
-        if current.resolution_id!=Some(request.resolution_id) || current.summary.expires_at<=chrono::Utc::now(){anyhow::bail!("target review expired or changed");}
-        let grant=state.app.grant_reviewed_comment(id,&request.fingerprint,request.resolution_id,target)?;
-        Ok::<_,anyhow::Error>(serde_json::json!({"id":grant,"message":"Permission saved for future requests. This pending request still needs Approve once or Deny."}))
+    let result = async {
+        let detail = state.app.reviews.detail(id).context("request no longer waiting")?;
+        if detail.summary.fingerprint != request.fingerprint || detail.resolution_id != Some(request.resolution_id) { anyhow::bail!("review/target changed; resolve again"); }
+        let context = detail.comment_context.context("no supported comment command")?;
+        let resolved = detail.resolved_target.context("resolve and inspect the GitHub target first")?;
+        let credential = crate::github::Credential::current(&state.settings, &context.binding).context("credential changed; resolve a new request")?;
+        let target = state.app.github.resolve(&context.subject_id, &credential).await?;
+        if !resolved.target.same_identity(&target) || crate::github::Credential::current(&state.settings, &context.binding).is_none() { anyhow::bail!("target or credential changed; resolve again"); }
+        let current = state.app.reviews.detail(id).context("request no longer waiting")?;
+        if current.resolution_id != Some(request.resolution_id) || current.summary.expires_at <= chrono::Utc::now() { anyhow::bail!("target review expired or changed"); }
+        let grant = state.app.grant_reviewed_comment(id, &request.fingerprint, request.resolution_id, target)?;
+        Ok::<_, anyhow::Error>(serde_json::json!({"id":grant,"message":"Permission saved for future requests. This pending request still needs Approve once or Deny."}))
     }.await;
     match result {
         Ok(body) => Json(body).into_response(),
@@ -1825,6 +1909,137 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
+    async fn trace_relay_is_explicit_pinned_bounded_and_forwards_only_protobuf_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1/traces", listener.local_addr().unwrap());
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let receiver = Router::new().route(
+            "/v1/traces",
+            post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let sent = sent.clone();
+                    async move {
+                        sent.send((headers, body)).unwrap();
+                        StatusCode::OK
+                    }
+                },
+            ),
+        );
+        let receiver_task = tokio::spawn(async move { axum::serve(listener, receiver).await });
+
+        let settings = test_settings();
+        let app = AppState::default();
+        app.add_container("guest").unwrap();
+        app.set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
+            .unwrap();
+        let registry =
+            crate::mcp::ForwardRegistry::load(settings.data_dir(), settings.clone()).unwrap();
+        let state = BootstrapState {
+            cert: Arc::new(String::new()),
+            binary: Arc::new(vec![]),
+            guest_binaries: Arc::default(),
+            mcp: crate::mcp::McpState::new(app.clone(), registry),
+            settings: settings.clone(),
+            proxy_port: 8080,
+            trace_relay: Some(
+                crate::telemetry::TraceRelay::new(endpoint.parse().unwrap()).unwrap(),
+            ),
+        };
+        let router = bootstrap_router(state.clone());
+        let request = |peer: &str, content_type: &str, body: Vec<u8>| {
+            let mut request = Request::post("/v1/traces")
+                .header(header::CONTENT_TYPE, content_type)
+                .header("x-must-not-forward", "private")
+                .body(Body::from(body))
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                peer.parse::<SocketAddr>().unwrap(),
+            ));
+            request
+        };
+
+        let disabled = bootstrap_router(BootstrapState {
+            trace_relay: None,
+            ..state.clone()
+        });
+        assert_eq!(
+            disabled
+                .oneshot(request("127.0.0.1:1234", "application/x-protobuf", vec![1]))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(request("127.0.0.2:1234", "application/x-protobuf", vec![1]))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        app.set_killed("guest".into(), true).unwrap();
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(request("127.0.0.1:1234", "application/x-protobuf", vec![1]))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        app.set_killed("guest".into(), false).unwrap();
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(request("127.0.0.1:1234", "application/json", vec![1]))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(request(
+                    "127.0.0.1:1234",
+                    "application/x-protobuf",
+                    vec![0; crate::telemetry::MAX_RELAY_BODY + 1]
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let payload = vec![0x0a, 0x02, 0x08, 0x01];
+        assert_eq!(
+            router
+                .oneshot(request(
+                    "127.0.0.1:1234",
+                    "application/x-protobuf",
+                    payload.clone()
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let (headers, body) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), received.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(body.as_ref(), payload);
+        assert_eq!(headers[header::CONTENT_TYPE], "application/x-protobuf");
+        assert!(!headers.contains_key("x-must-not-forward"));
+
+        receiver_task.abort();
+        std::fs::remove_dir_all(settings.data_dir()).unwrap();
+    }
+
+    #[tokio::test]
     async fn async_guest_routes_return_immediately_and_host_api_controls_execution() {
         let dir = std::env::temp_dir().join(format!("fz-async-http-{}", uuid::Uuid::new_v4()));
         let settings = crate::settings::Settings::load(&dir).unwrap();
@@ -1855,6 +2070,7 @@ mod tests {
             mcp: crate::mcp::McpState::new(app.clone(), registry.clone()),
             settings: settings.clone(),
             proxy_port: 8080,
+            trace_relay: None,
         });
         let ui = ui_router(UiState {
             app: app.clone(),
@@ -1882,7 +2098,7 @@ mod tests {
             ));
             req
         };
-        let payload=serde_json::json!({"request_key":"large","session_id":"s","query":"mutation($body:String!){addComment(input:{subjectId:\"ID\",body:$body}){clientMutationId}}","variables":{"body":"x".repeat(90000)}}).to_string();
+        let payload = serde_json::json!({"request_key":"large","session_id":"s","query":"mutation($body:String!){addComment(input:{subjectId:\"ID\",body:$body}){clientMutationId}}","variables":{"body":"x".repeat(90000)}}).to_string();
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             guest
@@ -2038,8 +2254,8 @@ mod tests {
                     },
                 )),
             )
-            .await
-            .unwrap()
+                .await
+                .unwrap()
         });
         let ui_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ui_addr = ui_listener.local_addr().unwrap();
@@ -2115,7 +2331,7 @@ mod tests {
             tokio::spawn(async move { req.send().await.unwrap() })
         };
         let mixed = "query Read { viewer { id } } mutation Write { createPullRequest(input:{repositoryId:\"repo\",headRefName:\"feature\",baseRefName:\"main\",title:\"new\"}){clientMutationId}}";
-        let queries=vec![
+        let queries = vec![
             serde_json::json!({"query":"{ viewer { login } }"}).to_string(),
             serde_json::json!({"query":"query MutationInName($q:String!){search(query:$q,type:ISSUE){issueCount}}","variables":{"q":"mutation { addComment }"}}).to_string(),
             serde_json::json!({"query":"query($show:Boolean=true){...F} fragment F on Query { __schema @include(if:$show){queryType{name}} }"}).to_string(),
@@ -2159,14 +2375,14 @@ mod tests {
             .collect();
         // REST workflows use the same one-shot gate, without special grants.
         mutations.extend([
-            ("https://api.github.com/repos/owner/repo/pulls".into(),r#"{"title":"new PR","head":"feature","base":"main"}"#.into(),None),
-            ("https://api.github.com/repos/owner/repo/pulls/12/comments".into(),r#"{"body":"review comment","path":"file.rs","line":4,"side":"RIGHT","commit_id":"abc"}"#.into(),None),
-            (crate::github::ENDPOINT.into(),serde_json::json!({"query":mixed,"operationName":"Write"}).to_string(),Some("Create pull request".into())),
-            (crate::github::ENDPOINT.into(),serde_json::json!({"query":mixed}).to_string(),None),
-            (format!("{}?operationName=Write",crate::github::ENDPOINT),serde_json::json!({"query":mixed,"operationName":"Read"}).to_string(),None),
-            (crate::github::ENDPOINT.into(),serde_json::json!({"query":"mutation OutcomeGraphqlError { createPullRequest(input:{repositoryId:\"id\",baseRefName:\"main\",headRefName:\"feature\",title:\"text\"}){clientMutationId} }"}).to_string(),None),
-            (crate::github::ENDPOINT.into(),serde_json::json!({"query":"mutation OutcomeHttpError { createPullRequest(input:{repositoryId:\"id\",baseRefName:\"main\",headRefName:\"feature\",title:\"text\"}){clientMutationId} }"}).to_string(),None),
-            ("https://api.github.com:444/graphql".into(),serde_json::json!({"query":"mutation OutcomeConnectionError { createPullRequest(input:{repositoryId:\"id\",baseRefName:\"main\",headRefName:\"feature\",title:\"text\"}){clientMutationId} }"}).to_string(),None),
+            ("https://api.github.com/repos/owner/repo/pulls".into(), r#"{"title":"new PR","head":"feature","base":"main"}"#.into(), None),
+            ("https://api.github.com/repos/owner/repo/pulls/12/comments".into(), r#"{"body":"review comment","path":"file.rs","line":4,"side":"RIGHT","commit_id":"abc"}"#.into(), None),
+            (crate::github::ENDPOINT.into(), serde_json::json!({"query":mixed,"operationName":"Write"}).to_string(), Some("Create pull request".into())),
+            (crate::github::ENDPOINT.into(), serde_json::json!({"query":mixed}).to_string(), None),
+            (format!("{}?operationName=Write", crate::github::ENDPOINT), serde_json::json!({"query":mixed,"operationName":"Read"}).to_string(), None),
+            (crate::github::ENDPOINT.into(), serde_json::json!({"query":"mutation OutcomeGraphqlError { createPullRequest(input:{repositoryId:\"id\",baseRefName:\"main\",headRefName:\"feature\",title:\"text\"}){clientMutationId} }"}).to_string(), None),
+            (crate::github::ENDPOINT.into(), serde_json::json!({"query":"mutation OutcomeHttpError { createPullRequest(input:{repositoryId:\"id\",baseRefName:\"main\",headRefName:\"feature\",title:\"text\"}){clientMutationId} }"}).to_string(), None),
+            ("https://api.github.com:444/graphql".into(), serde_json::json!({"query":"mutation OutcomeConnectionError { createPullRequest(input:{repositoryId:\"id\",baseRefName:\"main\",headRefName:\"feature\",title:\"text\"}){clientMutationId} }"}).to_string(), None),
         ]);
         for (url, body, action) in mutations {
             for decision in ["deny", "approve"] {
@@ -2309,7 +2525,7 @@ mod tests {
                     state.reviews.detail(summary.id).is_none(),
                     "retained detail cannot authorize a grant"
                 );
-                assert_eq!(host.post(format!("{endpoint}/decision")).header("x-friendzone-review","1").json(&serde_json::json!({"fingerprint":summary.fingerprint,"decision":"approve"})).send().await.unwrap().status(),StatusCode::CONFLICT);
+                assert_eq!(host.post(format!("{endpoint}/decision")).header("x-friendzone-review", "1").json(&serde_json::json!({"fingerprint":summary.fingerprint,"decision":"approve"})).send().await.unwrap().status(), StatusCode::CONFLICT);
             }
         }
         // Reproduce an enclosing client's shorter deadline: it must cancel the
@@ -2395,22 +2611,32 @@ mod tests {
         let hits_seen = hits.clone();
         let lookups_seen = lookups.clone();
         let upstream_task = tokio::spawn(async move {
-            axum::serve(upstream,Router::new().route("/graphql",post(move |headers:axum::http::HeaderMap,Json(json):Json<serde_json::Value>|{
-            let hits=hits_seen.clone();let lookups=lookups_seen.clone(); async move {
-                assert_eq!(headers["authorization"],"Bearer host-secret");
-                if json["query"].as_str().unwrap().starts_with("query FriendzoneTarget") {
-                    crate::github::tests::assert_lookup(&json);lookups.fetch_add(1,Ordering::SeqCst);
-                    let mut response=crate::github::tests::response();
-                    if json["variables"]["id"]=="wrong-target" {response["data"]["node"]["id"]="wrong-target".into();response["data"]["node"]["number"]=483.into();response["data"]["node"]["url"]="https://github.com/cline/cline/issues/483".into();}
-                    Json(response)
-                } else {
-                    assert_eq!(json["operationName"],"FriendzoneComment");assert_eq!(json["variables"]["input"]["subjectId"],"canonical");
-                    assert_eq!(json["variables"]["input"]["body"],"second comment\nmutation { deleteIssue } is just text");
-                    assert_eq!(headers["user-agent"],"Friendzone comment permission");assert!(!headers.contains_key("proxy-authorization"));
-                    hits.fetch_add(1,Ordering::SeqCst);Json(serde_json::json!({"data":{"alias":{"clientMutationId":null}}}))
+            axum::serve(upstream, Router::new().route("/graphql", post(move |headers: axum::http::HeaderMap, Json(json): Json<serde_json::Value>| {
+                let hits = hits_seen.clone();
+                let lookups = lookups_seen.clone();
+                async move {
+                    assert_eq!(headers["authorization"], "Bearer host-secret");
+                    if json["query"].as_str().unwrap().starts_with("query FriendzoneTarget") {
+                        crate::github::tests::assert_lookup(&json);
+                        lookups.fetch_add(1, Ordering::SeqCst);
+                        let mut response = crate::github::tests::response();
+                        if json["variables"]["id"] == "wrong-target" {
+                            response["data"]["node"]["id"] = "wrong-target".into();
+                            response["data"]["node"]["number"] = 483.into();
+                            response["data"]["node"]["url"] = "https://github.com/cline/cline/issues/483".into();
+                        }
+                        Json(response)
+                    } else {
+                        assert_eq!(json["operationName"], "FriendzoneComment");
+                        assert_eq!(json["variables"]["input"]["subjectId"], "canonical");
+                        assert_eq!(json["variables"]["input"]["body"], "second comment\nmutation { deleteIssue } is just text");
+                        assert_eq!(headers["user-agent"], "Friendzone comment permission");
+                        assert!(!headers.contains_key("proxy-authorization"));
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({"data":{"alias":{"clientMutationId":null}}}))
+                    }
                 }
-            }
-        }))).await.unwrap()
+            }))).await.unwrap()
         });
         let mut state = AppState::load(&dir).unwrap();
         state.github = crate::github::Client::for_test(&format!("http://{upstream_addr}/graphql"));
@@ -2987,6 +3213,7 @@ mod tests {
             mcp: crate::mcp::McpState::new(app, registry),
             settings,
             proxy_port: 8080,
+            trace_relay: None,
         });
         let make_guest = |auth: bool| {
             let mut builder =
@@ -3186,6 +3413,7 @@ mod tests {
             mcp: crate::mcp::McpState::new(app.clone(), registry.clone()),
             settings: settings.clone(),
             proxy_port: 8080,
+            trace_relay: None,
         });
         let config = serde_json::json!([{"name":"test", "url":"https://example.invalid/mcp", "tools":[], "guests":["guest"]}]);
         let saved = ui
@@ -3471,7 +3699,49 @@ mod tests {
             ),
             settings,
             proxy_port: 8080,
+            trace_relay: None,
         })
+    }
+
+    #[tokio::test]
+    async fn bootstrap_serves_lf_only_traced_command_assets_and_compatibility_aliases() {
+        for (path, expected) in [
+            (
+                "/bootstrap/trace-command.sh",
+                include_str!("bootstrap/trace-command.sh").replace("\r\n", "\n"),
+            ),
+            (
+                "/bootstrap/trace-cline.sh",
+                include_str!("bootstrap/trace-command.sh").replace("\r\n", "\n"),
+            ),
+            (
+                "/bootstrap/trace-node.cjs",
+                include_str!("bootstrap/trace-node.cjs").replace("\r\n", "\n"),
+            ),
+            (
+                "/bootstrap/trace-cline.cjs",
+                include_str!("bootstrap/trace-node.cjs").replace("\r\n", "\n"),
+            ),
+            (
+                "/bootstrap/trace-command.cjs",
+                include_str!("bootstrap/trace-command.cjs").replace("\r\n", "\n"),
+            ),
+        ] {
+            let response = bootstrap_app()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), expected.as_bytes());
+            assert!(
+                !body.contains(&b'\r'),
+                "{path} must be safe to execute in a Linux guest"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3488,6 +3758,7 @@ mod tests {
             mcp: crate::mcp::McpState::new(app.clone(), registry),
             settings,
             proxy_port: 8080,
+            trace_relay: None,
         };
         let peer: SocketAddr = "192.0.2.10:4567".parse().unwrap();
 

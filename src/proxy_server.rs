@@ -1,4 +1,11 @@
-use std::{future::pending, net::SocketAddr, time::Duration};
+use std::{
+    future::{Future, pending},
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context as TaskContext, Poll},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use hudsucker::{
@@ -10,9 +17,97 @@ use hudsucker::{
 
 use crate::{proxy::EventHandler, state::AppState};
 
+const CLINE_API_HOST: &str = "api.cline.bot";
+
+#[derive(Clone)]
+struct ProtocolRoutingConnector<C> {
+    cline_http1: C,
+    automatic: C,
+}
+
+impl<C> ProtocolRoutingConnector<C> {
+    fn new(cline_http1: C, automatic: C) -> Self {
+        Self {
+            cline_http1,
+            automatic,
+        }
+    }
+}
+
+fn cline_requires_http1(uri: &hudsucker::hyper::Uri) -> bool {
+    uri.scheme() == Some(&hudsucker::hyper::http::uri::Scheme::HTTPS)
+        && uri
+            .host()
+            .is_some_and(|host| host.eq_ignore_ascii_case(CLINE_API_HOST))
+        && uri.port_u16().is_none_or(|port| port == 443)
+}
+
+impl<C> tower::Service<hudsucker::hyper::Uri> for ProtocolRoutingConnector<C>
+where
+    C: tower::Service<hudsucker::hyper::Uri>,
+    C::Future: Send + 'static,
+    C::Response: 'static,
+    C::Error: 'static,
+{
+    type Response = C::Response;
+    type Error = C::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<C::Response, C::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        let cline = self.cline_http1.poll_ready(cx)?;
+        let automatic = self.automatic.poll_ready(cx)?;
+        if cline.is_ready() && automatic.is_ready() {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn call(&mut self, uri: hudsucker::hyper::Uri) -> Self::Future {
+        if cline_requires_http1(&uri) {
+            Box::pin(self.cline_http1.call(uri))
+        } else {
+            Box::pin(self.automatic.call(uri))
+        }
+    }
+}
+
+fn upstream_connector(
+    provider: hudsucker::rustls::crypto::CryptoProvider,
+) -> Result<(
+    ProtocolRoutingConnector<
+        hyper_rustls::HttpsConnector<hudsucker::hyper_util::client::legacy::connect::HttpConnector>,
+    >,
+    hudsucker::tokio_tungstenite::Connector,
+)> {
+    use hyper_rustls::ConfigBuilderExt as _;
+
+    let tls = hudsucker::rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .context("configure upstream TLS protocol versions")?
+        .with_webpki_roots()
+        .with_no_client_auth();
+    let cline_http1 = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls.clone())
+        .https_or_http()
+        .enable_http1()
+        .build();
+    let automatic = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls.clone())
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    Ok((
+        ProtocolRoutingConnector::new(cline_http1, automatic),
+        hudsucker::tokio_tungstenite::Connector::Rustls(Arc::new(tls)),
+    ))
+}
+
 /// One shared Hyper client is built by Hudsucker at broker startup. Its clones
-/// share this pool across every guest connection. TLS ALPN selects HTTP/2 when
-/// available and retains HTTP/1.1 fallback through Hudsucker's Rustls connector.
+/// share this pool across every guest connection. TLS ALPN selects HTTP/2 with
+/// HTTP/1.1 fallback except for api.cline.bot, where a dedicated connector does
+/// not advertise h2. This startup snapshot is the protocol consistency boundary.
 pub(crate) fn upstream_client() -> hudsucker::hyper_util::client::legacy::Builder {
     use hudsucker::hyper_util::rt::{TokioExecutor, TokioTimer};
 
@@ -55,11 +150,18 @@ pub async fn serve(
     bootstrap_port: u16,
 ) -> Result<()> {
     let ca = RcgenAuthority::new(issuer, 1_000, aws_lc_rs::default_provider());
+    let (connector, websocket_connector) = upstream_connector(aws_lc_rs::default_provider())?;
     tracing::info!(%addr, "proxy listening");
+    tracing::warn!(
+        host = CLINE_API_HOST,
+        protocol = "http/1.1",
+        "upstream protocol workaround enabled"
+    );
     Proxy::builder()
         .with_addr(addr)
         .with_ca(ca)
-        .with_rustls_connector(aws_lc_rs::default_provider())
+        .with_http_connector(connector)
+        .with_websocket_connector(websocket_connector)
         .with_client(upstream_client())
         .with_server(downstream_server())
         .with_http_handler(EventHandler::new(
@@ -99,10 +201,32 @@ mod tests {
     };
     use tokio_rustls::TlsAcceptor;
 
-    use super::{downstream_server, upstream_client};
+    use super::{
+        ProtocolRoutingConnector, cline_requires_http1, downstream_server, upstream_client,
+    };
+
+    #[test]
+    fn cline_http1_workaround_matches_only_the_production_https_origin() {
+        for uri in [
+            "https://api.cline.bot/",
+            "https://API.CLINE.BOT/api/v1/chat/completions",
+            "https://api.cline.bot:443/",
+        ] {
+            assert!(cline_requires_http1(&uri.parse().unwrap()), "{uri}");
+        }
+        for uri in [
+            "http://api.cline.bot/",
+            "https://api.cline.bot:444/",
+            "https://sub.api.cline.bot/",
+            "https://api.cline.bot.example/",
+            "https://example.com/",
+        ] {
+            assert!(!cline_requires_http1(&uri.parse().unwrap()), "{uri}");
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn real_proxy_multiplexes_http2_upstream_and_streams_json_immediately() {
+    async fn real_proxy_routes_cline_over_http1_and_keeps_http2_for_other_hosts() {
         use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
 
         let diagnostic_lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -130,18 +254,22 @@ mod tests {
         .with_no_client_auth()
         .with_single_cert(vec![leaf.der().clone()], leaf_key)
         .unwrap();
-        server_config.alpn_protocols = vec![b"h2".to_vec()];
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
         let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin_addr = origin.local_addr().unwrap();
-        let connections = Arc::new(AtomicUsize::new(0));
+        let h1_connections = Arc::new(AtomicUsize::new(0));
+        let h2_connections = Arc::new(AtomicUsize::new(0));
+        let h1_requests = Arc::new(AtomicUsize::new(0));
         let h2_requests = Arc::new(AtomicUsize::new(0));
         let post_bytes = Arc::new(AtomicUsize::new(0));
         let active = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
         let origin_task = {
-            let connections = connections.clone();
+            let h1_connections = h1_connections.clone();
+            let h2_connections = h2_connections.clone();
+            let h1_requests = h1_requests.clone();
             let h2_requests = h2_requests.clone();
             let post_bytes = post_bytes.clone();
             let active = active.clone();
@@ -149,24 +277,39 @@ mod tests {
             tokio::spawn(async move {
                 loop {
                     let (socket, _) = origin.accept().await.unwrap();
-                    connections.fetch_add(1, Ordering::SeqCst);
                     let acceptor = acceptor.clone();
+                    let h1_connections = h1_connections.clone();
+                    let h2_connections = h2_connections.clone();
+                    let h1_requests = h1_requests.clone();
                     let h2_requests = h2_requests.clone();
                     let post_bytes = post_bytes.clone();
                     let active = active.clone();
                     let maximum = maximum.clone();
                     tokio::spawn(async move {
                         let tls = acceptor.accept(socket).await.unwrap();
-                        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+                        let negotiated_h2 =
+                            tls.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
+                        if negotiated_h2 {
+                            h2_connections.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            assert_eq!(tls.get_ref().1.alpn_protocol(), None);
+                            h1_connections.fetch_add(1, Ordering::SeqCst);
+                        }
                         let service = service_fn(
                             move |request: Request<hudsucker::hyper::body::Incoming>| {
                                 let active = active.clone();
                                 let maximum = maximum.clone();
+                                let h1_requests = h1_requests.clone();
                                 let h2_requests = h2_requests.clone();
                                 let post_bytes = post_bytes.clone();
                                 async move {
-                                    assert_eq!(request.version(), Version::HTTP_2);
-                                    h2_requests.fetch_add(1, Ordering::SeqCst);
+                                    if negotiated_h2 {
+                                        assert_eq!(request.version(), Version::HTTP_2);
+                                        h2_requests.fetch_add(1, Ordering::SeqCst);
+                                    } else {
+                                        assert_eq!(request.version(), Version::HTTP_11);
+                                        h1_requests.fetch_add(1, Ordering::SeqCst);
+                                    }
                                     if request.uri().path() == "/stream" {
                                         let stream =
                                             futures_util::stream::unfold(0, |part| async move {
@@ -204,20 +347,27 @@ mod tests {
                                 }
                             },
                         );
-                        let mut server = hudsucker::hyper::server::conn::http2::Builder::new(
-                            TokioExecutor::new(),
-                        );
-                        server
-                            .timer(hudsucker::hyper_util::rt::TokioTimer::new())
-                            .header_table_size(Some(3_210))
-                            .max_concurrent_streams(Some(17))
-                            .initial_stream_window_size(Some(123_456))
-                            .max_frame_size(Some(32_768))
-                            .max_header_list_size(99_999);
-                        server
-                            .serve_connection(TokioIo::new(tls), service)
-                            .await
-                            .unwrap();
+                        if negotiated_h2 {
+                            let mut server = hudsucker::hyper::server::conn::http2::Builder::new(
+                                TokioExecutor::new(),
+                            );
+                            server
+                                .timer(hudsucker::hyper_util::rt::TokioTimer::new())
+                                .header_table_size(Some(3_210))
+                                .max_concurrent_streams(Some(17))
+                                .initial_stream_window_size(Some(123_456))
+                                .max_frame_size(Some(32_768))
+                                .max_header_list_size(99_999);
+                            server
+                                .serve_connection(TokioIo::new(tls), service)
+                                .await
+                                .unwrap();
+                        } else {
+                            hudsucker::hyper::server::conn::http1::Builder::new()
+                                .serve_connection(TokioIo::new(tls), service)
+                                .await
+                                .unwrap();
+                        }
                     });
                 }
             })
@@ -241,7 +391,15 @@ mod tests {
                     .map(TokioIo::new)
             }
         });
-        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        let cline_http1 = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(client_config.clone())
+            .https_only()
+            .with_server_name_resolver(hyper_rustls::FixedServerNameResolver::new(
+                "127.0.0.1".try_into().unwrap(),
+            ))
+            .enable_http1()
+            .wrap_connector(fixed);
+        let automatic = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(client_config)
             .https_only()
             .with_server_name_resolver(hyper_rustls::FixedServerNameResolver::new(
@@ -250,6 +408,7 @@ mod tests {
             .enable_http1()
             .enable_http2()
             .wrap_connector(fixed);
+        let connector = ProtocolRoutingConnector::new(cline_http1, automatic);
 
         let app = crate::state::AppState::default();
         app.add_container("guest").unwrap();
@@ -281,20 +440,6 @@ mod tests {
             )
             .build()
             .unwrap();
-        let url = "https://api.cline.bot/slow";
-
-        let warm = client.get(url).send().await.unwrap();
-        assert_eq!(warm.text().await.unwrap(), "ok");
-        let requests = (0..8).map(|_| client.get(url).send());
-        let responses = futures_util::future::join_all(requests).await;
-        for response in responses {
-            let response = response.unwrap();
-            assert_eq!(response.text().await.unwrap(), "ok");
-        }
-        assert_eq!(connections.load(Ordering::SeqCst), 1);
-        assert_eq!(h2_requests.load(Ordering::SeqCst), 9);
-        assert!(maximum.load(Ordering::SeqCst) > 1);
-
         let payload = vec![b'x'; 128 * 1024];
         let requests = (0..8).map(|_| {
             client
@@ -307,12 +452,45 @@ mod tests {
             let response = response.unwrap();
             assert_eq!(response.text().await.unwrap(), "ok");
         }
-        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        assert_eq!(h1_requests.load(Ordering::SeqCst), 8);
+        assert!(h1_connections.load(Ordering::SeqCst) > 1);
+        assert_eq!(h2_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(h2_connections.load(Ordering::SeqCst), 0);
         assert_eq!(post_bytes.load(Ordering::SeqCst), payload.len() * 8);
+        assert!(maximum.load(Ordering::SeqCst) > 1);
+
+        maximum.store(0, Ordering::SeqCst);
+        let url = "https://example.com/slow";
+
+        let warm = client.get(url).send().await.unwrap();
+        assert_eq!(warm.text().await.unwrap(), "ok");
+        let requests = (0..8).map(|_| client.get(url).send());
+        let responses = futures_util::future::join_all(requests).await;
+        for response in responses {
+            let response = response.unwrap();
+            assert_eq!(response.text().await.unwrap(), "ok");
+        }
+        assert_eq!(h2_connections.load(Ordering::SeqCst), 1);
+        assert_eq!(h2_requests.load(Ordering::SeqCst), 9);
+        assert!(maximum.load(Ordering::SeqCst) > 1);
+
+        let requests = (0..8).map(|_| {
+            client
+                .post("https://example.com/post")
+                .body(payload.clone())
+                .send()
+        });
+        let responses = futures_util::future::join_all(requests).await;
+        for response in responses {
+            let response = response.unwrap();
+            assert_eq!(response.text().await.unwrap(), "ok");
+        }
+        assert_eq!(h2_connections.load(Ordering::SeqCst), 1);
+        assert_eq!(post_bytes.load(Ordering::SeqCst), payload.len() * 16);
         assert_eq!(h2_requests.load(Ordering::SeqCst), 17);
 
         let mut response = client
-            .get("https://api.cline.bot/stream")
+            .get("https://example.com/stream")
             .send()
             .await
             .unwrap();

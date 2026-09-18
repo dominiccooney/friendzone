@@ -128,9 +128,13 @@ resumed.
 
 ### Proxy transport and tracing
 
-Friendzone shares one upstream connection pool across guests, negotiates HTTP/2
-with HTTP/1.1 fallback, streams ordinary provider responses without buffering,
-and never retries an uncertain POST. Its request log and stderr diagnostics
+Friendzone shares one upstream connection pool across guests, normally negotiates
+HTTP/2 with HTTP/1.1 fallback, streams ordinary provider responses without
+buffering, and never retries an uncertain POST. As a targeted timeout workaround,
+exact HTTPS `api.cline.bot:443` connections advertise HTTP/1.1 only; other origins
+retain normal H2 negotiation. This avoids sharing Cline inference requests on the
+H2 connections implicated by traces while preserving concurrent H1 connections.
+The selection is fixed at broker startup. Its request log and stderr diagnostics
 separate connection/send, response-header, first-byte, streaming, and completion
 phases and retain typed I/O/TLS/HTTP/2 failures without bodies, query strings,
 credentials, arbitrary headers, or raw HTTP/2 HEADERS frames.
@@ -142,9 +146,12 @@ log. Stock Cline currently exports OpenTelemetry logs/metrics only—not distrib
 traces—so true automatic Cline-to-proxy parentage requires temporary Node
 auto-instrumentation or another client that injects `traceparent`.
 
-See [Trace Cline proxy timeouts](TRACING.md) for broker configuration, stock Cline
-logs, a shared-trace Cline CLI recipe, collector/firewall constraints, privacy,
-and a phase-by-phase timeout diagnosis table.
+See [Trace commands and Cline proxy timeouts](TRACING.md) for the exact-command
+wrapper, broker configuration, Cline instrumentation, the portable Windows
+Jaeger viewer, JSON export, privacy, and a phase-by-phase diagnosis table. The
+turnkey path uses the existing bootstrap listener to relay approved guest trace
+batches to loopback Jaeger, so it requires no Docker or additional guest
+firewall port.
 
 ## GitHub policy
 

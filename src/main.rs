@@ -139,6 +139,12 @@ async fn run_broker(
     let state = AppState::load(&data_dir)?;
     let settings = settings::Settings::load(&data_dir)?;
     let registry = mcp::ForwardRegistry::load(&data_dir, settings.clone())?;
+    let trace_relay = telemetry::TraceRelay::from_env()?;
+    if trace_relay.is_some() {
+        println!(
+            "Guest trace relay:     http://{bootstrap_addr}/v1/traces -> loopback OTLP collector"
+        );
+    }
     let forwards = registry.configs();
     if forwards.is_empty() {
         println!(
@@ -202,7 +208,7 @@ async fn run_broker(
         _ = refresher => unreachable!("refresher loop never returns"),
         result = proxy_server::serve(proxy_addr, state.clone(), issuer, settings.clone(), ui_addr.port(), bootstrap_addr.port()) => result,
         result = web::serve_ui(ui_addr, state.clone(), settings.clone(), registry, bootstrap_addr) => result,
-        result = web::serve_bootstrap(bootstrap_addr, files.cert_pem, mcp_state, settings, proxy_addr.port()) => result,
+        result = web::serve_bootstrap(bootstrap_addr, files.cert_pem, mcp_state, settings, proxy_addr.port(), trace_relay) => result,
         signal = tokio::signal::ctrl_c() => signal.context("wait for Ctrl+C"),
     }
 }
