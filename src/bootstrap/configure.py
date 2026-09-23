@@ -151,7 +151,7 @@ def install_linux_ca(cert, config, destination=SYSTEM_CA, run=None,
     return dict(installed=True, managed=managed, sha256=digest, destination=str(destination))
 
 
-def provider_update(path, fake):
+def provider_update(path, fake, oauth=False):
     root = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     if not isinstance(root, dict) or root.get("version", 1) != 1:
         raise ValueError("Unsupported Cline providers.json; no configuration changed")
@@ -163,9 +163,20 @@ def provider_update(path, fake):
     entry = providers.setdefault("cline", {"settings": {"provider": "cline"}})
     if not isinstance(entry, dict) or not isinstance(entry.get("settings"), dict):
         raise ValueError("Invalid Cline provider settings")
-    entry["settings"]["apiKey"] = fake
-    entry["settings"].pop("auth", None)
-    entry["tokenSource"] = "manual"
+    if oauth:
+        entry["settings"].pop("apiKey", None)
+        # This is an OAuth-shaped, guest-only facade. Friendzone owns the real
+        # refresh token; the far-future local expiry prevents Cline from trying
+        # to redeem credentials that deliberately do not exist in the guest.
+        entry["settings"]["auth"] = {
+            "accessToken": "workos:" + fake,
+            "expiresAt": 253402300799000,
+        }
+        entry["tokenSource"] = "oauth"
+    else:
+        entry["settings"]["apiKey"] = fake
+        entry["settings"].pop("auth", None)
+        entry["tokenSource"] = "manual"
     entry["updatedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     root.setdefault("lastUsedProvider", "cline")
     return json.dumps(root, ensure_ascii=False, indent=2) + "\n"
@@ -295,7 +306,8 @@ unset _fz_rest _fz_list _fz_item
                 backups.append((path.with_name(path.name + ".friendzone-backup"), old))
     if "CLINE_API_KEY" in data["fakes"]:
         provider = home / ".cline/data/settings/providers.json"
-        edits.append((provider, provider_update(provider, data["fakes"]["CLINE_API_KEY"])))
+        edits.append((provider, provider_update(
+            provider, data["fakes"]["CLINE_API_KEY"], bool(data.get("cline_oauth")))))
         if provider.exists():
             backups.append((provider.with_name("providers.json.friendzone-backup"), provider.read_text(encoding="utf-8")))
     # All parsing and profile conflict checks complete before the first write.

@@ -239,6 +239,29 @@ case "$output" in *fz-test-github-token*|*username=x-access-token*) exit 12;; es
             self.apply()
         self.assertEqual((self.config / "friendzone-env.sh").read_bytes(), before)
 
+    def test_provider_oauth_facade_contains_only_worthless_guest_credentials(self):
+        provider = self.home / ".cline/data/settings/providers.json"
+        provider.parent.mkdir(parents=True)
+        provider.write_text(json.dumps({"version": 1, "lastUsedProvider": "other", "modes": {}, "providers": {
+            "cline": {"settings": {"provider": "cline", "model": "keep", "apiKey": "stale-key",
+                                   "auth": {"refreshToken": "stale-refresh", "accountId": "stale-account"}}},
+            "other": {"settings": {"key": "preserve"}}}}))
+        self.data["cline_oauth"] = True
+        self.apply()
+        root = json.loads(provider.read_text())
+        entry = root["providers"]["cline"]
+        self.assertEqual(entry["settings"]["model"], "keep")
+        self.assertNotIn("apiKey", entry["settings"])
+        self.assertEqual(entry["settings"]["auth"], {
+            "accessToken": "workos:fake'$(bad)",
+            "expiresAt": 253402300799000,
+        })
+        self.assertEqual(entry["tokenSource"], "oauth")
+        self.assertNotIn("refreshToken", json.dumps(entry))
+        self.assertNotIn("accountId", json.dumps(entry))
+        self.assertEqual(root["providers"]["other"]["settings"]["key"], "preserve")
+        self.assertEqual(root["lastUsedProvider"], "other")
+
     def test_child_shell_activation_no_proxy_and_noninteractive_bash(self):
         previous = self.home / "previous.sh"
         previous.write_text("export PREVIOUS_HOOK=preserved\n")

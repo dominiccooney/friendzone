@@ -837,7 +837,7 @@ impl EventHandler {
                 }
             }
             let host = req.uri().host().unwrap_or_default().to_owned();
-            let substitution = self.settings.substitute(&host, |name| {
+            let substitution = self.settings.substitute(&host, req.uri().path(), |name| {
                 req.headers()
                     .get(name)
                     .and_then(|v| v.to_str().ok())
@@ -893,15 +893,16 @@ impl EventHandler {
             .ok_or_else(|| error("container is no longer authorized".into()))?;
         // Escrow leak/missing-secret denials are not permissions the user
         // may override. Check before collecting or advertising the request.
-        if let crate::settings::Substitution::Block(reason) =
-            self.settings
-                .substitute(req.uri().host().unwrap_or_default(), |name| {
-                    req.headers()
-                        .get(name)
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::to_owned)
-                })
-        {
+        if let crate::settings::Substitution::Block(reason) = self.settings.substitute(
+            req.uri().host().unwrap_or_default(),
+            req.uri().path(),
+            |name| {
+                req.headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+            },
+        ) {
             return Err(error(reason));
         }
         if req.headers().contains_key("content-encoding")
@@ -2325,6 +2326,73 @@ mod tests {
             RequestOrResponse::Response(response) => response.status(),
             _ => panic!("expected response"),
         }
+    }
+
+    #[tokio::test]
+    async fn cline_oauth_facade_flows_through_proxy_but_guest_refresh_is_denied() {
+        let dir = std::env::temp_dir().join(format!("fz-proxy-cline-{}", uuid::Uuid::new_v4()));
+        let state = AppState::default();
+        state.add_container("guest").unwrap();
+        state
+            .set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
+            .unwrap();
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        let entry = settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "cline".into(),
+                hosts: vec!["api.cline.bot".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fz-cline-facade".into(),
+                real_env: None,
+                guest_env: Some("CLINE_API_KEY".into()),
+            })
+            .unwrap();
+        settings.set_secret(&entry.name, "host-access").unwrap();
+        settings.set_secret(&crate::oauth::ClineSession::secret_name(&entry.name), &serde_json::json!({"refresh_token":"host-refresh", "expires_at":4_000_000_000_i64, "api_base_url":"https://api.cline.bot"}).to_string()).unwrap();
+        let mut handler = EventHandler::new(state.clone(), settings, 8081, 8082);
+        let peer = "127.0.0.1:12345".parse().unwrap();
+
+        let mut account = request(
+            "GET",
+            "https://api.cline.bot/api/v1/users/me",
+            Some("guest"),
+        );
+        account.headers_mut().insert(
+            "authorization",
+            "Bearer workos:fz-cline-facade".parse().unwrap(),
+        );
+        let RequestOrResponse::Request(forwarded) = handler.handle_from_peer(peer, account).await
+        else {
+            panic!("account request should be forwarded")
+        };
+        assert_eq!(
+            forwarded.headers()["authorization"],
+            "Bearer workos:host-access"
+        );
+
+        let mut refresh = request(
+            "POST",
+            "https://api.cline.bot/api/v1/auth/refresh",
+            Some("guest"),
+        );
+        refresh.headers_mut().insert(
+            "authorization",
+            "Bearer workos:fz-cline-facade".parse().unwrap(),
+        );
+        let RequestOrResponse::Response(response) = handler.handle_from_peer(peer, refresh).await
+        else {
+            panic!("guest refresh must not be forwarded")
+        };
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        use http_body_util::BodyExt;
+        let denial = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            String::from_utf8_lossy(&denial).contains("refresh is host-owned"),
+            "{}",
+            String::from_utf8_lossy(&denial)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

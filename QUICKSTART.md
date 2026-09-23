@@ -67,7 +67,11 @@ Open <http://127.0.0.1:8081>.
   opens in your browser, you confirm the code, and the broker picks up
   the tokens in the background and auto-refreshes them. Edit fixes a wrong
   header/host without changing the fake; Delete removes the entry and
-  its stored key together.
+  its stored key together. Rerun guest setup after sign-in: it then writes a
+  worthless OAuth-shaped facade into guest Cline settings, allowing account and
+  Cloud UI to recognize sign-in without copying access or refresh credentials.
+  Cloud Hub connections also require a guest Cline build with proxy-aware
+  `ws:`/`wss:` support.
 - **Settings → MCP servers** — find a server in host Cline or enter its
   name and upstream URL. **Add & authorize** creates it and starts host
   sign-in in one step. Complete login, then **Next: choose tools and guests**

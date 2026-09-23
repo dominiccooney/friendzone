@@ -76,6 +76,7 @@ pub fn script(
     validate_container(container)?;
     let mut fakes = std::collections::BTreeMap::new();
     let mut git_github_auth = false;
+    let mut cline_oauth = false;
     for entry in settings.entries() {
         git_github_auth |= entry.guest_env.as_deref() == Some("GITHUB_TOKEN")
             && entry.header.eq_ignore_ascii_case("authorization")
@@ -126,10 +127,12 @@ pub fn script(
             {
                 bail!("invalid/conflicting guest environment variable {name}");
             }
+            cline_oauth |= name == "CLINE_API_KEY"
+                && crate::oauth::ClineSession::load(settings, &entry.name).is_some();
             fakes.insert(name, entry.fake);
         }
     }
-    let payload = serde_json::json!({"broker":broker,"container":container,"ca":ca,"proxy_port":proxy_port,"fakes":fakes,
+    let payload = serde_json::json!({"broker":broker,"container":container,"ca":ca,"proxy_port":proxy_port,"fakes":fakes,"cline_oauth":cline_oauth,
         "git_credential_config":if git_github_auth {GITHUB_GIT_CONFIG} else {EMPTY_GIT_CONFIG},
         "plugin":STANDARD.encode(include_bytes!("plugin/friendzone.js")),
         "persistence":STANDARD.encode(include_bytes!("bootstrap/persist-environment.ps1"))});
@@ -244,6 +247,7 @@ mod tests {
                 .unwrap();
             assert_eq!(plugin, include_bytes!("plugin/friendzone.js"));
             assert_eq!(payload["ca"], authority.cert_pem);
+            assert_eq!(payload["cline_oauth"], false);
             assert_eq!(payload["git_credential_config"], GITHUB_GIT_CONFIG);
             if !powershell {
                 assert!(text.contains("/usr/local/share/ca-certificates/friendzone-local-ca.crt"));
@@ -297,6 +301,62 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn broker_owned_cline_session_generates_only_public_oauth_facade_metadata() {
+        let dir = std::env::temp_dir().join(format!("fz-bootstrap-oauth-{}", uuid::Uuid::new_v4()));
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        let entry = settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "cline".into(),
+                hosts: vec!["api.cline.bot".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fz-public-placeholder".into(),
+                real_env: None,
+                guest_env: Some("CLINE_API_KEY".into()),
+            })
+            .unwrap();
+        settings
+            .set_secret(&entry.name, "host-access-secret")
+            .unwrap();
+        settings
+            .set_secret(
+                &crate::oauth::ClineSession::secret_name(&entry.name),
+                &serde_json::json!({
+                    "refresh_token":"host-refresh-secret",
+                    "expires_at":4_000_000_000_i64,
+                    "api_base_url":"https://api.cline.bot"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let authority = crate::ca::AuthorityFiles::load_or_create(&dir.join("ca")).unwrap();
+        let text = script(
+            Shell::Sh,
+            "http://192.0.2.1:9082",
+            "guest",
+            &authority.cert_pem,
+            9080,
+            &settings,
+        )
+        .unwrap();
+        let encoded = text
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("python3 - '")
+                    .and_then(|line| line.split('\'').next())
+            })
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+        assert_eq!(payload["cline_oauth"], true);
+        assert_eq!(payload["fakes"]["CLINE_API_KEY"], "fz-public-placeholder");
+        let serialized = payload.to_string();
+        assert!(!serialized.contains("host-access-secret"));
+        assert!(!serialized.contains("host-refresh-secret"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn powershell_script_configures_temp_guest_with_mock_user_environment() {
@@ -313,6 +373,21 @@ mod tests {
                 guest_env: Some("GITHUB_TOKEN".into()),
             })
             .unwrap();
+        let cline = settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "cline".into(),
+                hosts: vec!["api.cline.bot".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fake'$(not-a-command)".into(),
+                real_env: None,
+                guest_env: Some("CLINE_API_KEY".into()),
+            })
+            .unwrap();
+        settings
+            .set_secret(&cline.name, "host-access-secret")
+            .unwrap();
+        settings.set_secret(&crate::oauth::ClineSession::secret_name(&cline.name), &serde_json::json!({"refresh_token":"host-refresh-secret", "expires_at":4_000_000_000_i64, "api_base_url":"https://api.cline.bot"}).to_string()).unwrap();
         let authority = crate::ca::AuthorityFiles::load_or_create(&dir.join("test-ca")).unwrap();
         let rotated = crate::ca::AuthorityFiles::load_or_create(&dir.join("rotated-ca")).unwrap();
         let rotated_path = dir.join("rotated-ca.pem");

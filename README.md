@@ -469,14 +469,21 @@ auto-refresh from then on.
 The guest setup script saves the fakes as `friendzone-env.sh` (or `.ps1` on Windows);
 source it in the agent's shell. When the fakes include `CLINE_API_KEY`,
 setup also writes `~/.cline/data/settings/providers.json` (the settings
-file Cline's CLI, IDE extension, and SDK share) registering the `cline`
-provider with the fake key, so Cline inference works in the guest with
-no `cline auth`. The write is merge-safe: other providers, the user's
-model choice, and `lastUsedProvider` are preserved. The `cline` provider is
-switched to a fake static `apiKey` (stale OAuth fields are removed), with
-valid v1 store metadata and `tokenSource: "manual"`. Run setup while guest
-Cline is stopped. Real OAuth refresh stays in the broker; substitution
-adds Cline's `workos:` prefix to broker-owned OAuth access tokens.
+file Cline's CLI, IDE extension, and SDK share). Static broker keys use the
+existing fake `apiKey`/`tokenSource: "manual"` representation. A broker-owned
+Cline OAuth session instead uses an OAuth-shaped facade: `auth.accessToken`
+contains only `workos:<fake>`, its local expiry is far in the future, and
+`tokenSource` is `"oauth"`. No real access token, refresh token or account ID
+enters the guest. This lets account/Cloud UI take Cline's OAuth path while the
+broker substitutes its current host token. Guest refresh is blocked because
+refresh remains host-owned. The write is merge-safe: other providers, model
+choice, and `lastUsedProvider` are preserved, and switching modes removes the
+other mode's stale fields. Run setup while guest Cline is stopped, then restart it.
+
+Cline Cloud's REST calls use the normal proxy. Its Hub connection also requires
+a Cline build whose `NodeHubClient` sends `ws:`/`wss:` through the configured
+`HTTP_PROXY`/`HTTPS_PROXY`; otherwise externally enforced guest isolation will
+correctly block that direct WebSocket connection.
 
 The environment includes `FZ_HOST`, `FZ_BROKER`, and both `NO_PROXY`/`no_proxy`
 with the broker host plus `localhost`, `127.0.0.1`, `::1`, and `[::1]`.

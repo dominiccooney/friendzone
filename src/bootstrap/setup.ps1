@@ -34,7 +34,7 @@ function Add-FzGitConfiguration($Values, [string]$GitConfigPath) {
     $Values.GIT_CONFIG_COUNT='2'
     $Values.GIT_CONFIG_KEY_1='include.path';$Values.GIT_CONFIG_VALUE_1=$GitConfigPath
 }
-function Get-FzProviderJson([string]$Path, [string]$Fake) {
+function Get-FzProviderJson([string]$Path, [string]$Fake, [bool]$OAuth) {
     $root=if(Test-Path -LiteralPath $Path){Get-Content -Raw -Encoding UTF8 -LiteralPath $Path | ConvertFrom-Json}else{[pscustomobject]@{}}
     if ($root -isnot [pscustomobject] -or ($null -ne $root.version -and $root.version -ne 1)) { throw 'Unsupported Cline providers.json; configuration unchanged' }
     Set-FzProperty $root version 1
@@ -44,9 +44,17 @@ function Get-FzProviderJson([string]$Path, [string]$Fake) {
     if ($null -eq $root.providers.cline) {Set-FzProperty $root.providers cline ([pscustomobject]@{settings=[pscustomobject]@{provider='cline'}})}
     $entry=$root.providers.cline
     if ($entry -isnot [pscustomobject] -or $entry.settings -isnot [pscustomobject]) {throw 'Invalid Cline provider settings'}
-    Set-FzProperty $entry.settings apiKey $Fake
-    $entry.settings.PSObject.Properties.Remove('auth')
-    Set-FzProperty $entry tokenSource 'manual'
+    if($OAuth){
+        $entry.settings.PSObject.Properties.Remove('apiKey')
+        # OAuth-shaped guest facade only. The host broker owns refresh; keeping
+        # expiry far in the future prevents Cline from attempting guest refresh.
+        Set-FzProperty $entry.settings auth ([pscustomobject]@{accessToken='workos:'+$Fake;expiresAt=[Int64]253402300799000})
+        Set-FzProperty $entry tokenSource 'oauth'
+    }else{
+        Set-FzProperty $entry.settings apiKey $Fake
+        $entry.settings.PSObject.Properties.Remove('auth')
+        Set-FzProperty $entry tokenSource 'manual'
+    }
     Set-FzProperty $entry updatedAt ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))
     if ($null -eq $root.lastUsedProvider) {Set-FzProperty $root lastUsedProvider 'cline'}
     ConvertTo-Json -InputObject $root -Depth 100
@@ -99,7 +107,7 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
         $lines += "if (Test-Path -LiteralPath $markerLiteral) { if (`$env:CLINE_PLUGIN_IDLE_TIMEOUT_MS -ceq '90000000') { $restoreIdle }; Remove-Item -Force -LiteralPath $markerLiteral }"
     }
     $provider=Join-Path $HomeDirectory '.cline/data/settings/providers.json'
-    $providerJson=if($Data.fakes.CLINE_API_KEY){Get-FzProviderJson $provider $Data.fakes.CLINE_API_KEY}else{$null}
+    $providerJson=if($Data.fakes.CLINE_API_KEY){Get-FzProviderJson $provider $Data.fakes.CLINE_API_KEY ($Data.cline_oauth -eq $true)}else{$null}
     if (-not $ClineDirectory) {$ClineDirectory=Join-Path $HomeDirectory '.cline'}
     $pluginPath=Join-Path $ClineDirectory 'plugins/friendzone.js'
     $pluginConfig=Join-Path $ClineDirectory 'friendzone.json'

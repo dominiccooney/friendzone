@@ -73,12 +73,16 @@ are never automatically replayed. Rerunning setup removes the
 exact temporary 25-hour override written by Friendzone release `ebfa82b` when
 previous managed metadata proves ownership. User-authored values are preserved.
 
-If Cline credentials are configured on the broker, the script merges the fake
-key into the guest's `.cline/data/settings/providers.json`. **Close guest Cline
-before running the script** because it writes this same file. The merge keeps
-model choice, other providers, and last-used provider; it removes stale Cline
-OAuth fields so they cannot override the fake key. Invalid provider JSON fails
-before environment/profile writes. Existing provider files get a backup.
+If Cline credentials are configured on the broker, the script merges a worthless
+facade into the guest's `.cline/data/settings/providers.json`. **Close guest Cline
+before running the script** because it writes this same file. A static host key
+uses the existing fake `apiKey`; broker-owned Cline OAuth instead writes a fake
+`auth.accessToken` with OAuth store metadata, but no refresh token or account ID.
+The merge keeps model choice, other providers, and last-used provider and removes
+stale fields from the other presentation mode. Invalid provider JSON fails before
+environment/profile writes. Existing provider files get a backup. Restart Cline
+after setup; Cloud Hub access additionally needs proxy-aware WebSocket support in
+the guest Cline build.
 
 The script does not modify firewall rules, global/repository Git configuration,
 or the Windows **LocalMachine** CA store. On Kali/Debian/Ubuntu, Linux setup uses

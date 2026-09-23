@@ -131,7 +131,7 @@ $configDir=Join-Path $TemporaryDirectory "Config space '"
 $provider=Join-Path $homeDir '.cline/data/settings/providers.json'
 [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($provider)) | Out-Null
 [IO.File]::WriteAllText($provider,'{"version":1,"lastUsedProvider":"other","modes":{},"providers":{"cline":{"settings":{"provider":"cline","model":"keep","auth":{"refreshToken":"stale"}}},"other":{"settings":{"key":"preserved"}}}}')
-$data=[pscustomobject]@{broker='http://192.0.2.1:9082';container='guest';proxy_port=9080;ca='';fakes=[pscustomobject]@{CLINE_API_KEY="fake'`$(not-a-command)"}}
+$data=[pscustomobject]@{broker='http://192.0.2.1:9082';container='guest';proxy_port=9080;ca='';cline_oauth=$false;fakes=[pscustomobject]@{CLINE_API_KEY="fake'`$(not-a-command)"}}
 # Extract the exact payload emitted by the Rust bootstrap endpoint. Do not
 # substitute the source file here: that previously missed packaging failures.
 $bootstrapText=[IO.File]::ReadAllText($BootstrapScript)
@@ -140,6 +140,7 @@ if(-not $payloadMatch.Success){throw 'Could not find generated bootstrap payload
 $payload=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payloadMatch.Groups[1].Value)) | ConvertFrom-Json
 $data | Add-Member -NotePropertyName plugin -NotePropertyValue $payload.plugin
 $data.ca=[string]$payload.ca
+$data.cline_oauth=$payload.cline_oauth -eq $true
 $data | Add-Member -NotePropertyName git_credential_config -NotePropertyValue ([string]$payload.git_credential_config)
 $data.fakes | Add-Member -NotePropertyName GITHUB_TOKEN -NotePropertyValue ([string]$payload.fakes.GITHUB_TOKEN)
 # Model ebfa82b's exact managed value/metadata, then verify this upgrade removes
@@ -209,7 +210,16 @@ try {Invoke-FzConfigure $data $homeDir $configDir;throw 'expected unmanaged plug
 if([IO.File]::ReadAllText($EnvironmentFile) -cne $beforeEnv -or (ConvertTo-Json $script:fakeUser -Compress) -cne $beforeRegistry){throw 'unmanaged collision changed environment'}
 Write-FzFile $plugin ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload.plugin)))
 $root=Get-Content -Raw -Encoding UTF8 -LiteralPath $provider | ConvertFrom-Json
-if($root.providers.cline.settings.model -ne 'keep' -or $root.providers.cline.settings.auth -or $root.providers.other.settings.key -ne 'preserved' -or $root.lastUsedProvider -ne 'other'){throw 'Provider merge failed'}
+if($root.providers.cline.settings.model -ne 'keep' -or $root.providers.cline.settings.apiKey -or $root.providers.cline.settings.auth.accessToken -cne "workos:fake'`$(not-a-command)" -or $root.providers.cline.settings.auth.expiresAt -ne 253402300799000 -or $root.providers.cline.settings.auth.refreshToken -or $root.providers.cline.settings.auth.accountId -or $root.providers.cline.tokenSource -cne 'oauth' -or $root.providers.other.settings.key -ne 'preserved' -or $root.lastUsedProvider -ne 'other'){throw 'OAuth provider facade merge failed'}
+# Both presentation transitions remove the other mode's stale credential fields.
+$data.cline_oauth=$false
+$null=Invoke-FzConfigure $data $homeDir $configDir
+$manual=Get-Content -Raw -Encoding UTF8 -LiteralPath $provider | ConvertFrom-Json
+if($manual.providers.cline.settings.apiKey -cne "fake'`$(not-a-command)" -or $manual.providers.cline.settings.auth -or $manual.providers.cline.tokenSource -cne 'manual'){throw 'OAuth-to-manual provider transition failed'}
+$data.cline_oauth=$true
+$null=Invoke-FzConfigure $data $homeDir $configDir
+$root=Get-Content -Raw -Encoding UTF8 -LiteralPath $provider | ConvertFrom-Json
+if($root.providers.cline.settings.apiKey -or $root.providers.cline.settings.auth.accessToken -cne "workos:fake'`$(not-a-command)" -or $root.providers.cline.settings.auth.refreshToken -or $root.providers.cline.tokenSource -cne 'oauth'){throw 'Manual-to-OAuth provider transition failed'}
 $beforeEnv=[IO.File]::ReadAllText($EnvironmentFile)
 [IO.File]::WriteAllText($provider,'{"version":99}')
 try {Invoke-FzConfigure $data $homeDir $configDir;throw 'expected invalid provider failure'} catch {if($_.Exception.Message -eq 'expected invalid provider failure'){throw}}

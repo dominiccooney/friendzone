@@ -114,7 +114,13 @@ impl Settings {
         entries.retain(|entry| entry.name != name);
         write_json(&self.0.data_dir.join("escrow.json"), &*entries)?;
         drop(entries);
-        self.remove_secret(name)
+        let mut secrets = self.0.secrets.write().expect("settings lock");
+        let mut updated = secrets.clone();
+        updated.remove(name);
+        updated.remove(&crate::oauth::ClineSession::secret_name(name));
+        write_json_private(&self.0.data_dir.join("secrets.json"), &updated)?;
+        *secrets = updated;
+        Ok(())
     }
 
     pub fn set_secret(&self, name: &str, value: &str) -> Result<()> {
@@ -211,14 +217,30 @@ fn basic_credentials(value: &str) -> Option<(Vec<u8>, Vec<u8>)> {
 impl Settings {
     /// The single substitution resolver. Looks for each entry's exact
     /// fake in its declared header or the password of HTTP Basic Authorization.
+    /// A broker-owned Cline OAuth session also accepts the guest-only
+    /// `workos:<fake>` facade that makes Cline's account UI take its OAuth path.
     /// Both transports share the host pin and current-secret resolver. Rotation
     /// takes effect on the next substitution; no real credential is cached here.
     pub fn substitute(
         &self,
         host: &str,
+        path: &str,
         get_header: impl Fn(&str) -> Option<String>,
     ) -> Substitution {
         for entry in self.entries() {
+            let cline_oauth = crate::oauth::ClineSession::load(self, &entry.name).is_some();
+            // Guest OAuth state deliberately has no usable refresh token. Never
+            // let a current or future Cline client turn the broker into a token
+            // exchange that returns real rotated credentials to the guest.
+            if cline_oauth
+                && path == "/api/v1/auth/refresh"
+                && entry.hosts.iter().any(|pinned| pinned == host)
+            {
+                return Substitution::Block(
+                    "friendzone: Cline OAuth refresh is host-owned; reconnect it in Friendzone settings"
+                        .into(),
+                );
+            }
             let Some(value) = get_header(&entry.header) else {
                 continue;
             };
@@ -232,6 +254,10 @@ impl Settings {
                     !entry.fake.is_empty() && password == entry.fake.as_bytes()
                 });
             let literal_match = presented == entry.fake;
+            let oauth_facade_match = cline_oauth
+                && presented
+                    .strip_prefix("workos:")
+                    .is_some_and(|token| token == entry.fake);
             // GitHub CLI sends `token <PAT>`, not Bearer. Match only an exact
             // fake in an Authorization entry configured for token escrow; keep
             // the same pin/secret checks and configured upstream prefix.
@@ -243,7 +269,7 @@ impl Settings {
                         && !entry.fake.is_empty()
                         && token == entry.fake
                 });
-            if !literal_match && !github_token && basic.is_none() {
+            if !literal_match && !oauth_facade_match && !github_token && basic.is_none() {
                 continue;
             }
             if !entry.hosts.iter().any(|h| h == host) {
@@ -258,7 +284,7 @@ impl Settings {
                     entry.name
                 ));
             };
-            let replacement = if literal_match || github_token {
+            let replacement = if literal_match || oauth_facade_match || github_token {
                 // Preserve existing raw/prefixed (including whole-header) fakes.
                 format!("{}{real}", entry.prefix)
             } else {
@@ -326,7 +352,9 @@ mod tests {
     }
 
     fn basic_substitution(settings: &Settings, host: &str, value: &str) -> Substitution {
-        settings.substitute(host, |name| (name == "authorization").then(|| value.into()))
+        settings.substitute(host, "/", |name| {
+            (name == "authorization").then(|| value.into())
+        })
     }
 
     #[test]
@@ -464,7 +492,7 @@ mod tests {
     fn basic_nonmatches_and_malformed_values_do_not_inject_credentials() {
         let (settings, dir) = basic_settings();
         assert!(matches!(
-            settings.substitute("github.com", |_| None),
+            settings.substitute("github.com", "/", |_| None),
             Substitution::None
         ));
         let mut values = vec![
@@ -500,7 +528,7 @@ mod tests {
         settings.add_entry(entry).unwrap();
         let auth = format!("Basic {}", STANDARD.encode(b"guest:fake-github-token"));
         assert!(matches!(
-            settings.substitute("github.com", |name| (name == "x-api-key"
+            settings.substitute("github.com", "/", |name| (name == "x-api-key"
                 || name == "proxy-authorization")
                 .then(|| auth.clone())),
             Substitution::None
@@ -542,6 +570,56 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn cline_oauth_facade_substitutes_but_refresh_is_always_host_owned() {
+        let dir = std::env::temp_dir().join(format!("fz-cline-facade-{}", Uuid::new_v4()));
+        let settings = Settings::load(&dir).unwrap();
+        let entry = settings
+            .add_entry(EscrowEntry {
+                name: "cline".into(),
+                hosts: vec!["api.cline.bot".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fz-cline-fake".into(),
+                real_env: None,
+                guest_env: Some("CLINE_API_KEY".into()),
+            })
+            .unwrap();
+        settings.set_secret(&entry.name, "host-access").unwrap();
+
+        // A static Cline API key must not reinterpret an OAuth-shaped value.
+        assert!(matches!(
+            settings.substitute("api.cline.bot", "/api/v1/users/me", |name| {
+                (name == "authorization").then(|| "Bearer workos:fz-cline-fake".into())
+            }),
+            Substitution::None
+        ));
+
+        settings.set_secret(&crate::oauth::ClineSession::secret_name(&entry.name), &serde_json::json!({"refresh_token":"host-refresh", "expires_at":4_000_000_000_i64, "api_base_url":"https://api.cline.bot"}).to_string()).unwrap();
+        for presented in ["Bearer fz-cline-fake", "Bearer workos:fz-cline-fake"] {
+            let Substitution::Replace { header, value } =
+                settings.substitute("api.cline.bot", "/api/v1/users/me", |name| {
+                    (name == "authorization").then(|| presented.into())
+                })
+            else {
+                panic!("Cline facade substitution expected")
+            };
+            assert_eq!(header, "authorization");
+            assert_eq!(value, "Bearer workos:host-access");
+        }
+        assert!(matches!(
+            settings.substitute("evil.example", "/api/v1/users/me", |name| {
+                (name == "authorization").then(|| "Bearer workos:fz-cline-fake".into())
+            }),
+            Substitution::Block(_)
+        ));
+        assert!(matches!(
+            settings.substitute("api.cline.bot", "/api/v1/auth/refresh", |_| None),
+            Substitution::Block(_)
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn temp_settings() -> (Settings, PathBuf) {
         let dir = std::env::temp_dir().join(format!("fz-settings-{}", Uuid::new_v4()));
         let settings = Settings::load(&dir).unwrap();
@@ -563,7 +641,7 @@ mod tests {
     #[test]
     fn exact_fake_substitutes_on_pinned_host() {
         let (settings, dir) = temp_settings();
-        let result = settings.substitute("api.anthropic.com", |h| {
+        let result = settings.substitute("api.anthropic.com", "/", |h| {
             (h == "x-api-key").then(|| "fz-fake-anthropic".to_owned())
         });
         match result {
@@ -580,7 +658,7 @@ mod tests {
     fn non_matching_value_passes_through() {
         // A random string is NOT a fake: no substitution, no block.
         let (settings, dir) = temp_settings();
-        let result = settings.substitute("api.anthropic.com", |h| {
+        let result = settings.substitute("api.anthropic.com", "/", |h| {
             (h == "x-api-key").then(|| "some-other-key".to_owned())
         });
         assert!(matches!(result, Substitution::None));
@@ -590,7 +668,7 @@ mod tests {
     #[test]
     fn fake_toward_wrong_host_blocks() {
         let (settings, dir) = temp_settings();
-        let result = settings.substitute("evil.example.com", |h| {
+        let result = settings.substitute("evil.example.com", "/", |h| {
             (h == "x-api-key").then(|| "fz-fake-anthropic".to_owned())
         });
         assert!(matches!(result, Substitution::Block(_)));
@@ -635,16 +713,25 @@ mod tests {
     fn remove_entry_takes_its_secret_with_it() {
         let (settings, dir) = temp_settings();
         assert!(settings.secret("anthropic").is_some());
+        let session_name = crate::oauth::ClineSession::secret_name("anthropic");
+        settings
+            .set_secret(&session_name, "host-refresh-session")
+            .unwrap();
         settings.remove_entry("anthropic").unwrap();
         assert!(settings.entries().is_empty());
         assert!(
             settings.secret("anthropic").is_none(),
             "secret must not orphan"
         );
+        assert!(
+            settings.secret(&session_name).is_none(),
+            "OAuth session must not orphan"
+        );
         // Removal persists across reload.
         let reloaded = Settings::load(&dir).unwrap();
         assert!(reloaded.entries().is_empty());
         assert!(reloaded.secret("anthropic").is_none());
+        assert!(reloaded.secret(&session_name).is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 
