@@ -61,8 +61,9 @@ property depends on it.
   broker reconstructs the real request outside.
 - **MCP forwarding terminates, never tunnels.** The broker is an MCP
   server toward containers and an MCP client toward upstream (Linear
-  first). OAuth runs on the host — broker-owned client registration,
-  login in the host browser — and the token becomes an escrow entry; no
+  first). OAuth runs on the host — broker-owned client registration and
+  login opened by the admin UI's browser — and the token becomes an escrow
+  entry; no
   token-bearing byte enters the container, and upstream MCP hosts stay
   unroutable from it. One resolver computes both the filtered
   `tools/list` and each `tools/call` verdict, so the advertised and

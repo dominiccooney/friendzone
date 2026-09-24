@@ -168,7 +168,9 @@ function notifyPendingRequests(pending) {
 function renderPendingRequests() {
   renderCommentPermissions();
   const pending = snapshot.pending_requests || [];
-  $("#inbox-count").textContent = pending.length + guestJoinRequests().length;
+  const attentionCount = pending.length + guestJoinRequests().length;
+  $("#inbox-count").textContent = attentionCount;
+  document.title = attentionCount ? `(${attentionCount}) Friendzone` : "Friendzone";
   const recent = snapshot.recent_reviews || [];
   $("#pending-count").textContent = pending.length;
   $("#pending-section").hidden = pending.length === 0;
@@ -568,10 +570,9 @@ function closeRequestReviewDisplay() {
   renderCommentPermissionPanel(null); renderGraphqlResponseDiagnostics(null); $("#request-review").hidden = true;
 }
 $("#request-close").onclick = () => {
-  const currentId=activeReview?.id;
   closeRequestReviewDisplay();
-  if(currentId&&window.history?.state?.reviewId===currentId&&typeof window.history.back==="function")window.history.back();
-  else writeNavigationState("replace",currentView(),null);
+  selectView("inbox",{historyMode:"replace"});
+  $("#pending-requests").scrollIntoView({behavior:"smooth",block:"start"});
 };
 updateNotificationStatus();
 
@@ -708,10 +709,19 @@ async function renderSettings() {
   });
   document.querySelectorAll("[data-cline-oauth]").forEach(b=>b.onclick=async()=>{
     const entry = b.dataset.clineOauth;
-    const r = await fetch(`/api/escrow/${encodeURIComponent(entry)}/cline-oauth/start`,{method:"POST"});
-    if (!r.ok) { alert(`Cline sign-in failed to start: ${await r.text()}`); return; }
-    const login = await r.json();
-    $("#e-hint").innerHTML = `Cline sign-in: confirm code <strong style="font-size:1.4em">${esc(login.user_code)}</strong> in the browser tab that opened (or visit ${esc(login.verification_uri)}). Waiting…`;
+    const browser = prepareOAuthBrowser();
+    let login;
+    try {
+      const r = await fetch(`/api/escrow/${encodeURIComponent(entry)}/cline-oauth/start`,{method:"POST"});
+      if (!r.ok) throw new Error(await r.text());
+      login = await r.json();
+    } catch (error) {
+      closeOAuthBrowser(browser);
+      alert(`Cline sign-in failed to start: ${error}`);
+      return;
+    }
+    const browserOpened = navigateOAuthBrowser(browser, login.verification_uri);
+    $("#e-hint").innerHTML = `Cline sign-in: confirm code <strong style="font-size:1.4em">${esc(login.user_code)}</strong>. ${browserOpened?"Use the browser tab that opened.":`The browser blocked the sign-in tab; <a href="${esc(login.verification_uri)}" target="_blank" rel="noopener noreferrer">open the sign-in page</a>.`} Waiting…`;
     const poll = setInterval(async () => {
       const s = await fetch(`/api/escrow/${encodeURIComponent(entry)}/cline-oauth/status`);
       if (!s.ok) return;
@@ -763,7 +773,7 @@ async function renderSettings() {
 
 function cancelMcpOAuth(name) {
   const poll = mcpOAuthPolls.get(name);
-  if (poll) clearTimeout(poll.timer);
+  if (poll) { clearTimeout(poll.timer); closeOAuthBrowser(poll.browser); }
   mcpOAuthPolls.delete(name);
 }
 
@@ -780,11 +790,31 @@ function mcpOAuthStatus(message) {
   $("#mcp-form-status").textContent = message;
 }
 
-async function startMcpOAuth(name, scope) {
+function prepareOAuthBrowser() {
+  try {
+    const browser = window.open("about:blank", "_blank");
+    if (browser) browser.opener = null;
+    return browser;
+  } catch { return null; }
+}
+function oauthBrowserUrl(raw) {
+  const url = new URL(raw);
+  if (!['http:','https:'].includes(url.protocol) || !url.hostname) throw new Error("Sign-in URL must be HTTP(S).");
+  return url.toString();
+}
+function navigateOAuthBrowser(browser, url) {
+  if (!browser || browser.closed) return false;
+  try { browser.location.replace(oauthBrowserUrl(url)); return true; } catch { closeOAuthBrowser(browser); return false; }
+}
+function closeOAuthBrowser(browser) {
+  try { if (browser && !browser.closed) browser.close(); } catch { /* best effort */ }
+}
+
+async function startMcpOAuth(name, scope, browser = prepareOAuthBrowser()) {
   if (activeMcpOAuth && activeMcpOAuth !== name) cancelMcpOAuth(activeMcpOAuth);
   activeMcpOAuth = name;
   cancelMcpOAuth(name);
-  const attempt = {timer:null}; mcpOAuthPolls.set(name, attempt);
+  const attempt = {timer:null,browser}; mcpOAuthPolls.set(name, attempt);
   const current = () => mcpOAuthPolls.get(name) === attempt;
   $("#mcp-oauth-panel").hidden = false;
   $("#mcp-oauth-panel").scrollIntoView({behavior:"smooth",block:"center"});
@@ -795,13 +825,14 @@ async function startMcpOAuth(name, scope) {
   try {
     const response = await fetch(`/api/mcp/${encodeURIComponent(name)}/oauth/start`, {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({scope})});
     if (!response.ok) throw new Error(await response.text());
-    const {authorize_url, browser_opened} = await response.json();
-    if (!current()) return;
+    const result = await response.json(), authorize_url = oauthBrowserUrl(result.authorize_url);
+    if (!current()) { closeOAuthBrowser(browser); return; }
     const link = $("#mcp-oauth-link"); link.href = authorize_url; link.hidden = false;
     $("#mcp-oauth-url").value = authorize_url;
     $("#mcp-oauth-redirect").value = new URL(authorize_url).searchParams.get("redirect_uri") || "";
     $("#mcp-copy-oauth").disabled = false;
-    mcpOAuthStatus(browser_opened === false ? "The browser could not be opened. Use Open sign-in page or Copy sign-in URL below." : "Complete sign-in in the host browser. If it opened a broken page, open or copy the FULL sign-in URL below.");
+    const browserOpened = navigateOAuthBrowser(browser, authorize_url);
+    mcpOAuthStatus(browserOpened ? "Complete sign-in in the browser tab that opened. If it opened a broken page, use Open sign-in page or copy the FULL URL below." : "The browser blocked the sign-in tab. Use Open sign-in page or Copy sign-in URL below.");
     const poll = async () => {
       try {
         const response = await fetch(`/api/mcp/${encodeURIComponent(name)}/oauth/status`);
@@ -827,12 +858,12 @@ async function startMcpOAuth(name, scope) {
     };
     attempt.timer = setTimeout(poll, 1500);
     await renderSettings();
-  } catch (error) { if (current()) { cancelMcpOAuth(name); mcpOAuthStatus(`Sign-in could not start: ${error}. The server is saved; retry Authorize in Friendzone on its card.`); } }
+  } catch (error) { closeOAuthBrowser(browser); if (current()) { cancelMcpOAuth(name); mcpOAuthStatus(`Sign-in could not start: ${error}. The server is saved; retry Authorize in Friendzone on its card.`); } }
 }
 
 $("#mcp-copy-oauth").onclick = () => {
   const input = $("#mcp-oauth-url"), value = input.value;
-  return copyMcpText(input, $("#mcp-oauth-status"), "Full sign-in URL copied. Paste it into the host browser address bar, not a terminal.", () => input.value === value);
+  return copyMcpText(input, $("#mcp-oauth-status"), "Full sign-in URL copied. Paste it into the browser displaying Friendzone, not a terminal.", () => input.value === value);
 };
 
 async function reviewMcpAccess(name) {
@@ -1074,6 +1105,7 @@ $("#mcp-validate").onclick = async () => {
 };
 $("#mcp-save-oauth").onclick = async () => {
   const button = $("#mcp-save-oauth"); button.disabled = true;
+  const browser = prepareOAuthBrowser();
   try {
     const draft = mcpDraft(); draft.oauth = true; draft.bearer_env = "";
     if (!draft.name || !draft.url) throw new Error("Select an imported server or enter a server name and upstream URL first.");
@@ -1084,8 +1116,8 @@ $("#mcp-save-oauth").onclick = async () => {
     await saveMcp([...configs, draft]);
     $("#mcp-owned-oauth").checked = true;
     reviewingMcp = draft;
-    await startMcpOAuth(draft.name, scope);
-  } catch (error) { $("#mcp-form-status").textContent = String(error); }
+    await startMcpOAuth(draft.name, scope, browser);
+  } catch (error) { closeOAuthBrowser(browser); $("#mcp-form-status").textContent = String(error); }
   finally { button.disabled = false; }
 };
 $("#mcp-add").onclick = async () => {

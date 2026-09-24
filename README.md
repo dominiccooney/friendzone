@@ -434,10 +434,13 @@ reconfiguration and superseded callbacks cannot resurrect them. Permissions
 are not expanded by login. This OAuth implementation requires dynamic
 public-client registration and a loopback host UI callback; confidential or
 pre-registered clients and stdio/SSE imports are not supported yet.
+For a remote broker, forward the loopback UI port to the machine displaying
+Friendzone so that browser can return the MCP callback to the broker.
 
-The Windows browser launcher passes URLs as data so OAuth query parameters
-are not split at `&`. The sign-in panel retains the complete URL with Open
-and Copy actions, plus the registered callback for troubleshooting.
+OAuth start endpoints return validated URLs to the admin UI, which opens them
+in the browser displaying Friendzone. This works with a remote or headless broker.
+The sign-in panel retains the complete URL with Open and Copy actions, plus the
+registered callback for troubleshooting.
 
 Guests are identified by their unique source-IP pin, not upstream OAuth. New
 generated MCP transports have no guest `Authorization` header. An old guest
@@ -461,10 +464,10 @@ key rotates it) and deleted (the stored real key goes with the entry).
 
 For Cline, no key is needed: add the entry with the key field empty,
 then click "Sign in with Cline…". The broker uses the device-code flow:
-it shows a short code, opens the verification page in the host browser,
-and polls in the background until you confirm the code — no callback,
-no editor redirect. Tokens are registered with Cline's backend and
-auto-refresh from then on.
+it shows a short code, the admin UI opens the verification page in the browser
+you are using, and the broker polls until you confirm it — no broker-local
+browser, display server, callback, or editor redirect. Tokens are registered
+with Cline's backend and auto-refresh from then on.
 
 The guest setup script saves the fakes as `friendzone-env.sh` (or `.ps1` on Windows);
 source it in the agent's shell. When the fakes include `CLINE_API_KEY`,

@@ -1,5 +1,4 @@
 mod bootstrap;
-mod browser;
 mod ca;
 mod diagnostics;
 mod doctor;

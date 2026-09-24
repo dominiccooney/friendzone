@@ -632,9 +632,9 @@ async fn oauth_disconnect(
     }
 }
 
-/// Kicks off host-side OAuth: builds the authorization URL and opens
-/// the host browser. Returns the URL too, in case the browser did not
-/// open.
+/// Kicks off host-side OAuth and returns its authorization URL. The admin UI
+/// opens this URL in the browser where the human is present; the broker may be
+/// running remotely without a desktop session or browser launcher.
 #[derive(Default, Deserialize)]
 struct OAuthStartRequest {
     scope: Option<String>,
@@ -675,11 +675,10 @@ async fn oauth_start(
         .start(forward.oauth_session.clone(), &redirect_uri, scope)
         .await
     {
-        Ok(url) => {
-            let browser_opened = open_host_browser(&url).await;
-            Json(serde_json::json!({ "authorize_url": url, "browser_opened": browser_opened }))
-                .into_response()
-        }
+        Ok(url) => match browser_authorization_url(&url) {
+            Ok(url) => Json(serde_json::json!({ "authorize_url": url })).into_response(),
+            Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+        },
         Err(error) => (StatusCode::BAD_GATEWAY, format!("{error:#}")).into_response(),
     }
 }
@@ -715,9 +714,9 @@ async fn oauth_callback(
     }
 }
 
-/// Starts the Cline device-code sign-in: returns the user code to show,
-/// opens the verification page in the host browser, and polls WorkOS in
-/// the background — no callback into this process, no editor redirect.
+/// Starts the Cline device-code sign-in: returns the user code and verification
+/// URL for the admin UI to open in its browser, then polls WorkOS in the
+/// background — no callback into this process, no editor redirect.
 async fn cline_oauth_start(
     State(state): State<UiState>,
     Path(name): Path<String>,
@@ -727,8 +726,9 @@ async fn cline_oauth_start(
             if let crate::oauth::ClineLoginState::WaitingForUser {
                 verification_uri, ..
             } = &login
+                && let Err(error) = browser_authorization_url(verification_uri)
             {
-                open_host_browser(verification_uri).await;
+                return (StatusCode::BAD_GATEWAY, error.to_string()).into_response();
             }
             Json(serde_json::json!(login)).into_response()
         }
@@ -747,14 +747,12 @@ async fn cline_oauth_status(
     }
 }
 
-async fn open_host_browser(url: &str) -> bool {
-    match crate::browser::open(url).await {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(%error, "could not open host browser");
-            false
-        }
+fn browser_authorization_url(url: &str) -> anyhow::Result<&str> {
+    let parsed = reqwest::Url::parse(url).context("invalid browser authorization URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        anyhow::bail!("browser authorization URL must be HTTP(S)");
     }
+    Ok(url)
 }
 
 fn bootstrap_router(state: BootstrapState) -> Router {
@@ -3156,22 +3154,6 @@ mod tests {
         app.set_pinned_ip("scratch-kali", Some("127.0.0.1".parse().unwrap()))
             .unwrap();
         let oauth = crate::mcp_oauth::OauthFlows::default();
-        let forward = registry.get("Linear").unwrap();
-        let url = oauth
-            .start(
-                forward.oauth_session.clone(),
-                "http://127.0.0.1:8081/oauth/callback",
-                Some("read".into()),
-            )
-            .await
-            .unwrap();
-        let authorize = reqwest::Url::parse(&url).unwrap();
-        let state_id = authorize
-            .query_pairs()
-            .find(|(key, _)| key == "state")
-            .unwrap()
-            .1
-            .into_owned();
         let ui = ui_router(UiState {
             app: app.clone(),
             settings: settings.clone(),
@@ -3181,6 +3163,32 @@ mod tests {
             ui_addr: "127.0.0.1:8081".parse().unwrap(),
             bootstrap_addr: "172.31.208.1:8082".parse().unwrap(),
         });
+        let started = ui
+            .clone()
+            .oneshot(
+                Request::post("/api/mcp/Linear/oauth/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"scope":"read"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::OK);
+        let started: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(started.into_body(), 16 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(started.get("browser_opened").is_none());
+        let url = started["authorize_url"].as_str().unwrap();
+        let authorize = reqwest::Url::parse(url).unwrap();
+        let state_id = authorize
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
         let request = |uri: String| Request::get(uri).body(Body::empty()).unwrap();
         let callback = ui
             .clone()
@@ -3681,6 +3689,21 @@ mod tests {
     fn test_settings() -> crate::settings::Settings {
         let dir = std::env::temp_dir().join(format!("fz-web-{}", uuid::Uuid::new_v4()));
         crate::settings::Settings::load(&dir).unwrap()
+    }
+
+    #[test]
+    fn browser_authorization_urls_are_http_only() {
+        assert_eq!(
+            browser_authorization_url("https://auth.example/device?code=ABCD").unwrap(),
+            "https://auth.example/device?code=ABCD"
+        );
+        assert_eq!(
+            browser_authorization_url("http://127.0.0.1:8081/oauth/callback").unwrap(),
+            "http://127.0.0.1:8081/oauth/callback"
+        );
+        for url in ["javascript:alert(1)", "file:///tmp/token", "https://[::1"] {
+            assert!(browser_authorization_url(url).is_err(), "{url}");
+        }
     }
 
     fn bootstrap_app() -> Router {

@@ -63,8 +63,9 @@ Open <http://127.0.0.1:8081>.
   preset; the fake key is broker-generated. The in-UI hint says where to
   get each key (for GitHub: a fine-grained PAT, or just `gh auth
   token`). For Cline, skip the key entirely: add the entry, then click
-  "Sign in with Cline…" — a short code appears, the verification page
-  opens in your browser, you confirm the code, and the broker picks up
+  "Sign in with Cline…" — a short code appears, the admin page opens the
+  verification page in your current browser, you confirm the code, and the
+  broker picks up
   the tokens in the background and auto-refreshes them. Edit fixes a wrong
   header/host without changing the fake; Delete removes the entry and
   its stored key together. Rerun guest setup after sign-in: it then writes a
@@ -135,12 +136,15 @@ Legacy broker OAuth sessions without URL binding require reauthorization.
 
 Older Windows builds opened OAuth URLs with `cmd /C start`, which treated
 `&` query separators as command separators and dropped `redirect_uri` and
-the other required parameters. The fixed launcher passes the whole URL as
-data, not shell text. The sign-in panel also offers **Open sign-in page**,
-**Copy sign-in URL**, and the registered callback URL for diagnosis. Paste
-the full sign-in URL into the host browser address bar, not a terminal.
+the other required parameters. The admin UI now opens the complete URL in
+its browser instead of asking the broker host to launch one. The sign-in panel
+also offers **Open sign-in page**, **Copy sign-in URL**, and the registered
+callback URL for diagnosis. Paste the full sign-in URL into the browser
+displaying Friendzone, not a terminal.
 If the provider still rejects it, compare the callback shown in the panel;
 do not substitute the guest MCP endpoint for an OAuth redirect URI.
+When the broker is remote, forward the loopback UI port (8081 by default) to
+the machine running that browser so the registered MCP callback reaches it.
 
 ### Reviewing a GitHub request
 

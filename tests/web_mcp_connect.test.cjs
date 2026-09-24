@@ -9,7 +9,7 @@ const web = path.join(__dirname, "../src/web");
 const html = fs.readFileSync(path.join(web, "index.html"), "utf8");
 const script = fs.readFileSync(path.join(web, "app.js"), "utf8");
 
-function fixture({storage = new Map(), storageUnavailable = false, notificationPermission = null, secureContext = true} = {}) {
+function fixture({storage = new Map(), storageUnavailable = false, notificationPermission = null, secureContext = true, popupBlocked = false} = {}) {
   // Only model the DOM APIs used by the connection panel. IDs come from
   // the shipped HTML so missing/mismatched element wiring fails the test.
   const elements = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map(([, id]) => ["#" + id, {
@@ -44,6 +44,9 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
   let copyButtons = [];
   let fakeKeyButtons = [];
   let revokeButtons = [];
+  let clineOAuthButtons = [];
+  const openedWindows = [];
+  const intervals = [];
   const windowListeners = {};
   const history = {
     entries:[], index:-1, state:null,
@@ -53,6 +56,7 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
   };
   const sandbox = {
     document: {
+      title: "Friendzone",
       querySelector(selector) {
         assert.ok(elements.has(selector), `HTML is missing ${selector}`);
         return elements.get(selector);
@@ -67,6 +71,10 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
         if (selector === "[data-escrow-copy]") {
           fakeKeyButtons=[...elements.get("#escrow-list").innerHTML.matchAll(/data-escrow-copy="([^"]*)"/g)].map(match=>({dataset:{escrowCopy:match[1]}}));
           return fakeKeyButtons;
+        }
+        if (selector === "[data-cline-oauth]") {
+          clineOAuthButtons=[...elements.get("#escrow-list").innerHTML.matchAll(/data-cline-oauth="([^"]*)"/g)].map(match=>({dataset:{clineOauth:match[1]}}));
+          return clineOAuthButtons;
         }
         if (selector !== "[data-mcp-copy-url]") return [];
         // Model row-level controls from the real rendered markup so tests
@@ -86,10 +94,19 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
       setItem(key,value) { if(storageUnavailable)throw new Error("storage blocked");storage.set(key,value); },
     },
     EventSource: class {},
-    window: {history,addEventListener(type,listener){windowListeners[type]=listener;}, isSecureContext:secureContext, focus(){this.focused=true;}}, navigator: {}, URL, URLSearchParams, console,
+    window: {
+      history,addEventListener(type,listener){windowListeners[type]=listener;}, isSecureContext:secureContext, focus(){this.focused=true;},
+      open(url,target){
+        if(popupBlocked)return null;
+        const opened={initialUrl:url,target,opener:{},closed:false,location:{replace(value){opened.url=value;}},close(){this.closed=true;}};
+        openedWindows.push(opened);return opened;
+      },
+    }, navigator: {}, URL, URLSearchParams, console,
     confirm:()=>true,
     setTimeout(callback) { const timer = {callback, cancelled:false}; timers.push(timer); return timer; },
     clearTimeout(timer) { if (timer) timer.cancelled = true; },
+    setInterval(callback) { const timer={callback,cancelled:false};intervals.push(timer);return timer; },
+    clearInterval(timer) { if(timer)timer.cancelled=true; },
     fetch(url, options) {
       return new Promise(resolve => calls.push({url, options, resolve}));
     },
@@ -117,7 +134,7 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
       }}}},
     }),
   });
-  return {run, element, sandbox, calls, seed, reply, timers, nav, views, storage, notifications, history, get permissionRequests(){return permissionRequests;}, copyButtons:()=>copyButtons, fakeKeyButtons:()=>fakeKeyButtons, revokeButtons:()=>revokeButtons};
+  return {run, element, sandbox, calls, seed, reply, timers, intervals, openedWindows, nav, views, storage, notifications, history, get permissionRequests(){return permissionRequests;}, copyButtons:()=>copyButtons, fakeKeyButtons:()=>fakeKeyButtons, clineOAuthButtons:()=>clineOAuthButtons, revokeButtons:()=>revokeButtons};
 }
 
 const pendingRequest = {id:"request-id",container:"guest<script>",method:"POST",url:"https://api.github.com/graphql?x=<script>",body_bytes:42,expires_at:"2099-01-01T00:00:00Z",fingerprint:"exact-hash",reason:"Review complete GraphQL payload",headers:[["authorization","[redacted]"]],body:'{"query":"<script>alert(1)</script>","variables":{"id":42}}'};
@@ -344,6 +361,7 @@ test("review renders guest payload literally and only submits the loaded fingerp
   const markup=f.sandbox.document.querySelector("#pending-requests").innerHTML;
   assert.ok(markup.includes("guest&lt;script&gt;")); assert.ok(!markup.includes("<script>"));
   assert.equal(f.sandbox.document.querySelector("#inbox-count").textContent,1);
+  assert.equal(f.sandbox.document.title,"(1) Friendzone");
   const opening=f.run('openRequestReview("request-id")');
   f.calls.at(-1).resolve({ok:true,json:async()=>pendingRequest}); await opening;
   assert.equal(f.sandbox.document.querySelector("#request-review-body").textContent,pendingRequest.body);
@@ -567,7 +585,17 @@ test("selected inbox/log/settings tab survives reload and loads its view", () =>
   }
 });
 
-test("browser back closes an opened review and restores the previous tab", async () => {
+test("page title mirrors every request needing attention", () => {
+  const f=fixture();
+  assert.equal(f.sandbox.document.title,"Friendzone");
+  f.run(`snapshot.pending_requests=[${JSON.stringify(pendingRequest)}];snapshot.containers=[{id:"join",approved:false,state:"pending"}];renderPendingRequests()`);
+  assert.equal(f.sandbox.document.querySelector("#inbox-count").textContent,2);
+  assert.equal(f.sandbox.document.title,"(2) Friendzone");
+  f.run("snapshot.pending_requests=[];snapshot.containers=[];renderPendingRequests()");
+  assert.equal(f.sandbox.document.title,"Friendzone");
+});
+
+test("browser back closes a review; Close deterministically replaces it with Inbox", async () => {
   const f=fixture();
   assert.equal(JSON.stringify(f.history.state),JSON.stringify({friendzone:true,view:"inbox",reviewId:null}));
   const opening=f.run('openRequestReview("request-id")');
@@ -583,12 +611,16 @@ test("browser back closes an opened review and restores the previous tab", async
   const reopened=f.run('openRequestReview("request-id")');
   f.calls.at(-1).resolve({ok:true,json:async()=>pendingRequest});await reopened;
   assert.equal(f.history.index,beforeOpen+2);
+  const beforeClose=f.history.index;
   f.sandbox.document.querySelector("#request-close").onclick();
+  assert.equal(f.history.index,beforeClose,"Close must not traverse unrelated browser history");
   assert.equal(f.history.state.view,"inbox");
   assert.equal(f.history.state.reviewId,null);
+  assert.equal(f.run("activeReview"),null);
+  assert.equal(f.sandbox.document.querySelector("#pending-requests").scrolled,true);
   f.history.back();
-  assert.equal(f.history.state.view,"settings");
-  assert.equal(f.views.find(node=>node.classList.contains("active")).id,"settings-view");
+  assert.equal(f.history.state.view,"inbox");
+  assert.equal(f.views.find(node=>node.classList.contains("active")).id,"inbox-view");
 });
 
 test("invalid or unavailable browser storage cannot break navigation", () => {
@@ -703,6 +735,38 @@ test("credential rows copy the selected fake key without exposing the real key",
   assert.equal(f.sandbox.document.querySelector("#escrow-copy-value").selected,true);
 });
 
+test("Cline device sign-in opens in the admin browser and survives popup blocking", async () => {
+  const entry={name:"cline",hosts:["api.cline.bot"],header:"authorization",prefix:"Bearer ",fake:"fz-cline-fake",connected:false};
+  for(const popupBlocked of [false,true]){
+    const f=fixture({popupBlocked});
+    const render=f.run("renderSettings()");await resolveSettings(f,[],[entry]);await render;
+    const [button]=f.clineOAuthButtons();
+    const pending=button.onclick();
+    assert.equal(f.openedWindows.length,popupBlocked?0:1,"popup must be reserved before the request completes");
+    const call=f.calls.at(-1);assert.equal(call.url,"/api/escrow/cline/cline-oauth/start");
+    call.resolve({ok:true,json:async()=>({state:"waiting_for_user",user_code:"ABCD-EFGH",verification_uri:"https://auth.example/device?user_code=ABCD-EFGH"})});
+    await pending;
+    if(popupBlocked){
+      assert.match(f.sandbox.document.querySelector("#e-hint").innerHTML,/browser blocked.*open the sign-in page/i);
+    }else{
+      assert.equal(f.openedWindows[0].initialUrl,"about:blank");
+      assert.equal(f.openedWindows[0].target,"_blank");
+      assert.equal(f.openedWindows[0].opener,null);
+      assert.equal(f.openedWindows[0].url,"https://auth.example/device?user_code=ABCD-EFGH");
+    }
+    assert.equal(f.intervals.length,1,"device flow continues polling in either case");
+  }
+});
+
+test("OAuth browser navigation rejects non-HTTP schemes and closes its placeholder", () => {
+  const f=fixture();
+  const browser=f.run("prepareOAuthBrowser()");
+  f.sandbox.window.openedForTest=browser;
+  assert.equal(f.run('navigateOAuthBrowser(window.openedForTest,"javascript:alert(1)")'),false);
+  assert.equal(browser.closed,true);
+  assert.equal(browser.url,undefined);
+});
+
 test("guest bootstrap commands discard stale responses, use explicit platform choices and copy safely", async () => {
   const f=fixture(); const element=id=>f.sandbox.document.querySelector("#setup-"+id);
   element("host").value="172.31.208.1"; element("container").value="scratch-kali";
@@ -768,13 +832,16 @@ test("broker OAuth posts selected scope and reports completion without guest log
   assert.equal(call.url,"/api/mcp/Linear/oauth/start");
   assert.equal(call.options.method,"POST");
   assert.deepEqual(JSON.parse(call.options.body),{scope:"read"});
+  assert.equal(f.openedWindows.length,1,"popup is reserved synchronously from the user action");
   const authorizeUrl="https://auth.example/authorize?response_type=code&client_id=test&redirect_uri=http%3A%2F%2F127.0.0.1%3A8081%2Foauth%2Fcallback&state=abc&scope=read%20write";
-  call.resolve({ok:true,json:async()=>({authorize_url:authorizeUrl,browser_opened:false})});
+  call.resolve({ok:true,json:async()=>({authorize_url:authorizeUrl})});
   await resolveSettings(f); await start;
   assert.equal(f.element("oauth-link").href,authorizeUrl);
   assert.equal(f.element("oauth-url").value,authorizeUrl);
   assert.equal(f.element("oauth-redirect").value,"http://127.0.0.1:8081/oauth/callback");
-  assert.match(f.element("oauth-status").textContent,/could not be opened/);
+  assert.equal(f.openedWindows[0].opener,null);
+  assert.equal(f.openedWindows[0].url,authorizeUrl);
+  assert.match(f.element("oauth-status").textContent,/browser tab that opened/);
   let copied;
   f.sandbox.navigator.clipboard={async writeText(value){copied=value;}};
   await f.element("copy-oauth").onclick();
@@ -787,11 +854,24 @@ test("broker OAuth posts selected scope and reports completion without guest log
   assert.equal(f.element("oauth-next").hidden,false);
 });
 
+test("popup-blocked MCP OAuth keeps Open and Copy recovery available", async () => {
+  const f=fixture({popupBlocked:true});
+  const start=f.run('startMcpOAuth("Linear", "read")');
+  const authorizeUrl="https://auth.example/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A8081%2Foauth%2Fcallback";
+  f.calls.at(-1).resolve({ok:true,json:async()=>({authorize_url:authorizeUrl})});
+  await resolveSettings(f);await start;
+  assert.equal(f.element("oauth-link").href,authorizeUrl);
+  assert.equal(f.element("oauth-link").hidden,false);
+  assert.equal(f.element("copy-oauth").disabled,false);
+  assert.match(f.element("oauth-status").textContent,/browser blocked/);
+});
+
 test("Add & authorize saves a private server and immediately starts sign-in", async () => {
   const f=fixture();
   f.element("name").value="Linear"; f.element("url").value="https://mcp.linear.app/mcp";
   f.element("scope").value="read";
   const pending=f.element("save-oauth").onclick();
+  assert.equal(f.openedWindows.length,1,"the original click reserves the browser before saving");
   f.calls.at(-1).resolve({json:async()=>[]});
   await new Promise(setImmediate);
   const save=f.calls.at(-1);
@@ -804,11 +884,14 @@ test("Add & authorize saves a private server and immediately starts sign-in", as
   const login=f.calls.at(-1);
   assert.equal(login.url,"/api/mcp/Linear/oauth/start");
   assert.deepEqual(JSON.parse(login.options.body),{scope:"read"});
-  login.resolve({ok:true,json:async()=>({authorize_url:"https://auth.example/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A8081%2Foauth%2Fcallback",browser_opened:true})});
+  const authorizeUrl="https://auth.example/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A8081%2Foauth%2Fcallback";
+  login.resolve({ok:true,json:async()=>({authorize_url:authorizeUrl})});
   await resolveSettings(f,[{...linearForward,auth:"oauth-required",tools:[],guests:[]}]);
   await pending;
   assert.equal(f.element("save-oauth").disabled,false);
   assert.equal(f.element("oauth-panel").hidden,false);
+  assert.equal(f.openedWindows.length,1,"nested OAuth must reuse the reserved browser");
+  assert.equal(f.openedWindows[0].url,authorizeUrl);
   assert.match(html,/Add &amp; authorize/);
   assert.doesNotMatch(html,/Save for OAuth \(no tools\/guests yet\)/);
 });
@@ -821,6 +904,7 @@ test("cancelled OAuth polling cannot restore a waiting or success state", async 
   const poll=f.timers.at(-1).callback();
   const request=f.calls.at(-1);
   f.run('cancelMcpOAuth("Linear")');
+  assert.equal(f.openedWindows[0].closed,true,"cancelling must close the reserved sign-in tab");
   const count=f.timers.length;
   request.resolve({ok:true,json:async()=>({state:"waiting_for_user"})}); await poll;
   assert.equal(f.timers.length,count,"stale poll must not schedule itself again");
