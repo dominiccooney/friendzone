@@ -155,6 +155,64 @@ still matches the installed certificate. A `managed: false` root predated
 Friendzone and must be preserved. CA/provider files are separate; do not
 overwrite unrelated later edits.
 
+## Windows Build Tools and Rust
+
+Friendzone guest setup does not require Rust. If the Windows guest does need a
+Rust toolchain, the preferred sequence is to install the
+[Visual C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+prerequisite and Rust before running Friendzone setup. The Build Tools
+bootstrapper uses a WinINet downloader that does not work through the Friendzone
+proxy.
+
+For a guest that is already configured, use the following only during trusted
+image provisioning, while no autonomous agent or untrusted workload is running.
+Host-enforced egress restrictions may still block the resulting direct
+connection; do not weaken those restrictions or reconnect a guest that has
+processed hostile material. Run both blocks in the same PowerShell session so
+`$previousProxyEnable` remains available.
+
+First save the current setting, disable the current-user WinINet proxy, and
+notify running WinINet clients:
+
+```powershell
+$key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+$previousProxyEnable = (Get-ItemProperty $key).ProxyEnable
+
+Set-ItemProperty $key -Name ProxyEnable -Value 0
+
+if (-not ('QaProxy.WinInet' -as [type])) {
+    Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+namespace QaProxy {
+    public static class WinInet {
+        [DllImport("wininet.dll", SetLastError = true)]
+        public static extern bool InternetSetOption(
+            IntPtr handle, int option, IntPtr buffer, int length);
+    }
+}
+'@
+}
+
+[QaProxy.WinInet]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0)
+[QaProxy.WinInet]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0)
+```
+
+Download and run the Build Tools bootstrapper, wait for installation to finish,
+and then immediately restore the exact value saved above:
+
+```powershell
+Set-ItemProperty $key -Name ProxyEnable -Value $previousProxyEnable
+
+[QaProxy.WinInet]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0)
+[QaProxy.WinInet]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0)
+```
+
+Do not leave `ProxyEnable` set to `0`. Restart any installer or client that does
+not observe either notification. This workaround changes only the current-user
+Windows Internet proxy switch; it does not remove Friendzone's saved proxy
+address, environment variables, CA, or host-enforced network policy.
+
 ## Windows persistence
 
 Files live in `%APPDATA%\friendzone`. The script writes **User**, never

@@ -106,7 +106,12 @@ policies are deliberately incomplete; see the README's scope limitations.
 - Start with a trusted VM and **no autonomous agent/untrusted tasks running**.
 - Install OS updates, Git, Cline, curl and diagnostic tools. Linux setup uses
   Python 3; Windows setup uses PowerShell. Install those before sealing the
-  image. Guest setup does not require an fz binary or Rust toolchain.
+  image. Guest setup does not require an fz binary or Rust toolchain. If the
+  Windows image does need Rust, install Visual C++ Build Tools and Rust before
+  Friendzone setup: the Build Tools bootstrapper's WinINet downloader does not
+  work through the Friendzone proxy. See
+  [Windows Build Tools and Rust](GUEST-BOOTSTRAP.md#windows-build-tools-and-rust)
+  for the temporary proxy-disable procedure when Friendzone is already set up.
 - Keep a known-good guest setup script and CA/env files available offline.
 - Make a clean snapshot/clone. Do not snapshot real provider secrets into it.
 - Open **VMConnect / hypervisor console** and prove login works. SSH over the

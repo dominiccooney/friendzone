@@ -280,7 +280,18 @@ curl --noproxy '*' -fsS 'http://HOST_IP:8082/bootstrap/setup?shell=sh&container=
 sh ./friendzone-setup.sh
 ```
 
-In Windows guest PowerShell:
+If the Windows guest needs a Rust toolchain, install the
+[Visual C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+prerequisite and Rust **before** running Friendzone setup. The Build Tools
+bootstrapper's WinINet downloader does not work through the Friendzone proxy.
+On an already-configured guest, temporarily disable the current-user WinINet
+proxy while installing Build Tools, then restore its exact previous state
+immediately afterward. Use the complete procedure in
+[Windows Build Tools and Rust](GUEST-BOOTSTRAP.md#windows-build-tools-and-rust).
+Do this only during trusted image provisioning, before the guest runs untrusted
+work; do not reopen direct egress for a potentially compromised guest.
+
+Then, in Windows guest PowerShell:
 
 ```powershell
 curl.exe --noproxy "*" -fsS 'http://HOST_IP:8082/bootstrap/setup?shell=powershell&container=reviewer' -o friendzone-setup.ps1
