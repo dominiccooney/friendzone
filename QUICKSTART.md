@@ -287,6 +287,38 @@ curl.exe --noproxy "*" -fsS 'http://HOST_IP:8082/bootstrap/setup?shell=powershel
 & .\friendzone-setup.ps1
 ```
 
+Friendzone dynamically issues HTTPS leaf certificates as a MITM proxy, but those
+certificates have no public CRL/OCSP revocation responder. Windows clients that
+require an online revocation check can therefore reject otherwise valid
+Friendzone certificates. In the Windows guest, run the following from
+PowerShell:
+
+```powershell
+inetcpl.cpl
+```
+
+In **Internet Properties**, open **Advanced → Security**, uncheck **Check for
+server certificate revocation**, select **Apply**, and close the dialog. Restart
+clients that were already running. This changes the Windows Internet setting for
+the guest user and disables revocation checks for affected clients; CA-chain,
+expiry, and hostname verification remain enabled. Use this only in the isolated,
+Friendzone-managed guest—not on the broker host.
+
+Without this setting, WinGet package downloads through Friendzone can fail like
+this:
+
+```text
+PS C:\Users\qauser> winget install --id Git.Git -e --source winget
+Found Git [Git.Git] Version 2.55.0.3
+Downloading https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.3/Git-2.55.0.3-64-bit.exe
+An unexpected error occurred while executing the command:
+InternetOpenUrl() failed.
+0x80072f19 : unknown error
+```
+
+`0x80072f19` is WinINet error `12057`
+(`ERROR_INTERNET_SEC_CERT_REV_FAILED`): certificate revocation checking failed.
+
 The script updates the guest's Cline provider file, so close guest Cline before
 running it. Existing model/other-provider settings are retained. Real keys
 stay on the host. Download scripts only over a trusted host/network; the first

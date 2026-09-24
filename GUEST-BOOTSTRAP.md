@@ -199,14 +199,31 @@ Do this in the **new Windows guest**, not the broker host. Keep the hypervisor
 console and a clean snapshot available. These checks do not replace the
 host-enforced network isolation in [NETWORK-ISOLATION.md](NETWORK-ISOLATION.md).
 
-1. In a non-elevated PowerShell, confirm `curl.exe --version` and
+1. Friendzone dynamically issues HTTPS leaf certificates as a MITM proxy, but
+   those certificates have no public CRL/OCSP revocation responder. In a
+   non-elevated PowerShell in the guest, run:
+
+   ```powershell
+   inetcpl.cpl
+   ```
+
+   In **Internet Properties**, open **Advanced → Security**, uncheck **Check for
+   server certificate revocation**, select **Apply**, and close the dialog.
+   Restart clients that were already running. This disables revocation checks
+   for affected clients in the guest user's Windows Internet settings; CA-chain,
+   expiry, and hostname verification remain enabled. Do not make this change on
+   the broker host. Without it, WinGet downloads through Friendzone can fail
+   with `InternetOpenUrl() failed` and `0x80072f19 : unknown error` while, for
+   example, running `winget install --id Git.Git -e --source winget`. The code is
+   WinINet error `12057` (`ERROR_INTERNET_SEC_CERT_REV_FAILED`).
+2. In a non-elevated PowerShell, confirm `curl.exe --version` and
    `cline --version`. Fetch the setup script using the **current** broker address
    shown in Settings; do not reuse an old downloaded script or assume that a
    Hyper-V Default Switch address survived a reboot.
-2. Close guest Cline before running setup. Use the same guest Windows account
+3. Close guest Cline before running setup. Use the same guest Windows account
    that will run Cline. Execution policy still applies: do not use Bypass or
    change machine-wide policy to force installation.
-3. **Approve + pin IP** for the new guest in Inbox. Check that `$env:FZ_BROKER` and
+4. **Approve + pin IP** for the new guest in Inbox. Check that `$env:FZ_BROKER` and
    `$env:HTTP_PROXY` point at the current host, and `$env:NO_PROXY` includes the
    host and loopback addresses. User environment values affect new launchers;
    old Cline hubs and already-running applications retain their old environment.
@@ -214,16 +231,16 @@ host-enforced network isolation in [NETWORK-ISOLATION.md](NETWORK-ISOLATION.md).
    and confirm the user proxy points to the current Friendzone host/port. Confirm
    `Get-ChildItem Cert:\CurrentUser\Root` contains the Friendzone Local CA shown
    by the setup script's saved `friendzone-ca.pem` thumbprint.
-4. Verify the installed module **without executing it**. Use
+5. Verify the installed module **without executing it**. Use
    `(Get-Content -LiteralPath "$env:USERPROFILE/.cline/plugins/friendzone.js" -Tail 1)`;
    expect `module.exports=plugin;`. Substitute `$env:CLINE_DIR` for the `.cline`
    directory if configured. If Node is installed, dynamic import of that absolute
    path via `pathToFileURL` should yield `default.name === 'friendzone'`.
-5. Restart the guest Cline hub/session after activation. Confirm all six
+6. Restart the guest Cline hub/session after activation. Confirm all six
    `friendzone_*` tools are registered before asking the agent to use them.
    Then run a small inference prompt, followed by a read-only GraphQL query and
    result retrieval. Verify the session receives the completion update.
-6. Only after those pass, try a deliberate low-impact mutation with manual
+7. Only after those pass, try a deliberate low-impact mutation with manual
    approval. Check that the submitted ID, Inbox decision and returned result
    agree. Don't use a real GitHub write as the first connectivity test.
 
