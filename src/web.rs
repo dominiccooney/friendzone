@@ -155,6 +155,10 @@ fn ui_router(state: UiState) -> Router {
         .route("/api/containers/{id}/kill", post(set_killed))
         .route("/api/containers/{id}/approve", post(approve_container))
         .route("/api/containers/{id}/pin", post(set_container_pin))
+        .route(
+            "/api/containers/{id}/cline-access",
+            post(set_container_cline_access),
+        )
         .route("/api/escrow", get(list_escrow).post(add_escrow))
         .route(
             "/api/escrow/{name}",
@@ -258,16 +262,31 @@ async fn add_escrow(
         real_env: None,
         guest_env: request.guest_env,
     };
+    let real = request.real_value.filter(|v| !v.trim().is_empty());
+    if real.is_some() && crate::settings::is_cline_entry(&entry) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, CLINE_STATIC_KEY_REJECTED).into_response();
+    }
     let entry = match state.settings.add_entry(entry) {
         Ok(entry) => entry,
         Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
     };
-    if let Some(real) = request.real_value.filter(|v| !v.trim().is_empty())
+    if let Some(real) = real
         && let Err(error) = state.settings.set_secret(&entry.name, real.trim())
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
     }
     (StatusCode::CREATED, Json(serde_json::json!(entry))).into_response()
+}
+
+/// Static Cline API keys were removed: they are never accepted, so a pasted
+/// key can neither shadow a broker-owned session nor revive the legacy path.
+const CLINE_STATIC_KEY_REJECTED: &str = "Cline credentials are OAuth-only: leave the key empty and use \"Sign in with Cline…\" on the entry's row";
+
+fn is_cline_entry_name(settings: &crate::settings::Settings, name: &str) -> bool {
+    settings
+        .entries()
+        .iter()
+        .any(|entry| entry.name == name && crate::settings::is_cline_entry(entry))
 }
 
 #[derive(Deserialize)]
@@ -290,6 +309,14 @@ async fn update_escrow(
     Path(name): Path<String>,
     Json(request): Json<UpdateEscrowRequest>,
 ) -> impl IntoResponse {
+    let real = request.real_value.filter(|v| !v.trim().is_empty());
+    let becomes_cline = request
+        .hosts
+        .iter()
+        .any(|host| host.eq_ignore_ascii_case(crate::policy::CLINE_API_HOST));
+    if real.is_some() && (becomes_cline || is_cline_entry_name(&state.settings, &name)) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, CLINE_STATIC_KEY_REJECTED).into_response();
+    }
     let updated = match state.settings.update_entry(
         &name,
         request.hosts,
@@ -300,7 +327,7 @@ async fn update_escrow(
         Ok(entry) => entry,
         Err(error) => return (StatusCode::NOT_FOUND, error.to_string()).into_response(),
     };
-    if let Some(real) = request.real_value.filter(|v| !v.trim().is_empty())
+    if let Some(real) = real
         && let Err(error) = state.settings.set_secret(&name, real.trim())
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
@@ -329,6 +356,9 @@ async fn set_escrow_secret(
     Path(name): Path<String>,
     Json(request): Json<SecretRequest>,
 ) -> impl IntoResponse {
+    if is_cline_entry_name(&state.settings, &name) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, CLINE_STATIC_KEY_REJECTED).into_response();
+    }
     match state.settings.set_secret(&name, &request.value) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
@@ -721,6 +751,16 @@ async fn cline_oauth_start(
     State(state): State<UiState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    // The Cline account is only ever attached to an entry pinned to Cline's
+    // API host: the gate follows the credential, but the credential must not
+    // be pointed at an unrelated origin to begin with.
+    if !is_cline_entry_name(&state.settings, &name) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("escrow entry '{name}' is not pinned to {}; Cline sign-in is only available for Cline entries", crate::policy::CLINE_API_HOST),
+        )
+            .into_response();
+    }
     match state.cline.start(&name, &state.settings).await {
         Ok(login) => {
             if let crate::oauth::ClineLoginState::WaitingForUser {
@@ -1719,6 +1759,24 @@ async fn set_killed(
 ) -> impl IntoResponse {
     container_policy_response(
         state.app.set_killed(id, request.killed),
+        StatusCode::NO_CONTENT,
+    )
+}
+
+#[derive(Deserialize)]
+struct ClineAccessRequest {
+    /// `basic` (inference and account basics) or `full` (everything except
+    /// API key management). Unknown values are rejected, never defaulted.
+    access: crate::state::ClineAccess,
+}
+
+async fn set_container_cline_access(
+    State(state): State<UiState>,
+    Path(id): Path<String>,
+    Json(request): Json<ClineAccessRequest>,
+) -> impl IntoResponse {
+    container_policy_response(
+        state.app.set_cline_access(&id, request.access),
         StatusCode::NO_CONTENT,
     )
 }
@@ -3689,6 +3747,132 @@ mod tests {
     fn test_settings() -> crate::settings::Settings {
         let dir = std::env::temp_dir().join(format!("fz-web-{}", uuid::Uuid::new_v4()));
         crate::settings::Settings::load(&dir).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cline_entries_reject_static_keys_and_guests_get_a_durable_cline_access_mode() {
+        let settings = test_settings();
+        let dir = settings.data_dir().to_path_buf();
+        let app = AppState::load(&dir).unwrap();
+        app.add_container("guest").unwrap();
+        let registry = crate::mcp::ForwardRegistry::load(&dir, settings.clone()).unwrap();
+        let ui = ui_router(UiState {
+            app: app.clone(),
+            settings: settings.clone(),
+            registry,
+            oauth: Default::default(),
+            cline: Default::default(),
+            ui_addr: "127.0.0.1:8081".parse().unwrap(),
+            bootstrap_addr: "127.0.0.1:8082".parse().unwrap(),
+        });
+        let json = |method: &str, path: &str, body: serde_json::Value| {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let text = |response: axum::response::Response| async move {
+            String::from_utf8(
+                axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap()
+        };
+
+        // Adding a Cline entry with a pasted key is refused before anything is stored.
+        let cline = serde_json::json!({"name":"cline","hosts":["API.cline.bot"],"header":"authorization","prefix":"Bearer ","guest_env":"CLINE_API_KEY"});
+        let mut with_key = cline.clone();
+        with_key["real_value"] = "sk-static".into();
+        let response = ui.clone().oneshot(json("POST", "/api/escrow", with_key)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(text(response).await.contains("OAuth-only"));
+        assert!(settings.entries().is_empty());
+        // Without a key the entry is created, disconnected until sign-in.
+        let response = ui.clone().oneshot(json("POST", "/api/escrow", cline)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        for (method, path, body) in [
+            ("POST", "/api/escrow/cline/secret", serde_json::json!({"value":"sk-static"})),
+            ("PUT", "/api/escrow/cline", serde_json::json!({"hosts":["api.cline.bot"],"header":"authorization","prefix":"Bearer ","guest_env":"CLINE_API_KEY","real_value":"sk-static"})),
+        ] {
+            let response = ui.clone().oneshot(json(method, path, body)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{method} {path}");
+        }
+        assert!(settings.secret("cline").is_none(), "no static key may be stored");
+        // A non-Cline entry cannot be re-pointed at Cline while pasting a key either.
+        let response = ui
+            .clone()
+            .oneshot(json("POST", "/api/escrow", serde_json::json!({"name":"other","hosts":["api.example.com"],"header":"authorization","real_value":"real"})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let response = ui
+            .clone()
+            .oneshot(json("PUT", "/api/escrow/other", serde_json::json!({"hosts":["api.cline.bot"],"header":"authorization","real_value":"rotated"})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(settings.secret("other").as_deref(), Some("real"));
+        // The UI never sees a Cline entry as connected without a session.
+        let list = ui.clone().oneshot(Request::get("/api/escrow").body(Body::empty()).unwrap()).await.unwrap();
+        let list: serde_json::Value = serde_json::from_str(&text(list).await).unwrap();
+        let entry = list["entries"].as_array().unwrap().iter().find(|e| e["name"] == "cline").unwrap();
+        assert_eq!(entry["connected"], false);
+        // Sign-in attaches the account to an entry, so it is refused for entries
+        // that are not Cline entries: the account cannot be pointed elsewhere.
+        let response = ui
+            .clone()
+            .oneshot(json("POST", "/api/escrow/other/cline-oauth/start", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(text(response).await.contains("not pinned to api.cline.bot"));
+        let response = ui
+            .clone()
+            .oneshot(json("POST", "/api/escrow/missing/cline-oauth/start", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Per-guest Cline access: basic by default, changeable, validated, durable.
+        let state = |ui: Router| async move {
+            let response = ui.oneshot(Request::get("/api/state").body(Body::empty()).unwrap()).await.unwrap();
+            serde_json::from_str::<serde_json::Value>(&text(response).await).unwrap()
+        };
+        assert_eq!(state(ui.clone()).await["containers"][0]["cline_access"], "basic");
+        let response = ui
+            .clone()
+            .oneshot(json("POST", "/api/containers/guest/cline-access", serde_json::json!({"access":"everything"})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(app.cline_access("guest"), crate::state::ClineAccess::Basic);
+        let response = ui
+            .clone()
+            .oneshot(json("POST", "/api/containers/nobody/cline-access", serde_json::json!({"access":"full"})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(text(response).await.contains("unknown container"));
+        let response = ui
+            .clone()
+            .oneshot(json("POST", "/api/containers/guest/cline-access", serde_json::json!({"access":"full"})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(state(ui.clone()).await["containers"][0]["cline_access"], "full");
+        assert_eq!(AppState::load(&dir).unwrap().cline_access("guest"), crate::state::ClineAccess::Full);
+        let response = ui
+            .clone()
+            .oneshot(json("POST", "/api/containers/guest/cline-access", serde_json::json!({"access":"basic"})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(AppState::load(&dir).unwrap().cline_access("guest"), crate::state::ClineAccess::Basic);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

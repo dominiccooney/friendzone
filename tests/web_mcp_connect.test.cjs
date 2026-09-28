@@ -758,6 +758,51 @@ test("Cline device sign-in opens in the admin browser and survives popup blockin
   }
 });
 
+test("Cline credential rows are OAuth-only: no key entry, sign-in is the connector", async () => {
+  const cline={name:"cline",hosts:["api.cline.bot"],header:"authorization",prefix:"Bearer ",fake:"fz-cline-fake",connected:false};
+  const github={name:"github",hosts:["api.github.com"],header:"authorization",prefix:"Bearer ",fake:"ghp_fake",connected:false};
+  const f=fixture();
+  const render=f.run("renderSettings()");await resolveSettings(f,[],[cline,github]);await render;
+  const rows=f.sandbox.document.querySelector("#escrow-list").innerHTML.split('<div class="log-row">').slice(1);
+  assert.equal(rows.length,2);
+  const [clineRow,githubRow]=rows;
+  assert.doesNotMatch(clineRow,/data-secret=/,"a Cline entry never offers Set key…");
+  assert.match(clineRow,/not signed in/);
+  assert.match(clineRow,/data-cline-oauth="cline"/);
+  assert.match(githubRow,/data-secret="github"/);
+  assert.doesNotMatch(githubRow,/data-cline-oauth/);
+  // A connected Cline row still offers re-sign-in and never a key.
+  const connected=f.run("renderSettings()");await resolveSettings(f,[],[{...cline,connected:true}]);await connected;
+  const html=f.sandbox.document.querySelector("#escrow-list").innerHTML;
+  assert.match(html,/connected/);assert.match(html,/Sign in again/);assert.doesNotMatch(html,/data-secret=/);
+  // Picking the Cline preset disables the real-key field; the form refuses a pasted key for the Cline host.
+  const provider=f.sandbox.document.querySelector("#e-provider"), real=f.sandbox.document.querySelector("#e-real");
+  provider.value="cline";real.value="sk-pasted";provider.onchange();
+  assert.equal(real.disabled,true);assert.equal(real.value,"");
+  assert.match(f.sandbox.document.querySelector("#e-hint").textContent,/Static Cline API keys are not supported/);
+  provider.value="github";provider.onchange();
+  assert.equal(real.disabled,false);
+  f.sandbox.document.querySelector("#e-hosts").value="api.cline.bot";real.value="sk-pasted";
+  let alerted="";f.sandbox.alert=message=>{alerted=message;};
+  const before=f.calls.length;
+  await f.sandbox.document.querySelector("#escrow-form").onsubmit({preventDefault(){},target:{reset(){}}});
+  assert.equal(f.calls.length,before,"no request is sent with a static Cline key");
+  assert.match(alerted,/OAuth-only/);
+});
+
+test("guest Cline access labels default to basic and only known modes render", () => {
+  const f=fixture();
+  assert.equal(f.run('clineAccessLabel({cline_access:"basic"})'),"Cline: inference & account basics");
+  assert.equal(f.run('clineAccessLabel({cline_access:"full"})'),"Cline: full API (no key management)");
+  assert.equal(f.run('clineAccessLabel({})'),"Cline: inference & account basics","missing/unknown mode never reads as full");
+  const control=f.run('clineAccessControl({id:"g",name:"<guest>",cline_access:"full"})');
+  assert.match(control,/class="cline-access-select"/);
+  assert.match(control,/<option value="full" selected>/);
+  assert.doesNotMatch(control,/<option value="basic" selected>/);
+  assert.match(control,/&lt;guest&gt;/);assert.doesNotMatch(control,/<guest>/);
+  assert.match(f.run('clineAccessControl({id:"g",name:"g",cline_access:"weird"})'),/<option value="basic" selected>/);
+});
+
 test("OAuth browser navigation rejects non-HTTP schemes and closes its placeholder", () => {
   const f=fixture();
   const browser=f.run("prepareOAuthBrowser()");

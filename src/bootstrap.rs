@@ -76,6 +76,8 @@ pub fn script(
     validate_container(container)?;
     let mut fakes = std::collections::BTreeMap::new();
     let mut git_github_auth = false;
+    // Cline credentials are OAuth-only. The guest fake is delivered only while
+    // the broker holds a session, so a disconnected entry writes no facade.
     let mut cline_oauth = false;
     for entry in settings.entries() {
         git_github_auth |= entry.guest_env.as_deref() == Some("GITHUB_TOKEN")
@@ -127,8 +129,12 @@ pub fn script(
             {
                 bail!("invalid/conflicting guest environment variable {name}");
             }
-            cline_oauth |= name == "CLINE_API_KEY"
-                && crate::oauth::ClineSession::load(settings, &entry.name).is_some();
+            if name == "CLINE_API_KEY" {
+                if crate::oauth::ClineSession::load(settings, &entry.name).is_none() {
+                    continue;
+                }
+                cline_oauth = true;
+            }
             fakes.insert(name, entry.fake);
         }
     }
@@ -208,6 +214,20 @@ mod tests {
                 guest_env: Some("GITHUB_TOKEN".into()),
             })
             .unwrap();
+        // A Cline entry without a broker-owned session delivers no guest fake
+        // at all: there is no static-key mode for it to fall back to.
+        settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "cline".into(),
+                hosts: vec!["api.cline.bot".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fz-disconnected-cline".into(),
+                real_env: None,
+                guest_env: Some("CLINE_API_KEY".into()),
+            })
+            .unwrap();
+        settings.set_secret("cline", "stale-static-key").unwrap();
         let authority = crate::ca::AuthorityFiles::load_or_create(&dir.join("script-ca")).unwrap();
         for shell in [Shell::Sh, Shell::Powershell] {
             let powershell = matches!(shell, Shell::Powershell);
@@ -248,6 +268,9 @@ mod tests {
             assert_eq!(plugin, include_bytes!("plugin/friendzone.js"));
             assert_eq!(payload["ca"], authority.cert_pem);
             assert_eq!(payload["cline_oauth"], false);
+            assert!(payload["fakes"].get("CLINE_API_KEY").is_none(), "{}", payload["fakes"]);
+            assert!(!text.contains("fz-disconnected-cline"));
+            assert!(!text.contains("stale-static-key"));
             assert_eq!(payload["git_credential_config"], GITHUB_GIT_CONFIG);
             if !powershell {
                 assert!(text.contains("/usr/local/share/ca-certificates/friendzone-local-ca.crt"));

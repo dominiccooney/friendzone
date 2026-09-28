@@ -29,6 +29,17 @@ function containerStatus(container) {
 function containerTraffic(container) {
   return container.last_activity ? `Last guest traffic: ${new Date(container.last_activity).toLocaleString()}` : "No guest traffic observed this broker session";
 }
+const CLINE_ACCESS_LABELS = {
+  basic: "Cline: inference & account basics",
+  full: "Cline: full API (no key management)",
+};
+function clineAccessLabel(container) {
+  return CLINE_ACCESS_LABELS[container.cline_access] || CLINE_ACCESS_LABELS.basic;
+}
+function clineAccessControl(container) {
+  const current = container.cline_access === "full" ? "full" : "basic";
+  return `<label class="cline-access"><span class="sr-only">Cline API access for ${esc(container.name)}</span><select class="cline-access-select" aria-label="Cline API access for ${esc(container.name)}" title="What this guest may do on api.cline.bot. Basic: inference, model catalog, account/organization basics; cloud sessions look empty and cannot be created or driven. Full: everything except API key management, which is never available to guests.">${Object.entries(CLINE_ACCESS_LABELS).map(([value,label])=>`<option value="${value}"${value===current?" selected":""}>${esc(label)}</option>`).join("")}</select></label>`;
+}
 function ordered(containers) { return [...containers].sort((a,b) => { const ai=order.indexOf(a.id),bi=order.indexOf(b.id); if(ai<0&&bi<0)return 0;if(ai<0)return 1;if(bi<0)return-1;return ai-bi; }); }
 
 async function setKilled(id, killed) {
@@ -82,9 +93,15 @@ function renderGuestRegistry() {
     const pin = c.pinned_ip ? (c.pinned_ip.startsWith("~") ? `last seen ${esc(c.pinned_ip.slice(1))}, not pinned` : `pinned to ${esc(c.pinned_ip)}`) : "any address";
     const actions = pending
       ? `<span class="state killed">awaiting approval</span><button class="approve-pin">Approve + pin IP</button><button class="quiet approve">Approve without pin (legacy)</button><button class="quiet remove">Deny</button>`
-      : `<span class="state ${killed?"killed":"approved"}" title="Network authorization, not agent activity">${containerStatus(c)}</span><button class="stop ${killed?"resume":""}">${killed?"Resume":"Kill"}</button><button class="quiet pin-edit">Pin…</button><button class="quiet remove">Remove</button>`;
-    section.innerHTML = `<div class="container-head"><span class="status-dot" style="background:${killed?"var(--red)":"#999"}" title="${esc(containerStatus(c))}; agent activity is not monitored"></span><div><div class="container-name">${esc(c.name)}</div><div class="meta">${c.request_count} retained requests · ${esc(containerTraffic(c))} · ${pin}</div></div><div class="actions">${actions}</div></div>${pending?'<div class="container-body">Join request · Approve + pin IP for credential-free access.</div>':""}`;
+      : `<span class="state ${killed?"killed":"approved"}" title="Network authorization, not agent activity">${containerStatus(c)}</span>${clineAccessControl(c)}<button class="stop ${killed?"resume":""}">${killed?"Resume":"Kill"}</button><button class="quiet pin-edit">Pin…</button><button class="quiet remove">Remove</button>`;
+    section.innerHTML = `<div class="container-head"><span class="status-dot" style="background:${killed?"var(--red)":"#999"}" title="${esc(containerStatus(c))}; agent activity is not monitored"></span><div><div class="container-name">${esc(c.name)}</div><div class="meta">${c.request_count} retained requests · ${esc(containerTraffic(c))} · ${pin} · ${esc(clineAccessLabel(c))}</div></div><div class="actions">${actions}</div></div>${pending?'<div class="container-body">Join request · Approve + pin IP for credential-free access. New guests start with basic Cline access (inference and account basics only).</div>':""}`;
     section.querySelector(".stop")?.addEventListener("click", () => {$("#container-error").textContent="";return setKilled(c.id, !killed).catch(showContainerError);});
+    section.querySelector(".cline-access-select")?.addEventListener("change", async (event) => {
+      const access = event.target.value;
+      if (access === "full" && !confirm(`Give '${c.name}' full Cline API access? It can then create and drive cloud sessions with your Cline account (API key management stays blocked). Use basic access for guests you do not trust.`)) { event.target.value = c.cline_access === "full" ? "full" : "basic"; return; }
+      const applied = await changeContainerPolicy(`/api/containers/${encodeURIComponent(c.id)}/cline-access`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({access})}, errorTarget);
+      if (!applied) event.target.value = c.cline_access === "full" ? "full" : "basic";
+    });
     section.querySelector(".approve")?.addEventListener("click", async () => {
       await changeContainerPolicy(`/api/containers/${encodeURIComponent(c.id)}/approve`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pin_to_last_ip:false})}, errorTarget);
     });
@@ -618,7 +635,7 @@ const PROVIDER_PRESETS = {
   },
   cline: {
     name: "cline", hosts: "api.cline.bot", header: "authorization", prefix: "Bearer ", guest: "CLINE_API_KEY",
-    hint: "Easiest: add the entry (key field empty), then click 'Sign in with Cline…' on its row — tokens are fetched and refreshed automatically. Or paste a static API key from app.cline.bot → Settings → API Keys. Agents read it from CLINE_API_KEY.",
+    hint: "Leave the key field empty and click Add, then click 'Sign in with Cline…' on its row — the broker signs in with your Cline account and refreshes tokens automatically. Static Cline API keys are not supported. Guests receive the fake through CLINE_API_KEY and an OAuth-shaped facade in their Cline settings; each guest's Cline API access (basic or full) is set under Settings → Guests.",
   },
   github: {
     name: "github", hosts: "api.github.com,github.com,codeload.github.com", header: "authorization", prefix: "Bearer ", guest: "GITHUB_TOKEN",
@@ -635,6 +652,10 @@ $("#e-provider").onchange = () => {
   $("#e-guest").value = preset.guest;
   $("#e-hint").textContent = preset.hint;
   $("#e-advanced").open = $("#e-provider").value === "custom";
+  // Cline is OAuth-only: there is no real key to paste.
+  const cline = $("#e-provider").value === "cline";
+  $("#e-real").disabled = cline; if (cline) $("#e-real").value = "";
+  $("#e-real").placeholder = cline ? "no key: use 'Sign in with Cline…' after adding" : "paste the REAL API key here (stays on the host)";
 };
 
 async function renderSettings() {
@@ -659,8 +680,11 @@ async function renderSettings() {
   loadMcpConnection();
   window._escrowEntries = escrow.entries;
   $("#escrow-list").innerHTML = escrow.entries.map(e=>{
-    const clineBtn = e.name === "cline" ? ` <button class="quiet" data-cline-oauth="${esc(e.name)}">Sign in with Cline…</button>` : "";
-    return `<div class="log-row"><span>${esc(e.name)}</span><span>${esc(e.hosts.join(", "))}</span><span class="request">${esc(e.header)}${e.prefix?` · prefix '${esc(e.prefix)}'`:""} · fake <code>${esc(e.fake)}</code> <button type="button" class="quiet copy-fake-key" data-escrow-copy="${esc(e.name)}">Copy fake key</button></span><span>${e.connected?'<span class="verdict allowed">connected</span>':`<button class="quiet" data-secret="${esc(e.name)}">Set key…</button>`}${clineBtn} <button class="quiet" data-escrow-edit="${esc(e.name)}">Edit</button> <button class="quiet" data-escrow-delete="${esc(e.name)}">Delete</button></span></div>`;
+    // Cline entries are OAuth-only: no "Set key…", sign-in is the only connector.
+    const cline = e.hosts.some(h=>h.toLowerCase()==="api.cline.bot");
+    const clineBtn = cline ? ` <button class="quiet" data-cline-oauth="${esc(e.name)}">${e.connected?"Sign in again…":"Sign in with Cline…"}</button>` : "";
+    const status = e.connected ? '<span class="verdict allowed">connected</span>' : cline ? '<span class="verdict failed">not signed in</span>' : `<button class="quiet" data-secret="${esc(e.name)}">Set key…</button>`;
+    return `<div class="log-row"><span>${esc(e.name)}</span><span>${esc(e.hosts.join(", "))}</span><span class="request">${esc(e.header)}${e.prefix?` · prefix '${esc(e.prefix)}'`:""} · fake <code>${esc(e.fake)}</code> <button type="button" class="quiet copy-fake-key" data-escrow-copy="${esc(e.name)}">Copy fake key</button></span><span>${status}${clineBtn} <button class="quiet" data-escrow-edit="${esc(e.name)}">Edit</button> <button class="quiet" data-escrow-delete="${esc(e.name)}">Delete</button></span></div>`;
   }).join("") || '<div class="log-row">No escrow entries yet.</div>';
   // Keep the single connection form alive while rebuilding server rows.
   $("#mcp-connect-parking").append($("#mcp-connect"));
@@ -739,6 +763,7 @@ async function renderSettings() {
   document.querySelectorAll("[data-escrow-edit]").forEach(b=>b.onclick=()=>{
     const entry = window._escrowEntries.find(e=>e.name===b.dataset.escrowEdit);
     if (!entry) return;
+    const cline = entry.hosts.some(h=>h.toLowerCase()==="api.cline.bot");
     $("#e-provider").value = PROVIDER_PRESETS[entry.name] ? entry.name : "custom";
     $("#e-name").value = entry.name; $("#e-hosts").value = entry.hosts.join(",");
     $("#e-header").value = entry.header; $("#e-prefix").value = entry.prefix || "";
@@ -746,8 +771,11 @@ async function renderSettings() {
     $("#e-advanced").open = true;
     editingEntry = entry.name;
     $("#escrow-form button[type=submit]").textContent = "Save changes";
-    $("#e-hint").textContent = `Editing '${entry.name}' — the fake key stays the same, so guests keep working. Leave the key field empty to keep the current real key, or paste a new one to rotate it.`;
-    $("#e-real").focus();
+    $("#e-real").disabled = cline; if (cline) $("#e-real").value = "";
+    $("#e-hint").textContent = cline
+      ? `Editing '${entry.name}' — the fake key stays the same, so guests keep working. Cline credentials come only from 'Sign in with Cline…'; there is no key to paste.`
+      : `Editing '${entry.name}' — the fake key stays the same, so guests keep working. Leave the key field empty to keep the current real key, or paste a new one to rotate it.`;
+    if (!cline) $("#e-real").focus();
   });
   document.querySelectorAll("[data-escrow-delete]").forEach(b=>b.onclick=async()=>{
     if (!confirm(`Delete escrow entry '${b.dataset.escrowDelete}' and its stored real key? Containers holding its fake lose access.`)) return;
@@ -1174,10 +1202,13 @@ $("#escrow-form").onsubmit = async (e) => {
     header: $("#e-header").value.trim().toLowerCase(),
     prefix: $("#e-prefix").value,
     guest_env: $("#e-guest").value.trim() || null,
-    real_value: $("#e-real").value || null,
+    real_value: $("#e-real").disabled ? null : ($("#e-real").value || null),
   };
   if (!body.name || !body.hosts.length || !body.header) {
     alert("Missing name/hosts/header — open Advanced and fill them in."); return;
+  }
+  if (body.hosts.some(h=>h.toLowerCase()==="api.cline.bot") && body.real_value) {
+    alert("Cline credentials are OAuth-only: leave the key empty and use 'Sign in with Cline…' after adding the entry."); return;
   }
   const r = editingEntry
     ? await fetch(`/api/escrow/${encodeURIComponent(editingEntry)}`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify(body)})
@@ -1185,7 +1216,7 @@ $("#escrow-form").onsubmit = async (e) => {
   if (!r.ok) { alert(await r.text()); return; }
   editingEntry = null;
   $("#escrow-form button[type=submit]").textContent = "Add";
-  e.target.reset(); $("#e-hint").textContent = ""; renderSettings();
+  e.target.reset(); $("#e-hint").textContent = ""; $("#e-real").disabled = false; $("#e-real").placeholder = "paste the REAL API key here (stays on the host)"; renderSettings();
 };
 
 function currentView() {

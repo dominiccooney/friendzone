@@ -60,6 +60,31 @@ names remain accepted during migration only when they agree with the source-IP
 owner. Kill/Resume stops traffic reversibly; Remove forgets the container (its
 log rows remain for audit).
 
+Each guest also has a **Cline API access** mode, chosen on its card under
+**Settings → Guests** and saved with its other policy. **Basic** (the default
+for every new or restored guest) allows inference, the model catalog, and
+account basics on `api.cline.bot`: `POST /api/v1/chat/completions`,
+`/api/v1/images`, `/api/v1/search/*`, `GET /api/v1/ai/cline/recommended-models`,
+`GET /api/v1/users/me`, `/users/me/plan`, `/users/{id}/balance|usages|payments`,
+`PUT /api/v1/users/active-account` (organization switching), and
+`GET /api/v1/organizations/{id}`, `/balance`, `/members/{id}/usages`. In basic
+mode `GET /api/v1/session` is answered locally with an empty list, so cloud
+sessions appear to not exist; creating, attaching, driving or deleting them,
+the Hub WebSocket upgrade, integrations, connectors, plans and every other path
+on the host return 403 and are logged as blocked. **Full** forwards everything
+on the host. In both modes `/api/v1/api-keys` and
+`/api/v1/organizations/{id}/api-keys` are denied: a guest can never mint,
+list or delete long-lived Cline API keys. The gate is applied by host to every
+decrypted request whether or not it carries a credential, before escrow
+substitution, so a denied request never leaves with a real token. It governs
+`api.cline.bot` always, plus every other host pinned by a Cline credential
+entry: the gate follows the credential, so if you edit the Cline entry to also
+pin a staging API origin (making the broker substitute your account token
+there), the same allowlist applies there without further configuration. Hosts
+no Cline entry pins receive no account token and are not gated. Cline sign-in
+is only offered for entries pinned to `api.cline.bot`.
+Switching a guest to Full asks for confirmation; use Basic for untrusted guests.
+
 Inbox is for decisions: pending requests, guest joins, then recent outcomes.
 Approved/killed guests and saved comment permissions live under
 **Settings → Guests**, alongside the single expandable **Set up guest** flow.
@@ -70,7 +95,7 @@ or online. Last observed guest traffic is shown separately; administrative
 actions do not count as traffic. The selected Inbox/Log/Settings tab is
 remembered in this browser for the same UI origin.
 
-Approvals, IP pins, and kill state are saved atomically in `containers.json`
+Approvals, IP pins, Cline API access, and kill state are saved atomically in `containers.json`
 in the broker data directory and restored on startup. Removal is persisted
 too. Failed writes return an error and leave the previous policy in effect;
 if Kill cannot be saved, stop the guest externally rather than assuming it
@@ -462,31 +487,39 @@ key is always broker-generated, never typed. Entries can be edited
 (fixing hosts/header keeps the fake, so guests keep working; pasting a
 key rotates it) and deleted (the stored real key goes with the entry).
 
-For Cline, no key is needed: add the entry with the key field empty,
-then click "Sign in with Cline…". The broker uses the device-code flow:
+Cline credentials are **OAuth-only**. Add the entry with the key field empty
+(the UI disables it for the Cline preset, and the broker rejects a pasted key
+for any entry pinned to `api.cline.bot`), then click "Sign in with Cline…".
+The broker uses the device-code flow:
 it shows a short code, the admin UI opens the verification page in the browser
 you are using, and the broker polls until you confirm it — no broker-local
 browser, display server, callback, or editor redirect. Tokens are registered
-with Cline's backend and auto-refresh from then on.
+with Cline's backend and auto-refresh from then on. Static Cline API keys
+(`app.cline.bot → Settings → API Keys`) are not supported: a Cline entry has no
+usable credential until it is signed in, a static key left in an older
+`secrets.json` is ignored, and the guest never receives the entry's fake while
+the entry is disconnected. Per-guest limits on what that account may do live on
+the guest, not the credential (see Containers above).
 
 The guest setup script saves the fakes as `friendzone-env.sh` (or `.ps1` on Windows);
 source it in the agent's shell. When the fakes include `CLINE_API_KEY`,
 setup also writes `~/.cline/data/settings/providers.json` (the settings
-file Cline's CLI, IDE extension, and SDK share). Static broker keys use the
-existing fake `apiKey`/`tokenSource: "manual"` representation. A broker-owned
-Cline OAuth session instead uses an OAuth-shaped facade: `auth.accessToken`
+file Cline's CLI, IDE extension, and SDK share) as an OAuth-shaped facade: `auth.accessToken`
 contains only `workos:<fake>`, its local expiry is far in the future, and
 `tokenSource` is `"oauth"`. No real access token, refresh token or account ID
 enters the guest. This lets account/Cloud UI take Cline's OAuth path while the
 broker substitutes its current host token. Guest refresh is blocked because
 refresh remains host-owned. The write is merge-safe: other providers, model
-choice, and `lastUsedProvider` are preserved, and switching modes removes the
-other mode's stale fields. Run setup while guest Cline is stopped, then restart it.
+choice, and `lastUsedProvider` are preserved; a stale static `apiKey` from an
+older setup is removed so it cannot shadow the facade. Run setup while guest
+Cline is stopped, then restart it.
 
 Cline Cloud's REST calls use the normal proxy. Its Hub connection also requires
 a Cline build whose `NodeHubClient` sends `ws:`/`wss:` through the configured
 `HTTP_PROXY`/`HTTPS_PROXY`; otherwise externally enforced guest isolation will
-correctly block that direct WebSocket connection.
+correctly block that direct WebSocket connection. Both need the guest's Cline
+API access set to Full; in Basic mode the cloud-session list is empty and the
+Hub upgrade is denied.
 
 The environment includes `FZ_HOST`, `FZ_BROKER`, and both `NO_PROXY`/`no_proxy`
 with the broker host plus `localhost`, `127.0.0.1`, `::1`, and `[::1]`.
@@ -521,8 +554,9 @@ Working now: persistent container approval/IP pins/Kill, a searchable
 10,000-event in-memory log, CONNECT interception and credential substitution;
 parsed GitHub GraphQL reads, one-shot write review with desktop notifications,
 reviewed durable Git branch-bundle publication, and narrow per-guest issue/PR
-comment permissions; live MCP configuration,
-tool/guest allowlists and host-side OAuth; Cline sign-in and token refresh;
+comment permissions; per-guest Cline API access (basic/full) with API key
+management always denied; live MCP configuration,
+tool/guest allowlists and host-side OAuth; OAuth-only Cline sign-in and token refresh;
 script-only guest setup with persistent Linux profiles or Windows user
 environment. Settings is organized into Guests, Credentials and MCP servers.
 

@@ -62,7 +62,8 @@ Open <http://127.0.0.1:8081>.
   masked field, click Add. Hosts/header/env-var are prefilled by the
   preset; the fake key is broker-generated. The in-UI hint says where to
   get each key (for GitHub: a fine-grained PAT, or just `gh auth
-  token`). For Cline, skip the key entirely: add the entry, then click
+  token`). Cline is OAuth-only — there is no key to paste (the field is
+  disabled, and the broker rejects one): add the entry, then click
   "Sign in with Cline…" — a short code appears, the admin page opens the
   verification page in your current browser, you confirm the code, and the
   broker picks up
@@ -71,8 +72,12 @@ Open <http://127.0.0.1:8081>.
   its stored key together. Rerun guest setup after sign-in: it then writes a
   worthless OAuth-shaped facade into guest Cline settings, allowing account and
   Cloud UI to recognize sign-in without copying access or refresh credentials.
-  Cloud Hub connections also require a guest Cline build with proxy-aware
-  `ws:`/`wss:` support.
+- **Settings → Guests → Cline API access** — every guest starts as **basic**:
+  inference, model catalog, and account/organization basics work; cloud
+  sessions look empty and cannot be created or driven. Switch a trusted guest
+  to **full** to allow cloud sessions (needs a guest Cline build with
+  proxy-aware `ws:`/`wss:` support). API key creation/listing/deletion on
+  `api.cline.bot` is denied for every guest in both modes.
 - **Settings → MCP servers** — find a server in host Cline or enter its
   name and upstream URL. **Add & authorize** creates it and starts host
   sign-in in one step. Complete login, then **Next: choose tools and guests**

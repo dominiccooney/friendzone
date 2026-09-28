@@ -9,6 +9,8 @@
 
 use hudsucker::{Body, hyper::Request};
 
+use crate::state::ClineAccess;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
     Read,
@@ -61,6 +63,145 @@ pub fn note(decision: Decision) -> Option<&'static str> {
             Some("friendzone: GitHub writes require review; this request format is not reviewable")
         }
         _ => None,
+    }
+}
+
+/// Cline's production API origin. Always governed by the per-container gate,
+/// whatever token a request carries: a guest-supplied token here cannot be
+/// told apart from a leaked one, and this is where the broker's account lives.
+pub const CLINE_API_HOST: &str = "api.cline.bot";
+
+/// Verdict of the per-container Cline API gate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClineVerdict {
+    /// Not the Cline API host, or the request is allowed in this mode.
+    Allow,
+    /// Never forwarded in any mode (API key management).
+    Deny(&'static str),
+    /// Basic mode: answer locally with this JSON body instead of forwarding,
+    /// so cloud-session lists look empty rather than erroring.
+    Synthetic(&'static str),
+}
+
+/// Paths that no guest may reach in any mode. A prompt-injected agent must
+/// not mint or list long-lived credentials: `/api/v1/api-keys` (user) and
+/// `/api/v1/organizations/{id}/api-keys` (organization).
+fn is_api_key_management(path: &str) -> bool {
+    matches!(path, "/api/v1/api-keys" | "/api/v1/api-keys/")
+        || path.starts_with("/api/v1/api-keys/")
+        || (path.starts_with("/api/v1/organizations/") && {
+            let rest = &path["/api/v1/organizations/".len()..];
+            match rest.split_once('/') {
+                Some((_, tail)) => {
+                    tail == "api-keys" || tail.starts_with("api-keys/")
+                }
+                None => false,
+            }
+        })
+}
+
+/// Basic mode allowlist: inference, the model catalog, and account basics
+/// (who am I, which organizations, switch the active one, balance/usage).
+/// Derived from cline/cline's SDK/CLI/desktop clients; everything else on
+/// the host (cloud sessions, connectors, integrations, auth, plans) is denied.
+fn basic_allows(method: &str, path: &str) -> bool {
+    let read = matches!(method, "GET" | "HEAD" | "OPTIONS");
+    match path {
+        // Inference and model-backed tools.
+        "/api/v1/chat/completions" | "/api/v1/images" => method == "POST",
+        "/api/v1/search/websearch" | "/api/v1/search/webfetch" => method == "POST",
+        // Model catalog.
+        "/api/v1/ai/cline/recommended-models" => read,
+        // Account basics.
+        "/api/v1/users/me" | "/api/v1/users/me/plan" => read,
+        "/api/v1/users/active-account" => method == "PUT",
+        _ => {
+            if let Some(rest) = path.strip_prefix("/api/v1/users/") {
+                // /users/{id}/balance|usages|payments — one id segment, then a
+                // known read-only suffix. Reject nested paths and empty ids.
+                return read
+                    && matches!(
+                        rest.split_once('/'),
+                        Some((id, "balance" | "usages" | "payments")) if !id.is_empty() && id != "me"
+                    );
+            }
+            if let Some(rest) = path.strip_prefix("/api/v1/organizations/") {
+                let Some((id, tail)) = rest.split_once('/') else {
+                    // GET /organizations/{id}
+                    return read && !rest.is_empty();
+                };
+                if id.is_empty() {
+                    return false;
+                }
+                if tail == "balance" {
+                    return read;
+                }
+                // /organizations/{id}/members/{memberId}/usages
+                if let Some(member_rest) = tail.strip_prefix("members/") {
+                    return read
+                        && matches!(
+                            member_rest.split_once('/'),
+                            Some((member, "usages")) if !member.is_empty()
+                        );
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Applies the per-container Cline API gate. Runs on every decrypted
+/// request; CONNECT is transport setup and is judged again inside the tunnel.
+///
+/// The gate follows the credential: `is_cline_host` must answer true for every
+/// host the broker would substitute its Cline account token toward (the hosts
+/// pinned by Cline credential entries, which the administrator may edit).
+/// The production host is governed regardless, so a caller cannot un-gate it.
+pub fn cline_verdict(
+    req: &Request<Body>,
+    access: ClineAccess,
+    is_cline_host: impl Fn(&str) -> bool,
+) -> ClineVerdict {
+    if req.method() == hudsucker::hyper::Method::CONNECT {
+        return ClineVerdict::Allow;
+    }
+    let Some(host) = req.uri().host() else {
+        return ClineVerdict::Allow;
+    };
+    if !host.eq_ignore_ascii_case(CLINE_API_HOST) && !is_cline_host(host) {
+        return ClineVerdict::Allow;
+    }
+    let path = req.uri().path();
+    if is_api_key_management(path) {
+        return ClineVerdict::Deny(
+            "friendzone: Cline API key management is never available to guests",
+        );
+    }
+    if access == ClineAccess::Full {
+        return ClineVerdict::Allow;
+    }
+    // WebSocket upgrades (the cloud-session Hub) are never part of the basic
+    // allowlist, whatever path they claim.
+    let upgrade = req
+        .headers()
+        .get(hudsucker::hyper::header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+    if upgrade {
+        return ClineVerdict::Deny(
+            "friendzone: Cline cloud-session connections are not allowed for this guest (basic Cline access)",
+        );
+    }
+    let method = req.method().as_str();
+    if matches!(path, "/api/v1/session" | "/api/v1/session/") && matches!(method, "GET" | "HEAD") {
+        return ClineVerdict::Synthetic(r#"{"success":true,"data":[]}"#);
+    }
+    if basic_allows(method, path) {
+        ClineVerdict::Allow
+    } else {
+        ClineVerdict::Deny(
+            "friendzone: this Cline API operation is not allowed for this guest (basic Cline access: inference and account basics only)",
+        )
     }
 }
 
@@ -132,5 +273,225 @@ mod tests {
             classify(&req("POST", "https://example.com/anything")),
             Decision::Unpoliced
         );
+    }
+
+    fn cline(method: &str, path: &str, access: ClineAccess) -> ClineVerdict {
+        // The production host needs no help from the credential predicate.
+        cline_verdict(&req(method, &format!("https://api.cline.bot{path}")), access, |_| false)
+    }
+
+    #[test]
+    fn api_key_management_is_denied_in_every_mode() {
+        for access in [ClineAccess::Basic, ClineAccess::Full] {
+            for (method, path) in [
+                ("GET", "/api/v1/api-keys"),
+                ("POST", "/api/v1/api-keys"),
+                ("POST", "/api/v1/api-keys/"),
+                ("DELETE", "/api/v1/api-keys/key-123"),
+                ("GET", "/api/v1/organizations/org-1/api-keys"),
+                ("POST", "/api/v1/organizations/org-1/api-keys"),
+                ("DELETE", "/api/v1/organizations/org-1/api-keys/key-9"),
+            ] {
+                assert!(
+                    matches!(cline(method, path, access), ClineVerdict::Deny(reason) if reason.contains("API key")),
+                    "{access:?} {method} {path}"
+                );
+            }
+        }
+        // Host matching is case-insensitive; a query string does not change the path.
+        assert!(matches!(
+            cline_verdict(
+                &req("POST", "https://API.CLINE.BOT/api/v1/api-keys?x=1"),
+                ClineAccess::Full,
+                |_| false
+            ),
+            ClineVerdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn full_access_forwards_everything_else_on_the_cline_host() {
+        for (method, path) in [
+            ("POST", "/api/v1/session"),
+            ("GET", "/api/v1/session"),
+            ("POST", "/api/v1/session/ses-1/history"),
+            ("GET", "/api/v1/integrations/github/repositories"),
+            ("POST", "/api/v1/connectors/tools/GMAIL_SEND_EMAIL/execute"),
+            ("POST", "/api/v1/chat/completions"),
+            ("PUT", "/api/v1/users/active-account"),
+        ] {
+            assert_eq!(cline(method, path, ClineAccess::Full), ClineVerdict::Allow, "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn basic_access_allows_inference_catalog_and_account_basics() {
+        for (method, path) in [
+            ("POST", "/api/v1/chat/completions"),
+            ("POST", "/api/v1/images"),
+            ("POST", "/api/v1/search/websearch"),
+            ("POST", "/api/v1/search/webfetch"),
+            ("GET", "/api/v1/ai/cline/recommended-models"),
+            ("GET", "/api/v1/users/me"),
+            ("GET", "/api/v1/users/me/plan"),
+            ("PUT", "/api/v1/users/active-account"),
+            ("GET", "/api/v1/users/user-1/balance"),
+            ("GET", "/api/v1/users/user-1/usages"),
+            ("GET", "/api/v1/users/user-1/payments"),
+            ("GET", "/api/v1/organizations/org-1"),
+            ("GET", "/api/v1/organizations/org-1/balance"),
+            ("GET", "/api/v1/organizations/org-1/members/member-9/usages"),
+        ] {
+            assert_eq!(cline(method, path, ClineAccess::Basic), ClineVerdict::Allow, "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn basic_access_hides_cloud_sessions_and_denies_everything_else() {
+        // Listing looks empty rather than failing; nothing else about sessions flows.
+        for path in ["/api/v1/session", "/api/v1/session/"] {
+            assert_eq!(
+                cline("GET", path, ClineAccess::Basic),
+                ClineVerdict::Synthetic(r#"{"success":true,"data":[]}"#)
+            );
+        }
+        assert!(matches!(
+            cline_verdict(
+                &req("GET", "https://api.cline.bot/api/v1/session?organizationId=org-1"),
+                ClineAccess::Basic,
+                |_| false
+            ),
+            ClineVerdict::Synthetic(_)
+        ));
+        for (method, path) in [
+            ("POST", "/api/v1/session"),
+            ("GET", "/api/v1/session/ses-1"),
+            ("DELETE", "/api/v1/session/ses-1"),
+            ("GET", "/api/v1/session/ses-1/history"),
+            ("GET", "/api/v1/session/ses-1/status"),
+            ("GET", "/api/v1/integrations"),
+            ("GET", "/api/v1/integrations/github/repositories"),
+            ("GET", "/api/v1/connectors"),
+            ("POST", "/api/v1/connectors/tools/GMAIL_SEND_EMAIL/execute"),
+            ("POST", "/api/v1/auth/refresh"),
+            ("POST", "/api/v1/auth/register"),
+            ("GET", "/api/v1/plans"),
+            ("POST", "/api/v1/users/me/budget/request"),
+            ("GET", "/api/v1/users/me/featurebase-token"),
+            ("GET", "/api/v1/users/me/remote-config"),
+            ("GET", "/api/v1/organizations/org-1/remote-config"),
+            ("GET", "/api/v1/organizations/org-1/integrations/github/repositories"),
+            ("GET", "/api/v1/organizations/org-1/members/member-9"),
+            ("GET", "/api/v1/organizations/"),
+            ("GET", "/api/v1/users//balance"),
+            ("GET", "/api/v1/users/me/balance/extra"),
+            ("DELETE", "/api/v1/users/me"),
+            ("POST", "/api/v1/users/me"),
+            ("GET", "/api/v1/chat/completions"),
+            ("GET", "/"),
+            ("GET", "/v1/mcp/anything"),
+        ] {
+            assert!(
+                matches!(cline(method, path, ClineAccess::Basic), ClineVerdict::Deny(_)),
+                "{method} {path} should be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn basic_access_denies_websocket_upgrades_even_on_allowed_paths() {
+        let request = Request::builder()
+            .method("GET")
+            .uri("https://api.cline.bot/api/v1/users/me")
+            .header("upgrade", "WebSocket")
+            .header("connection", "Upgrade")
+            .body(Body::empty())
+            .unwrap();
+        assert!(matches!(
+            cline_verdict(&request, ClineAccess::Basic, |_| false),
+            ClineVerdict::Deny(reason) if reason.contains("cloud-session")
+        ));
+        let request = Request::builder()
+            .method("GET")
+            .uri("https://api.cline.bot/api/v1/session/ses-1")
+            .header("upgrade", "websocket")
+            .body(Body::empty())
+            .unwrap();
+        assert!(matches!(
+            cline_verdict(&request, ClineAccess::Basic, |_| false),
+            ClineVerdict::Deny(_)
+        ));
+        assert_eq!(
+            cline_verdict(&request, ClineAccess::Full, |_| false),
+            ClineVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn cline_gate_ignores_other_hosts_and_connect() {
+        assert_eq!(
+            cline_verdict(
+                &req("POST", "https://api.github.com/api/v1/api-keys"),
+                ClineAccess::Basic,
+                |_| false
+            ),
+            ClineVerdict::Allow
+        );
+        assert_eq!(
+            cline_verdict(
+                &req("POST", "https://evil.api.cline.bot/api/v1/session"),
+                ClineAccess::Basic,
+                |_| false
+            ),
+            ClineVerdict::Allow,
+            "an unpinned subdomain is another origin: no token is substituted there, so nothing to gate"
+        );
+        assert_eq!(
+            cline_verdict(&req("CONNECT", "api.cline.bot:443"), ClineAccess::Basic, |_| true),
+            ClineVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn cline_gate_follows_the_credential_to_every_pinned_host() {
+        // An administrator pinned the Cline entry to a second origin, so the
+        // broker would substitute the account token there: the same allowlist
+        // must apply there, in every mode.
+        let pinned = |host: &str| host == "core-api.staging.int.cline.bot";
+        let staging = |method: &str, path: &str| {
+            req(method, &format!("https://core-api.staging.int.cline.bot{path}"))
+        };
+        for access in [ClineAccess::Basic, ClineAccess::Full] {
+            assert!(matches!(
+                cline_verdict(&staging("POST", "/api/v1/api-keys"), access, pinned),
+                ClineVerdict::Deny(reason) if reason.contains("API key")
+            ));
+        }
+        assert_eq!(
+            cline_verdict(&staging("GET", "/api/v1/session"), ClineAccess::Basic, pinned),
+            ClineVerdict::Synthetic(r#"{"success":true,"data":[]}"#)
+        );
+        assert!(matches!(
+            cline_verdict(&staging("POST", "/api/v1/session"), ClineAccess::Basic, pinned),
+            ClineVerdict::Deny(_)
+        ));
+        assert_eq!(
+            cline_verdict(&staging("POST", "/api/v1/chat/completions"), ClineAccess::Basic, pinned),
+            ClineVerdict::Allow
+        );
+        assert_eq!(
+            cline_verdict(&staging("POST", "/api/v1/session"), ClineAccess::Full, pinned),
+            ClineVerdict::Allow
+        );
+        // Hosts the predicate does not claim stay ungoverned; production stays
+        // governed even when the predicate claims nothing.
+        assert_eq!(
+            cline_verdict(&req("POST", "https://evil.example/api/v1/session"), ClineAccess::Basic, pinned),
+            ClineVerdict::Allow
+        );
+        assert!(matches!(
+            cline_verdict(&req("POST", "https://api.cline.bot/api/v1/session"), ClineAccess::Basic, |_| false),
+            ClineVerdict::Deny(_)
+        ));
     }
 }

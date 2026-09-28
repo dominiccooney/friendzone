@@ -414,6 +414,10 @@ mod tests {
         app.add_container("guest").unwrap();
         app.set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
             .unwrap();
+        // This test exercises transport routing, not the per-guest Cline API
+        // policy; /post is not on the basic allowlist.
+        app.set_cline_access("guest", crate::state::ClineAccess::Full)
+            .unwrap();
         let settings = crate::settings::Settings::load(&dir).unwrap();
         let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -602,6 +606,8 @@ mod tests {
         app.add_container("guest").unwrap();
         app.set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
             .unwrap();
+        app.set_cline_access("guest", crate::state::ClineAccess::Full)
+            .unwrap();
         let settings = crate::settings::Settings::load(&dir).unwrap();
         let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -709,6 +715,8 @@ mod tests {
         let app = crate::state::AppState::default();
         app.add_container("guest").unwrap();
         app.set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
+            .unwrap();
+        app.set_cline_access("guest", crate::state::ClineAccess::Full)
             .unwrap();
         let settings = crate::settings::Settings::load(&dir).unwrap();
         let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

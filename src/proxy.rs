@@ -769,7 +769,18 @@ impl EventHandler {
         }
         let decision = crate::policy::classify(&req);
         let needs_review = decision == crate::policy::Decision::RequireReview;
-        let blocked = killed;
+        // The per-guest Cline gate is evaluated before anything is forwarded or
+        // substituted; a denied request never carries a real credential anywhere.
+        // It governs every host the broker's Cline account would be substituted
+        // toward, so re-pinning the credential cannot outrun the allowlist.
+        let cline = if killed {
+            crate::policy::ClineVerdict::Allow
+        } else {
+            crate::policy::cline_verdict(&req, self.state.cline_access(&container), |host| {
+                self.settings.is_cline_credential_host(host)
+            })
+        };
+        let blocked = killed || !matches!(cline, crate::policy::ClineVerdict::Allow);
         let host = req.uri().host().unwrap_or_default().to_owned();
         let method = req.method().to_string();
         let path = req.uri().path().to_owned();
@@ -809,6 +820,45 @@ impl EventHandler {
                 .status(StatusCode::FORBIDDEN)
                 .body(Body::from("container is killed"))
                 .expect("static blocked response")
+                .into()
+        } else if let crate::policy::ClineVerdict::Deny(reason) = cline {
+            server_span.record("http.response.status_code", 403_u16);
+            server_span.record("friendzone.outcome", "cline_access_denied");
+            server_span.record("error.type", "cline_access_denied");
+            server_span.record("otel.status_code", "error");
+            server_span.record("otel.status_description", reason);
+            tracing::warn!(
+                request_id = %id,
+                container = %container,
+                method = %req.method(),
+                path = %req.uri().path(),
+                "Cline API request denied by per-guest access policy"
+            );
+            self.state.annotate(id, Some(403), Some(reason.into()));
+            Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::from(reason))
+                .expect("static blocked response")
+                .into()
+        } else if let crate::policy::ClineVerdict::Synthetic(body) = cline {
+            // Answer locally so the guest's cloud-session list is simply empty.
+            // Nothing is forwarded; the log shows the request as blocked.
+            server_span.record("http.response.status_code", 200_u16);
+            server_span.record("friendzone.outcome", "cline_synthetic_empty");
+            self.state.annotate(
+                id,
+                Some(200),
+                Some(
+                    "friendzone: answered locally with an empty cloud-session list (basic Cline access); not forwarded"
+                        .into(),
+                ),
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(hudsucker::hyper::header::CONTENT_TYPE, "application/json")
+                .header(hudsucker::hyper::header::CACHE_CONTROL, "no-store")
+                .body(Body::from(body))
+                .expect("static synthetic response")
                 .into()
         } else {
             if needs_review {
@@ -1466,7 +1516,7 @@ mod tests {
         );
         let mut request = Request::builder()
             .method("POST")
-            .uri("https://api.cline.bot/v1/chat?secret=query")
+            .uri("https://api.cline.bot/api/v1/chat/completions?secret=query")
             .header(
                 "traceparent",
                 "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
@@ -2352,6 +2402,8 @@ mod tests {
         settings.set_secret(&crate::oauth::ClineSession::secret_name(&entry.name), &serde_json::json!({"refresh_token":"host-refresh", "expires_at":4_000_000_000_i64, "api_base_url":"https://api.cline.bot"}).to_string()).unwrap();
         let mut handler = EventHandler::new(state.clone(), settings, 8081, 8082);
         let peer = "127.0.0.1:12345".parse().unwrap();
+        // Account basics are in the basic allowlist, so the default mode forwards them.
+        assert_eq!(state.cline_access("guest"), crate::state::ClineAccess::Basic);
 
         let mut account = request(
             "GET",
@@ -2371,27 +2423,347 @@ mod tests {
             "Bearer workos:host-access"
         );
 
-        let mut refresh = request(
-            "POST",
-            "https://api.cline.bot/api/v1/auth/refresh",
-            Some("guest"),
-        );
-        refresh.headers_mut().insert(
+        // Guest refresh is denied in both modes: by the basic allowlist, and by
+        // the escrow rule (refresh is host-owned) once the guest has full access.
+        use http_body_util::BodyExt;
+        for (access, expected) in [
+            (crate::state::ClineAccess::Basic, "basic Cline access"),
+            (crate::state::ClineAccess::Full, "refresh is host-owned"),
+        ] {
+            state.set_cline_access("guest", access).unwrap();
+            let mut refresh = request(
+                "POST",
+                "https://api.cline.bot/api/v1/auth/refresh",
+                Some("guest"),
+            );
+            refresh.headers_mut().insert(
+                "authorization",
+                "Bearer workos:fz-cline-facade".parse().unwrap(),
+            );
+            let RequestOrResponse::Response(response) =
+                handler.handle_from_peer(peer, refresh).await
+            else {
+                panic!("guest refresh must not be forwarded ({access:?})")
+            };
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let denial = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(
+                String::from_utf8_lossy(&denial).contains(expected),
+                "{access:?}: {}",
+                String::from_utf8_lossy(&denial)
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A guest with a connected broker session; returns the handler, state and
+    /// the entry's fake so tests can present it like guest Cline would.
+    fn cline_guest(
+        name: &str,
+    ) -> (
+        EventHandler,
+        AppState,
+        crate::settings::Settings,
+        std::path::PathBuf,
+    ) {
+        let dir = std::env::temp_dir().join(format!("fz-proxy-cline-{name}-{}", uuid::Uuid::new_v4()));
+        let state = AppState::default();
+        state.add_container("guest").unwrap();
+        state
+            .set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
+            .unwrap();
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        let entry = settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "cline".into(),
+                hosts: vec!["api.cline.bot".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fz-cline-facade".into(),
+                real_env: None,
+                guest_env: Some("CLINE_API_KEY".into()),
+            })
+            .unwrap();
+        settings.set_secret(&entry.name, "host-access").unwrap();
+        settings.set_secret(&crate::oauth::ClineSession::secret_name(&entry.name), &serde_json::json!({"refresh_token":"host-refresh", "expires_at":4_000_000_000_i64, "api_base_url":"https://api.cline.bot"}).to_string()).unwrap();
+        let handler = EventHandler::new(state.clone(), settings.clone(), 8081, 8082);
+        (handler, state, settings, dir)
+    }
+
+    fn cline_request(method: &str, path: &str) -> Request<Body> {
+        let mut req = request(method, &format!("https://api.cline.bot{path}"), Some("guest"));
+        req.headers_mut().insert(
             "authorization",
             "Bearer workos:fz-cline-facade".parse().unwrap(),
         );
-        let RequestOrResponse::Response(response) = handler.handle_from_peer(peer, refresh).await
+        req
+    }
+
+    async fn body_text(response: Response<Body>) -> String {
+        use http_body_util::BodyExt;
+        String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes()).into_owned()
+    }
+
+    #[tokio::test]
+    async fn basic_cline_access_forwards_inference_hides_sessions_and_denies_the_rest() {
+        let (mut handler, state, _settings, dir) = cline_guest("basic");
+        let peer = "127.0.0.1:12345".parse().unwrap();
+
+        // Inference flows and receives the real credential.
+        let RequestOrResponse::Request(forwarded) = handler
+            .handle_from_peer(peer, cline_request("POST", "/api/v1/chat/completions"))
+            .await
         else {
-            panic!("guest refresh must not be forwarded")
+            panic!("inference should be forwarded")
+        };
+        assert_eq!(forwarded.headers()["authorization"], "Bearer workos:host-access");
+        drop(forwarded);
+        handler.pending = None;
+
+        // Organization switching is an account basic.
+        assert!(matches!(
+            handler
+                .handle_from_peer(peer, cline_request("PUT", "/api/v1/users/active-account"))
+                .await,
+            RequestOrResponse::Request(_)
+        ));
+        handler.pending = None;
+
+        // Cloud sessions look empty: answered locally, never forwarded.
+        let RequestOrResponse::Response(response) = handler
+            .handle_from_peer(
+                peer,
+                cline_request("GET", "/api/v1/session?organizationId=org-1"),
+            )
+            .await
+        else {
+            panic!("session list must be answered locally")
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(body, serde_json::json!({"success": true, "data": []}));
+        assert!(handler.pending.is_none(), "synthetic answers are not upstream work");
+        let logged = &state.view().requests[0];
+        assert!(matches!(logged.verdict, Verdict::Blocked));
+        assert_eq!(logged.status, Some(200));
+        assert!(logged.detail.as_deref().unwrap().contains("empty cloud-session list"));
+
+        // Creating and driving sessions, and everything else, is denied with the
+        // fake still in place: no real credential is attached to a denied request.
+        for (method, path) in [
+            ("POST", "/api/v1/session"),
+            ("POST", "/api/v1/session/ses-1/history"),
+            ("GET", "/api/v1/session/ses-1/status"),
+            ("DELETE", "/api/v1/session/ses-1"),
+            ("GET", "/api/v1/integrations/github/repositories"),
+            ("POST", "/api/v1/connectors/tools/GMAIL_SEND_EMAIL/execute"),
+        ] {
+            let RequestOrResponse::Response(response) =
+                handler.handle_from_peer(peer, cline_request(method, path)).await
+            else {
+                panic!("{method} {path} must not be forwarded")
+            };
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+            let text = body_text(response).await;
+            assert!(text.contains("basic Cline access"), "{method} {path}: {text}");
+            assert!(!text.contains("host-access"));
+            let logged = &state.view().requests[0];
+            assert!(matches!(logged.verdict, Verdict::Blocked));
+            assert_eq!(logged.status, Some(403));
+        }
+        // The Hub WebSocket upgrade is denied regardless of path.
+        let mut upgrade = cline_request("GET", "/api/v1/session/ses-1");
+        upgrade.headers_mut().insert("upgrade", "websocket".parse().unwrap());
+        upgrade.headers_mut().insert("connection", "Upgrade".parse().unwrap());
+        assert_eq!(status(handler.handle_from_peer(peer, upgrade).await), StatusCode::FORBIDDEN);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_cline_access_forwards_sessions_but_api_key_management_is_always_denied() {
+        let (mut handler, state, _settings, dir) = cline_guest("full");
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        state
+            .set_cline_access("guest", crate::state::ClineAccess::Full)
+            .unwrap();
+
+        for (method, path) in [
+            ("GET", "/api/v1/session"),
+            ("POST", "/api/v1/session"),
+            ("POST", "/api/v1/session/ses-1/history"),
+            ("GET", "/api/v1/integrations/github/repositories"),
+        ] {
+            let RequestOrResponse::Request(forwarded) =
+                handler.handle_from_peer(peer, cline_request(method, path)).await
+            else {
+                panic!("{method} {path} should be forwarded in full mode")
+            };
+            assert_eq!(forwarded.headers()["authorization"], "Bearer workos:host-access");
+            drop(forwarded);
+            handler.pending = None;
+        }
+        for access in [
+            crate::state::ClineAccess::Full,
+            crate::state::ClineAccess::Basic,
+        ] {
+            state.set_cline_access("guest", access).unwrap();
+            for (method, path) in [
+                ("POST", "/api/v1/api-keys"),
+                ("GET", "/api/v1/api-keys"),
+                ("DELETE", "/api/v1/api-keys/key-1"),
+                ("POST", "/api/v1/organizations/org-1/api-keys"),
+            ] {
+                let RequestOrResponse::Response(response) =
+                    handler.handle_from_peer(peer, cline_request(method, path)).await
+                else {
+                    panic!("{access:?} {method} {path} must never be forwarded")
+                };
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                let text = body_text(response).await;
+                assert!(text.contains("API key management"), "{text}");
+                assert!(!text.contains("host-access"));
+            }
+        }
+        // Guest refresh stays host-owned in full mode too.
+        assert_eq!(
+            status(
+                handler
+                    .handle_from_peer(peer, cline_request("POST", "/api/v1/auth/refresh"))
+                    .await
+            ),
+            StatusCode::FORBIDDEN
+        );
+        // Widening one guest does not widen another: an unknown/other name is basic.
+        assert_eq!(state.cline_access("someone-else"), crate::state::ClineAccess::Basic);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cline_gate_follows_the_credential_when_the_entry_is_pinned_to_another_host() {
+        let (mut handler, state, settings, dir) = cline_guest("staging");
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let staging = "core-api.staging.int.cline.bot";
+        let staging_request = |method: &str, path: &str| {
+            let mut req = request(method, &format!("https://{staging}{path}"), Some("guest"));
+            req.headers_mut().insert(
+                "authorization",
+                "Bearer workos:fz-cline-facade".parse().unwrap(),
+            );
+            req
+        };
+
+        // Before the administrator pins the credential there, the staging host is
+        // just another origin: the gate leaves it alone and escrow blocks the fake.
+        assert!(!settings.is_cline_credential_host(staging));
+        let RequestOrResponse::Response(leak) = handler
+            .handle_from_peer(peer, staging_request("POST", "/api/v1/session"))
+            .await
+        else {
+            panic!("fake toward an unpinned host must be blocked by escrow")
+        };
+        assert_eq!(leak.status(), StatusCode::FORBIDDEN);
+        assert!(body_text(leak).await.contains("non-pinned host"));
+
+        // Pin the Cline entry to the staging host as well. Now the broker would
+        // substitute the account token there, so the gate applies there too.
+        let entry = settings.entries().pop().unwrap();
+        settings
+            .update_entry(
+                &entry.name,
+                vec!["api.cline.bot".into(), staging.into()],
+                entry.header.clone(),
+                entry.prefix.clone(),
+                entry.guest_env.clone(),
+            )
+            .unwrap();
+        assert!(settings.is_cline_credential_host(staging));
+        assert!(!settings.is_cline_credential_host("api.github.com"));
+
+        // Basic: inference flows with the real token; sessions are hidden/denied.
+        let RequestOrResponse::Request(forwarded) = handler
+            .handle_from_peer(peer, staging_request("POST", "/api/v1/chat/completions"))
+            .await
+        else {
+            panic!("staging inference should be forwarded")
+        };
+        assert_eq!(forwarded.headers()["authorization"], "Bearer workos:host-access");
+        drop(forwarded);
+        handler.pending = None;
+        let RequestOrResponse::Response(empty) = handler
+            .handle_from_peer(peer, staging_request("GET", "/api/v1/session"))
+            .await
+        else {
+            panic!("staging session list must be answered locally")
+        };
+        assert_eq!(empty.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body_text(empty).await).unwrap(),
+            serde_json::json!({"success": true, "data": []})
+        );
+        let RequestOrResponse::Response(denied) = handler
+            .handle_from_peer(peer, staging_request("POST", "/api/v1/session"))
+            .await
+        else {
+            panic!("staging session creation must be denied in basic mode")
+        };
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let text = body_text(denied).await;
+        assert!(text.contains("basic Cline access"), "{text}");
+        assert!(!text.contains("host-access"));
+
+        // Full: sessions flow, API key management still never does.
+        state
+            .set_cline_access("guest", crate::state::ClineAccess::Full)
+            .unwrap();
+        assert!(matches!(
+            handler
+                .handle_from_peer(peer, staging_request("POST", "/api/v1/session"))
+                .await,
+            RequestOrResponse::Request(_)
+        ));
+        handler.pending = None;
+        let RequestOrResponse::Response(keys) = handler
+            .handle_from_peer(peer, staging_request("POST", "/api/v1/api-keys"))
+            .await
+        else {
+            panic!("API key management must never be forwarded")
+        };
+        assert_eq!(keys.status(), StatusCode::FORBIDDEN);
+        assert!(body_text(keys).await.contains("API key management"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cline_gate_applies_without_any_credential_and_kill_still_wins() {
+        let (mut handler, state, _settings, dir) = cline_guest("bare");
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        // No Authorization header at all: policy is by host, not by credential.
+        let bare = request("POST", "https://api.cline.bot/api/v1/session", Some("guest"));
+        assert_eq!(status(handler.handle_from_peer(peer, bare).await), StatusCode::FORBIDDEN);
+        let bare_keys = request("POST", "https://api.cline.bot/api/v1/api-keys", Some("guest"));
+        state
+            .set_cline_access("guest", crate::state::ClineAccess::Full)
+            .unwrap();
+        assert_eq!(status(handler.handle_from_peer(peer, bare_keys).await), StatusCode::FORBIDDEN);
+        // Other hosts are untouched by this gate.
+        assert!(matches!(
+            handler
+                .handle_from_peer(peer, request("GET", "https://example.com/api/v1/api-keys", Some("guest")))
+                .await,
+            RequestOrResponse::Request(_)
+        ));
+        handler.pending = None;
+        // A killed guest gets the kill denial, not a synthetic empty list.
+        state.set_killed("guest".into(), true).unwrap();
+        let RequestOrResponse::Response(response) = handler
+            .handle_from_peer(peer, cline_request("GET", "/api/v1/session"))
+            .await
+        else {
+            panic!("killed guest must be denied")
         };
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        use http_body_util::BodyExt;
-        let denial = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(
-            String::from_utf8_lossy(&denial).contains("refresh is host-owned"),
-            "{}",
-            String::from_utf8_lossy(&denial)
-        );
+        assert!(body_text(response).await.contains("killed"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -223,13 +223,21 @@ case "$output" in *fz-test-github-token*|*username=x-access-token*) exit 12;; es
         provider = self.home / ".cline/data/settings/providers.json"
         provider.parent.mkdir(parents=True)
         provider.write_text(json.dumps({"version": 1, "lastUsedProvider": "other", "modes": {}, "providers": {
-            "cline": {"settings": {"provider": "cline", "model": "keep", "auth": {"refreshToken": "stale"}}},
+            "cline": {"settings": {"provider": "cline", "model": "keep", "apiKey": "legacy-static-key",
+                                   "auth": {"refreshToken": "stale"}}},
             "other": {"settings": {"key": "preserve"}}}}))
         self.apply()
         root = json.loads(provider.read_text())
-        self.assertEqual(root["providers"]["cline"]["settings"]["model"], "keep")
-        self.assertEqual(root["providers"]["cline"]["settings"]["apiKey"], "fake'$(bad)")
-        self.assertNotIn("auth", root["providers"]["cline"]["settings"])
+        entry = root["providers"]["cline"]
+        self.assertEqual(entry["settings"]["model"], "keep")
+        # Legacy static keys are gone: the guest only ever holds the OAuth facade.
+        self.assertNotIn("apiKey", entry["settings"])
+        self.assertEqual(entry["settings"]["auth"], {
+            "accessToken": "workos:fake'$(bad)",
+            "expiresAt": 253402300799000,
+        })
+        self.assertEqual(entry["tokenSource"], "oauth")
+        self.assertNotIn("manual", provider.read_text())
         self.assertEqual(root["providers"]["other"]["settings"]["key"], "preserve")
         self.assertEqual(root["lastUsedProvider"], "other")
         provider.write_text('{"version":99}')
@@ -246,7 +254,6 @@ case "$output" in *fz-test-github-token*|*username=x-access-token*) exit 12;; es
             "cline": {"settings": {"provider": "cline", "model": "keep", "apiKey": "stale-key",
                                    "auth": {"refreshToken": "stale-refresh", "accountId": "stale-account"}}},
             "other": {"settings": {"key": "preserve"}}}}))
-        self.data["cline_oauth"] = True
         self.apply()
         root = json.loads(provider.read_text())
         entry = root["providers"]["cline"]

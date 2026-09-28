@@ -45,6 +45,21 @@ pub struct ContainerView {
     pub approved: bool,
     /// None = any address (wildcard).
     pub pinned_ip: Option<String>,
+    pub cline_access: ClineAccess,
+}
+
+/// What a guest may do on Cline's API host. Independent of which credential
+/// (if any) the request carries; enforced on every decrypted request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClineAccess {
+    /// Inference, model catalog, and account basics only. Cloud sessions look
+    /// empty and cannot be created or driven. The default for every guest.
+    #[default]
+    Basic,
+    /// Everything on the host except API key management, which is never
+    /// available to a guest.
+    Full,
 }
 
 /// Verdict of the container gate, checked before any policy.
@@ -93,6 +108,7 @@ struct ContainerRecord {
     instance: Uuid,
     comment_permissions: Vec<crate::github::Grant>,
     comment_revision: Uuid,
+    cline_access: ClineAccess,
 }
 
 impl Default for ContainerRecord {
@@ -107,6 +123,7 @@ impl Default for ContainerRecord {
             instance: Uuid::new_v4(),
             comment_permissions: Vec::new(),
             comment_revision: Uuid::new_v4(),
+            cline_access: ClineAccess::Basic,
         }
     }
 }
@@ -133,6 +150,9 @@ struct SavedContainer {
     /// Legacy policies contain no automatic comment grants.
     #[serde(default)]
     comment_permissions: Vec<crate::github::Grant>,
+    /// Policies saved before this field existed get the restrictive default.
+    #[serde(default)]
+    cline_access: ClineAccess,
 }
 
 fn required_pin<'de, D: serde::Deserializer<'de>>(
@@ -267,6 +287,7 @@ impl AppState {
                     pinned_ip: entry.pinned_ip,
                     managed: true,
                     comment_permissions: entry.comment_permissions,
+                    cline_access: entry.cline_access,
                     ..Default::default()
                 },
             );
@@ -305,6 +326,7 @@ impl AppState {
                     killed: killed.contains(name),
                     pinned_ip: record.pinned_ip,
                     comment_permissions: record.comment_permissions.clone(),
+                    cline_access: record.cline_access,
                 })
                 .collect();
             entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -958,6 +980,30 @@ impl AppState {
             .contains(container)
     }
 
+    /// The guest's Cline API mode. Unknown names get the restrictive default,
+    /// so a lookup race can never widen access.
+    pub fn cline_access(&self, container: &str) -> ClineAccess {
+        self.data
+            .read()
+            .expect("state lock poisoned")
+            .containers
+            .get(container)
+            .map(|record| record.cline_access)
+            .unwrap_or_default()
+    }
+
+    /// Sets a guest's Cline API mode. Durable, like every other policy field.
+    pub fn set_cline_access(&self, name: &str, access: ClineAccess) -> Result<()> {
+        self.update_policy(|containers, _| {
+            let record = containers
+                .get_mut(name)
+                .context("unknown container; no Cline access changed")?;
+            record.cline_access = access;
+            record.managed = true;
+            Ok(())
+        })
+    }
+
     pub fn set_killed(&self, container: String, killed: bool) -> Result<()> {
         self.update_policy(|containers, killed_names| {
             containers.entry(container.clone()).or_default().managed = true;
@@ -996,6 +1042,7 @@ impl AppState {
                     .pinned_ip
                     .map(|ip| ip.to_string())
                     .or_else(|| record.last_ip.map(|ip| format!("~{ip}"))),
+                cline_access: record.cline_access,
             })
             .collect();
         containers.sort_by(|a, b| {
@@ -1250,6 +1297,8 @@ mod tests {
         let changes = state.subscribe();
         assert!(state.set_killed("guest".into(), false).is_err());
         assert!(state.set_pinned_ip("guest", None).is_err());
+        assert!(state.set_cline_access("guest", ClineAccess::Full).is_err());
+        assert_eq!(state.cline_access("guest"), ClineAccess::Basic);
         assert!(state.remove_container("guest").is_err());
         assert!(state.add_container("new").is_err());
         assert!(state.approve_container("pending", false).is_err());
@@ -1269,6 +1318,7 @@ mod tests {
             r#"{"version":1,"containers":[{"name":"guest","approved":true,"killed":false}]}"#,
             r#"{"version":1,"containers":[{"name":"guest","approved":true,"killed":false,"pinned_ip":"not-an-ip"}]}"#,
             r#"{"version":1,"containers":[{"name":"guest","approved":true,"killed":false,"pinned_ip":null},{"name":"guest","approved":false,"killed":false,"pinned_ip":null}]}"#,
+            r#"{"version":1,"containers":[{"name":"guest","approved":true,"killed":false,"pinned_ip":null,"cline_access":"everything"}]}"#,
         ] {
             fs::write(dir.0.join("containers.json"), value).unwrap();
             assert!(
@@ -1276,6 +1326,66 @@ mod tests {
                 "accepted invalid policy {value}"
             );
         }
+    }
+
+    #[test]
+    fn cline_access_defaults_to_basic_persists_and_never_widens_for_unknown_guests() {
+        let dir = TestDir::new();
+        let state = AppState::load(&dir.0).unwrap();
+        assert_eq!(state.cline_access("never-seen"), ClineAccess::Basic);
+        state.add_container("guest").unwrap();
+        state.add_container("wide").unwrap();
+        assert_eq!(state.cline_access("guest"), ClineAccess::Basic);
+        assert_eq!(state.view().containers[0].cline_access, ClineAccess::Basic);
+        assert!(
+            state.set_cline_access("unknown", ClineAccess::Full).is_err(),
+            "widening must not manufacture a guest"
+        );
+        state.set_cline_access("wide", ClineAccess::Full).unwrap();
+
+        // A policy file written before the field existed loads as basic.
+        let path = dir.0.join("containers.json");
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let wide = saved["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "wide")
+            .unwrap();
+        assert_eq!(wide["cline_access"], "full");
+        let mut legacy = saved.clone();
+        for container in legacy["containers"].as_array_mut().unwrap() {
+            container.as_object_mut().unwrap().remove("cline_access");
+        }
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let reloaded = AppState::load(&dir.0).unwrap();
+        assert_eq!(reloaded.cline_access("wide"), ClineAccess::Basic);
+        assert_eq!(reloaded.cline_access("guest"), ClineAccess::Basic);
+
+        // Restored from the current format, the explicit choice survives restart.
+        fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let reloaded = AppState::load(&dir.0).unwrap();
+        assert_eq!(reloaded.cline_access("wide"), ClineAccess::Full);
+        assert_eq!(reloaded.cline_access("guest"), ClineAccess::Basic);
+        let view = reloaded.view();
+        assert_eq!(
+            view.containers.iter().find(|c| c.id == "wide").unwrap().cline_access,
+            ClineAccess::Full
+        );
+        assert_eq!(
+            serde_json::to_value(&view).unwrap()["containers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == "wide")
+                .unwrap()["cline_access"],
+            "full"
+        );
+
+        // Removing and re-adding a name does not inherit its widened access.
+        reloaded.remove_container("wide").unwrap();
+        reloaded.add_container("wide").unwrap();
+        assert_eq!(reloaded.cline_access("wide"), ClineAccess::Basic);
     }
 
     #[test]

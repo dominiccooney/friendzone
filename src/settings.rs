@@ -151,20 +151,26 @@ impl Settings {
     }
 
     /// Real value for an entry: secrets store first, then env fallback.
+    ///
+    /// Cline entries are OAuth-only. Their real value is the access token
+    /// mirrored by the broker-owned session, always carrying Cline's `workos:`
+    /// prefix. Without a session there is no value, so a stale static API key
+    /// left in the secrets store cannot quietly keep the legacy path alive.
     pub fn real_value(&self, entry: &EscrowEntry) -> Option<String> {
+        let cline_session = crate::oauth::ClineSession::load(self, &entry.name).is_some();
+        if is_cline_entry(entry) && !cline_session {
+            return None;
+        }
         let value = self.secret(&entry.name).or_else(|| {
             entry
                 .real_env
                 .as_ref()
                 .and_then(|var| std::env::var(var).ok())
         })?;
-        // Cline's auth adapter prefixes OAuth access tokens with workos:.
-        // Static API keys remain unchanged. Handle existing stored sessions
-        // too, without requiring a new login after upgrading the broker.
+        // Cline's auth adapter prefixes OAuth access tokens with workos:. Handle
+        // sessions stored before the prefix was mirrored, without a new login.
         Some(
-            if crate::oauth::ClineSession::load(self, &entry.name).is_some()
-                && !value.to_ascii_lowercase().starts_with("workos:")
-            {
+            if cline_session && !value.to_ascii_lowercase().starts_with("workos:") {
                 format!("workos:{value}")
             } else {
                 value
@@ -195,6 +201,33 @@ pub enum Substitution {
     /// A fake appeared toward a non-pinned host, or the real value is
     /// missing: block and say why.
     Block(String),
+}
+
+/// An entry that carries the broker's Cline account: pinned to Cline's
+/// production API host, or holding a broker-owned Cline OAuth session. Such
+/// entries are OAuth-only, and every host they pin is governed by the
+/// per-container Cline gate.
+pub fn is_cline_entry(entry: &EscrowEntry) -> bool {
+    entry
+        .hosts
+        .iter()
+        .any(|host| host.eq_ignore_ascii_case(crate::policy::CLINE_API_HOST))
+}
+
+impl Settings {
+    /// Whether the broker would substitute its Cline account token toward
+    /// `host`: the host is pinned by an entry that is Cline by host or holds a
+    /// Cline OAuth session. The per-container Cline gate covers exactly this
+    /// set, so an administrator who pins the account to another origin (for
+    /// example a staging API) extends the allowlist there automatically.
+    /// Uses the same exact host comparison as `substitute`, so the two can
+    /// never disagree about where the token goes.
+    pub fn is_cline_credential_host(&self, host: &str) -> bool {
+        self.entries().iter().any(|entry| {
+            (is_cline_entry(entry) || crate::oauth::ClineSession::load(self, &entry.name).is_some())
+                && entry.hosts.iter().any(|pinned| pinned == host)
+        })
+    }
 }
 
 /// HTTP Basic is an encoding of user:password, not a token prefix. Decode only
@@ -552,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn cline_oauth_substitution_uses_workos_prefix_but_static_keys_do_not() {
+    fn cline_oauth_substitution_uses_workos_prefix_and_other_hosts_are_untouched() {
         let (settings, dir) = temp_settings();
         let entry = settings.entries().pop().unwrap();
         settings.set_secret(&entry.name, "access").unwrap();
@@ -567,6 +600,109 @@ mod tests {
             settings.real_value(&entry).as_deref(),
             Some("workos:access")
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cline_entries_are_oauth_only_and_a_stale_static_key_is_inert() {
+        let dir = std::env::temp_dir().join(format!("fz-cline-static-{}", Uuid::new_v4()));
+        let settings = Settings::load(&dir).unwrap();
+        let entry = settings
+            .add_entry(EscrowEntry {
+                name: "cline".into(),
+                hosts: vec!["api.cline.bot".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fz-cline-fake".into(),
+                real_env: Some("FZ_TEST_CLINE_STATIC_KEY".into()),
+                guest_env: Some("CLINE_API_KEY".into()),
+            })
+            .unwrap();
+        assert!(is_cline_entry(&entry));
+        assert!(is_cline_entry(&EscrowEntry {
+            hosts: vec!["API.Cline.Bot".into()],
+            ..entry.clone()
+        }));
+        // A static key pasted into the secrets store, or one supplied through
+        // the env fallback, is not a Cline credential: no session, no value.
+        settings.set_secret(&entry.name, "static-api-key").unwrap();
+        // SAFETY: test-scoped variable name, no concurrent reader.
+        unsafe { std::env::set_var("FZ_TEST_CLINE_STATIC_KEY", "env-static-key") };
+        assert_eq!(settings.real_value(&entry), None);
+        assert!(matches!(
+            settings.substitute("api.cline.bot", "/api/v1/chat/completions", |name| {
+                (name == "authorization").then(|| "Bearer fz-cline-fake".into())
+            }),
+            Substitution::Block(reason) if reason.contains("connect it in settings")
+        ));
+        // Connecting the broker-owned session makes the mirrored token usable.
+        settings.set_secret(&crate::oauth::ClineSession::secret_name(&entry.name), &serde_json::json!({"refresh_token":"refresh", "expires_at":4_000_000_000_i64, "api_base_url":"https://api.cline.bot"}).to_string()).unwrap();
+        settings.set_secret(&entry.name, "access").unwrap();
+        assert_eq!(settings.real_value(&entry).as_deref(), Some("workos:access"));
+        // Deleting the entry takes the session with it; nothing is left behind.
+        settings.remove_entry(&entry.name).unwrap();
+        assert!(settings.secret(&crate::oauth::ClineSession::secret_name(&entry.name)).is_none());
+        unsafe { std::env::remove_var("FZ_TEST_CLINE_STATIC_KEY") };
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cline_credential_hosts_are_exactly_where_the_account_token_would_go() {
+        let dir = std::env::temp_dir().join(format!("fz-cline-hosts-{}", Uuid::new_v4()));
+        let settings = Settings::load(&dir).unwrap();
+        // Unrelated entries never make a host a Cline credential host.
+        settings
+            .add_entry(EscrowEntry {
+                name: "anthropic".into(),
+                hosts: vec!["api.anthropic.com".into()],
+                header: "x-api-key".into(),
+                prefix: String::new(),
+                fake: "fz-anthropic".into(),
+                real_env: None,
+                guest_env: None,
+            })
+            .unwrap();
+        assert!(!settings.is_cline_credential_host("api.anthropic.com"));
+        assert!(!settings.is_cline_credential_host("api.cline.bot"));
+
+        // A Cline entry (by host) governs every host it pins, connected or not.
+        // Host comparison is exact, precisely as in `substitute`: a pin that
+        // would not receive the token does not widen the gate either.
+        let cline = settings
+            .add_entry(EscrowEntry {
+                name: "cline".into(),
+                hosts: vec!["api.cline.bot".into(), "core-api.staging.int.cline.bot".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fz-cline".into(),
+                real_env: None,
+                guest_env: Some("CLINE_API_KEY".into()),
+            })
+            .unwrap();
+        assert!(settings.is_cline_credential_host("api.cline.bot"));
+        assert!(settings.is_cline_credential_host("core-api.staging.int.cline.bot"));
+        assert!(
+            !settings.is_cline_credential_host("CORE-API.staging.int.cline.bot"),
+            "substitute would not match this spelling, so neither does the gate predicate"
+        );
+        assert!(!settings.is_cline_credential_host("api.anthropic.com"));
+        assert!(!settings.is_cline_credential_host("cline.bot"));
+
+        // If the production pin is edited away after sign-in, the session still
+        // marks the entry's remaining hosts as Cline credential hosts: the token
+        // would be substituted there, so the gate must follow it.
+        settings.set_secret(&crate::oauth::ClineSession::secret_name(&cline.name), &serde_json::json!({"refresh_token":"refresh", "expires_at":4_000_000_000_i64, "api_base_url":"https://api.cline.bot"}).to_string()).unwrap();
+        settings
+            .update_entry(
+                &cline.name,
+                vec!["core-api.staging.int.cline.bot".into()],
+                cline.header.clone(),
+                cline.prefix.clone(),
+                cline.guest_env.clone(),
+            )
+            .unwrap();
+        assert!(settings.is_cline_credential_host("core-api.staging.int.cline.bot"));
+        assert!(!settings.is_cline_credential_host("api.cline.bot"), "no entry pins production any more");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -587,12 +723,18 @@ mod tests {
             .unwrap();
         settings.set_secret(&entry.name, "host-access").unwrap();
 
-        // A static Cline API key must not reinterpret an OAuth-shaped value.
+        // Without a broker-owned session the entry has no credential at all.
         assert!(matches!(
             settings.substitute("api.cline.bot", "/api/v1/users/me", |name| {
                 (name == "authorization").then(|| "Bearer workos:fz-cline-fake".into())
             }),
             Substitution::None
+        ));
+        assert!(matches!(
+            settings.substitute("api.cline.bot", "/api/v1/users/me", |name| {
+                (name == "authorization").then(|| "Bearer fz-cline-fake".into())
+            }),
+            Substitution::Block(_)
         ));
 
         settings.set_secret(&crate::oauth::ClineSession::secret_name(&entry.name), &serde_json::json!({"refresh_token":"host-refresh", "expires_at":4_000_000_000_i64, "api_base_url":"https://api.cline.bot"}).to_string()).unwrap();
