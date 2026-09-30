@@ -39,6 +39,9 @@ class FakeMac:
         self.disabled = list(disabled)
         self.calls = []
         self.fail = None
+        # Older macOS releases exit 1 instead of exporting an empty admin trustList.
+        self.empty_export_fails = False
+        self.export_error = None
 
     @staticmethod
     def service(bypass=(), web=None, secure=None):
@@ -49,9 +52,10 @@ class FakeMac:
         self.certificates[configure.certificate_digest(pem)] = pem
         self.trusted.add(configure._macos_fingerprint(pem))
 
-    def run(self, arguments, check, stdout=None):
-        assert check
+    def run(self, arguments, check, stdout=None, stderr=None):
         command, rest = arguments[1], arguments[2:]
+        # Only the trust export inspects its own exit status.
+        assert check == (command != "trust-settings-export")
         if command not in ("find-certificate", "trust-settings-export", "-listallnetworkservices") and not command.startswith("-get"):
             self.calls.append(list(arguments))
         if self.fail is not None and self.fail(arguments):
@@ -65,6 +69,10 @@ class FakeMac:
         if command == "find-certificate":
             output = "".join(self.certificates.values())
         elif command == "trust-settings-export":
+            error = self.export_error or (b"SecTrustSettingsCreateExternalRepresentation: No Trust Settings were found.\n"
+                                          if self.empty_export_fails and not self.trusted else None)
+            if error is not None:
+                return types.SimpleNamespace(returncode=1, stdout=b"", stderr=error)
             with open(rest[-1], "wb") as stream:
                 plistlib.dump({"trustList": {key.upper(): {} for key in self.trusted}, "trustVersion": 1}, stream)
         elif command == "add-trusted-cert":
@@ -247,6 +255,25 @@ class GuestScriptTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid Friendzone macOS CA ownership state"):
             self.install_macos_ca(mac, ROTATED_CA)
         self.assertEqual(mac.calls, [])
+
+    def test_macos_ca_empty_admin_trust_export_failure_means_no_trust_settings(self):
+        mac = FakeMac()
+        mac.empty_export_fails = True
+        result = self.install_macos_ca(mac)
+        self.assertTrue(result["installed"])
+        self.assertTrue(result["managed"])
+        self.assertEqual(mac.trusted, {configure._macos_fingerprint(TEST_CA)})
+        mac.calls.clear()
+        self.assertFalse(self.install_macos_ca(mac)["installed"])
+        self.assertEqual(mac.calls, [])
+
+        other = FakeMac()
+        other.export_error = b"security: SecTrustSettingsCreateExternalRepresentation: unexpected failure\n"
+        (self.config / configure.MACOS_CA_STATE).unlink()
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.install_macos_ca(other)
+        self.assertEqual(other.calls, [])
+        self.assertFalse((self.config / configure.MACOS_CA_STATE).exists())
 
     def test_macos_ca_failures_restore_previous_trust(self):
         mac = FakeMac()

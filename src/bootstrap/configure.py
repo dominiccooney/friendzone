@@ -196,7 +196,15 @@ def _macos_trust_state(run, security, keychain):
             continue
     with tempfile.TemporaryDirectory(prefix="friendzone-trust-") as directory:
         exported = Path(directory) / "admin-trust.plist"
-        run([security, "trust-settings-export", "-d", str(exported)], check=True, stdout=subprocess.DEVNULL)
+        arguments = [security, "trust-settings-export", "-d", str(exported)]
+        completed = run(arguments, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if completed.returncode != 0:
+            # Older macOS releases exit 1 for an empty admin domain instead of
+            # exporting an empty trustList; any other failure is still fatal.
+            stderr = completed.stderr.decode("utf-8", "replace") if isinstance(completed.stderr, bytes) else completed.stderr or ""
+            if "No Trust Settings were found" not in stderr:
+                raise subprocess.CalledProcessError(completed.returncode, arguments, stderr=completed.stderr)
+            return certificates, set()
         with exported.open("rb") as stream:
             settings = plistlib.load(stream)
     trust = settings.get("trustList") if isinstance(settings, dict) else None
