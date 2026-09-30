@@ -5,8 +5,11 @@ the curl command, and run it in the guest terminal. The command only downloads
 a script. Inspect it if desired, then run the separate command shown below it.
 No guest fz binary, architecture-specific build or compiler is involved.
 
-Linux requires `curl` and Python 3.6+ (standard library only). Windows requires
-`curl.exe` and PowerShell 5.1 or 7. The scripts do not install these dependencies.
+Linux and macOS require `curl` and Python 3.6+ (standard library only). On macOS
+that is the Command Line Tools' `/usr/bin/python3` (`xcode-select --install`) or
+Homebrew Python; the script stops before any change when only the stock installer
+stub exists. Windows requires `curl.exe` and PowerShell 5.1 or 7. The scripts do
+not install these dependencies.
 
 ```sh
 curl --noproxy '*' -fsS 'http://HOST_IP:8082/bootstrap/setup?shell=sh&container=reviewer' -o friendzone-setup.sh
@@ -33,8 +36,8 @@ the installer does not download or upgrade Cline.
 
 The script contains a snapshot of the public CA, proxy port and fake keys from
 the broker at download time. It registers the guest directly with the broker,
-then writes the guest account's environment, Windows current-user proxy (on
-Windows), and Cline settings. Refetch before rerunning if the CA, broker address
+then writes the guest account's environment, system proxy (the current-user
+proxy on Windows, each enabled network service on macOS), and Cline settings. Refetch before rerunning if the CA, broker address
 or fake keys have changed. Downloading a
 script never registers or approves a guest; the host Inbox still owns approval.
 
@@ -93,7 +96,8 @@ or the Windows **LocalMachine** CA store. On Kali/Debian/Ubuntu, Linux setup use
 `/usr/local/share/ca-certificates/friendzone-local-ca.crt` and runs
 `update-ca-certificates`. It records whether it owns that file, is idempotent,
 rotates only a Friendzone-owned root, refuses to overwrite external content, and
-rolls back a failed trust refresh. This covers native-root TLS clients; programs
+rolls back a failed trust refresh. On macOS it adds the exact root to the System
+keychain with admin trust; see [macOS persistence](#macos-persistence). This covers native-root TLS clients; programs
 compiled with a private WebPKI-only root set must enable native roots or accept an
 explicit CA bundle. On Windows it installs the exact
 Friendzone CA into the guest user's Trusted Root Certification Authorities store
@@ -157,6 +161,55 @@ is recorded in `linux-system-ca.json`: remove
 still matches the installed certificate. A `managed: false` root predated
 Friendzone and must be preserved. CA/provider files are separate; do not
 overwrite unrelated later edits.
+
+## macOS persistence
+
+Run the setup script as the guest user from Terminal in the logged-in desktop
+session, not over SSH and not with `sudo`. macOS can show an administrator
+password dialog for the trust change, and the GUI environment is published to
+that login session. Files are written under
+`${XDG_CONFIG_HOME:-$HOME/.config}/friendzone`, and the profile hooks are the
+same as on Linux (zsh, the default shell, reads `.zshenv`).
+
+Setup invokes `sudo` for two changes:
+
+- **CA.** `security add-trusted-cert -d -r trustRoot -k
+  /Library/Keychains/System.keychain` adds the exact Friendzone root with
+  admin-domain trust. The `com.apple.trust-settings.admin` right does not allow
+  root, so macOS may ask for an administrator password even under `sudo`.
+  `macos-system-ca.json` records the root's SHA-256 and PEM and whether
+  Friendzone installed it. Reruns are idempotent. A matching root that was
+  already trusted is used but never claimed. Rotation removes only a
+  Friendzone-installed root (`remove-trusted-cert -d`, then
+  `delete-certificate -Z`). A cancelled dialog or other failure restores the
+  keychain and trust settings from before the run.
+- **System proxy.** For each enabled network service, `networksetup` sets the web
+  (HTTP) and secure web (HTTPS) proxy to the credential-free Friendzone proxy
+  and adds the broker host, `localhost`, `127.0.0.1` and `::1` to the bypass
+  list, keeping existing entries. `macos-system-proxy.json` records the original
+  values before the first write and keeps them across reruns; a failed update is
+  rolled back. A service with an enabled authenticated proxy is refused.
+  Automatic proxy configuration (PAC) and proxy auto-discovery are not changed.
+  This covers software that follows the system proxy settings, such as
+  NSURLSession and WebKit; it cannot force software that ignores them.
+
+GUI apps started from the Dock, Finder or Spotlight do not read shell profiles.
+Setup writes `~/Library/LaunchAgents/friendzone.guest-environment.plist`, which
+runs `launchd-env.sh` at each login. That script sources `activate.sh` and copies
+the Friendzone variables, including NO_PROXY and BASH_ENV, into the login session
+with `launchctl setenv`; setup also runs it once immediately. Apps read these
+values when they start, so quit and reopen apps that were already running. macOS
+may show a "Background Items Added" notification for `sh`. An unrelated
+LaunchAgent with the same file name is never replaced.
+
+Rollback (there is no automatic restore command yet): delete the LaunchAgent,
+run `launchctl unsetenv` for each name in `launchd-env.sh`, remove the marked
+profile hooks as on Linux, and restore each service's `previous` values from
+`macos-system-proxy.json` with `networksetup` or System Settings. Only when
+`macos-system-ca.json` says `managed: true`, run `sudo security
+remove-trusted-cert -d` on its PEM and `sudo security delete-certificate -Z
+<sha256> /Library/Keychains/System.keychain`. A `managed: false` root predated
+Friendzone and must be preserved.
 
 ## Windows Build Tools and Rust
 
@@ -326,7 +379,8 @@ Management routes remain unavailable on this listener.
 ## Validation boundary
 
 Tests execute script configuration against explicit temporary homes and local
-fixtures. Windows environment and Internet Settings writes are mocked in memory. The developer's
+fixtures. Windows environment and Internet Settings writes, and macOS keychain,
+trust-settings and `networksetup` calls, are mocked in memory. The developer's
 real profiles, user registry, trust store, network settings and live broker
 are never used as installation test targets. Native zsh startup and real
-Windows persistence still require acceptance testing in a disposable guest.
+Windows and macOS persistence still require acceptance testing in a disposable guest.

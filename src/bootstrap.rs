@@ -24,7 +24,7 @@ impl Shell {
         {
             "sh" | "bash" | "zsh" => Ok(Self::Sh),
             "powershell" | "pwsh" => Ok(Self::Powershell),
-            _ => bail!("Choose sh (Linux) or powershell (Windows)"),
+            _ => bail!("Choose sh (Linux or macOS) or powershell (Windows)"),
         }
     }
 }
@@ -145,7 +145,7 @@ pub fn script(
     let encoded = STANDARD.encode(serde_json::to_vec(&payload)?);
     Ok(match shell {
         Shell::Sh => format!(
-            "#!/bin/sh\n# Configure this Linux guest; Python 3 standard library only.\nset -eu\ncommand -v python3 >/dev/null 2>&1 || {{ echo 'Python 3 is required in the guest.' >&2; exit 1; }}\npython3 - {} <<'FRIENDZONE_PYTHON'\n{}\nif __name__ == '__main__':\n    import sys\n    main(sys.argv[1])\nFRIENDZONE_PYTHON\n",
+            "#!/bin/sh\n# Configure this Linux or macOS guest; Python 3 standard library only.\nset -eu\ncommand -v python3 >/dev/null 2>&1 || {{ echo 'Python 3 is required in the guest.' >&2; exit 1; }}\n# Stock macOS only has a /usr/bin/python3 stub that opens a Command Line Tools installer.\nif [ \"$(uname -s)\" = Darwin ] && [ \"$(command -v python3)\" = /usr/bin/python3 ] && ! /usr/bin/xcode-select -p >/dev/null 2>&1; then echo 'macOS needs Python 3: run xcode-select --install or install Homebrew Python, then rerun.' >&2; exit 1; fi\npython3 - {} <<'FRIENDZONE_PYTHON'\n{}\nif __name__ == '__main__':\n    import sys\n    main(sys.argv[1])\nFRIENDZONE_PYTHON\n",
             quote(&encoded),
             include_str!("bootstrap/configure.py").replace("\r\n", "\n")
         ),
@@ -276,6 +276,8 @@ mod tests {
                 assert!(text.contains("/usr/local/share/ca-certificates/friendzone-local-ca.crt"));
                 assert!(text.contains("update-ca-certificates"));
                 assert!(text.contains("install_linux_ca(config / \"friendzone-ca.pem\", config)"));
+                assert!(text.contains("install_macos_ca(config / \"friendzone-ca.pem\", config)"));
+                assert!(text.contains("/usr/bin/xcode-select -p"));
             }
             if !powershell && let Some(dir) = std::env::var_os("FZ_PLUGIN_TEST_ARTIFACT_DIR") {
                 let dir = std::path::PathBuf::from(dir);
