@@ -184,9 +184,12 @@ impl Job {
                 targets: vec![format!("branch {}", self.submission.branch)],
                 artifacts: vec![],
                 more: false,
+                operations: vec![],
+                omitted_operations: 0,
             }),
             request_key: Some(self.submission.request_key.clone()),
             upstream: None,
+            display_binding: None,
         }
     }
 

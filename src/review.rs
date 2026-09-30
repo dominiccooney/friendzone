@@ -230,6 +230,8 @@ pub struct Summary {
     /// content, credentials and arbitrary response headers are never included.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream: Option<crate::jobs::UpstreamDiagnostics>,
+    #[serde(skip)]
+    pub display_binding: Option<crate::github::Binding>,
 }
 
 #[derive(Clone, Serialize)]
@@ -388,6 +390,7 @@ impl Detail {
                 facts: graphql.as_ref().and_then(crate::graphql::Review::facts),
                 request_key: None,
                 upstream: None,
+                display_binding: None,
             },
             headers,
             body: body.into(),
@@ -400,6 +403,74 @@ impl Detail {
             resolution_id: None,
             comment_context: None,
         })
+    }
+
+    pub async fn resolve_display(
+        &mut self,
+        client: &crate::github::Client,
+        credential: Option<&crate::github::Credential>,
+    ) {
+        use futures_util::{StreamExt, stream};
+        let Some(crate::graphql::Review::Parsed { analysis }) = &mut self.graphql else {
+            return;
+        };
+        let mut seen = std::collections::HashSet::new();
+        let targets: Vec<_> = analysis
+            .operations
+            .iter()
+            .flat_map(|operation| operation.targets.iter())
+            .map(|target| (target.id.clone(), target.expected_type.clone()))
+            .filter(|target| seen.insert(target.clone()))
+            .collect();
+        let mut pending = stream::iter(targets.iter().take(32).cloned().map(
+            |(id, expected)| async move {
+                let result = match credential {
+                    Some(credential) => client
+                        .resolve_display(&id, &expected, credential)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    None => Err("No current supported escrow credential for this request".into()),
+                };
+                ((id, expected), result)
+            },
+        ))
+        .buffer_unordered(4);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let mut results = Vec::new();
+        while let Ok(Some(result)) = tokio::time::timeout_at(deadline, pending.next()).await {
+            results.push(result);
+        }
+        for operation in &mut analysis.operations {
+            for target in &mut operation.targets {
+                match results
+                    .iter()
+                    .find(|((id, expected), _)| {
+                        id == &target.id && expected == &target.expected_type
+                    })
+                    .map(|(_, result)| result)
+                {
+                    Some(Ok(lookup)) => {
+                        target.lookup = Some(lookup.clone());
+                        target.error = None;
+                    }
+                    Some(Err(error)) => {
+                        target.lookup = None;
+                        target.error = Some(error.clone());
+                    }
+                    None => {
+                        target.lookup = None;
+                        target.error = Some(
+                            "Target lookup time or count limit reached; reopen details to retry"
+                                .into(),
+                        );
+                    }
+                }
+            }
+        }
+        self.summary.facts = self
+            .graphql
+            .as_ref()
+            .and_then(crate::graphql::Review::facts);
     }
 }
 

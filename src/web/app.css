@@ -12,6 +12,13 @@
 .review-table th:nth-child(5) { width:9%; }
 .review-table th:nth-child(6) { width:8%; }
 .review-operation { font-weight:600; }
+.graphql-client-name,.review-operation .graphql-client-name{display:block;color:var(--muted);font-size:11px;font-weight:400;overflow-wrap:anywhere}
+.graphql-summary{margin:10px 0;padding:10px 12px;border-left:3px solid var(--blue);background:var(--paper);overflow-wrap:anywhere}
+.graphql-summary.read{color:var(--muted);border-color:var(--line);font-size:12px}
+.graphql-summary strong{color:var(--ink)}
+.graphql-summary .graphql-summary-warning{color:var(--amber);font-weight:600}
+.review-operation .review-effects{display:block;font-size:11px;font-weight:400;white-space:normal}
+.review-table .review-operation{white-space:normal;overflow-wrap:anywhere}
 .review-target a { color:var(--blue); text-decoration:underline; text-underline-offset:2px; }
 .review-table td:last-child { padding:4px; }
 .review-table .request-badge { font-size:11px; padding:3px 5px; white-space:nowrap; max-width:100%; overflow:hidden; text-overflow:ellipsis; vertical-align:middle; }

@@ -157,7 +157,8 @@ test("GraphQL review shows actual action, opaque target and comment separately w
   assert.match(markup,/harmless/); assert.match(markup,/opaque-node/); assert.match(markup,/Not an issue\/PR number/);
   assert.match(markup,/Comment text/); assert.match(markup,/&lt;img/); assert.doesNotMatch(markup,/<img|<details/);
   assert.match(markup,/When this field is included:/);
-  assert.match(html,/Operation names are requester-controlled, untrusted text/);
+  assert.match(html,/Operation names and aliases are requester-controlled/);
+  assert.match(html,/id="request-graphql-operation" class="graphql-client-name"/);
   assert.equal(f.sandbox.document.querySelector("#request-review-body").textContent,pendingRequest.body);
   assert.equal(f.run("activeReview.fingerprint"),"exact-hash");
 });
@@ -170,6 +171,31 @@ test("structured GraphQL warnings and non-GraphQL reviews clear previously displ
   assert.match(f.sandbox.document.querySelector("#request-graphql-warning").textContent,/fragment cycle.*No operation or target was inferred/);
   assert.equal(f.sandbox.document.querySelector("#request-graphql-warning").innerHTML,"");
   f.run('renderGraphqlReview(null)'); assert.equal(f.sandbox.document.querySelector("#request-graphql").hidden,true);
+});
+
+test("summaries prioritize every mutation and warn about gaps while reads and client labels remain secondary", () => {
+  const f=fixture();
+  const lookup={node_id:"canonical",kind:"PullRequest",repository:"cline/cline",repository_id:"repo",number:482,url:"https://github.com/cline/cline/pull/482",fetched_at:"2026-09-30T00:00:00Z",cached:true,branch:{base:"main",head:"feature",head_repository:"contributor/cline",head_oid:"a".repeat(40),head_exists:false}};
+  const operations=[
+    {field_index:0,field:"addPullRequestReview",action:"APPROVE",targets:[{id:"opaque",expected_type:"PullRequest",input_path:"input.pullRequestId",lookup}],effects:["body supplied"],warnings:[],conditional:false,read:false},
+    {field_index:1,field:"comments",action:"READ comments",targets:[],effects:["Arguments: first"],warnings:[],conditional:false,read:true},
+    {field_index:2,field:"addPullRequestReview",action:"REQUEST_CHANGES",targets:[{id:"unresolved<script>",expected_type:"PullRequest",input_path:"input.pullRequestId",error:"not accessible"}],effects:[],warnings:["input.surprise not summarized"],conditional:true,read:false},
+    {field_index:3,field:"mystery",action:"mystery",targets:[],effects:[],warnings:["Mutation not summarized; inspect every argument"],conditional:false,read:false},
+  ];
+  const graph={status:"parsed",analysis:{...parsedGraphql.analysis,operation_name:"SafeRead<script>",operations}};
+  f.run(`renderGraphqlReview(${JSON.stringify(graph)})`);
+  const summary=f.sandbox.document.querySelector("#request-graphql-summary").innerHTML;
+  assert.match(summary,/<strong>APPROVE<\/strong> <code>addPullRequestReview<\/code>/);
+  assert.match(summary,/href="https:\/\/github\.com\/cline\/cline\/pull\/482"[^>]*>cline\/cline #482/);
+  assert.match(summary,/contributor\/cline.*ref absent/);assert.match(summary,/cached \(up to 60s old\)/);
+  assert.match(summary,/Mutation not summarized/);assert.match(summary,/input.surprise not summarized/);
+  assert.match(summary,/Conditional/);assert.match(summary,/Unresolved PullRequest/);
+  assert.ok(summary.indexOf("mystery")<summary.indexOf("READ comments"));
+  assert.match(summary,/graphql-summary read/);assert.doesNotMatch(summary,/<script>|SafeRead/);
+  const row=f.run(`reviewRow({...${JSON.stringify(pendingRequest)},facts:{operation_name:"SafeRead<script>",operation_type:"mutation",operations:${JSON.stringify(operations)},omitted_operations:2}})`);
+  assert.match(row,/APPROVE \(addPullRequestReview\).*REQUEST_CHANGES/);
+  assert.match(row,/cline\/cline #482/);assert.match(row,/2 additional fields not shown/);
+  assert.match(row,/<span class="graphql-client-name">Client name: SafeRead&lt;script&gt;/);
 });
 
 test("unknown mutations expose every typed input without field expanders and separate response-only selections", () => {
@@ -233,7 +259,7 @@ test("compact overview puts operation repository and HTTP errors in one row with
   const f=fixture();
   const job={...pendingRequest,status:'response_received',http_status:499,outcome:'Response received',updated_at:'2026-09-14T09:14:17Z',facts:{operation_name:'PublishBackgroundCommandStreaming',operation_type:'mutation',fields:['createCommitOnBranch'],repositories:['cline/cline'],targets:['branch feature'],more:false}};
   const markup=f.run(`reviewTable([${JSON.stringify(job)}],"empty")`);
-  assert.match(markup,/<table/);assert.match(markup,/<td[^>]*>PublishBackgroundCommandStreaming<\/td>/);
+  assert.match(markup,/<table/);assert.match(markup,/<td[^>]*>createCommitOnBranch<span class="graphql-client-name">Client name: PublishBackgroundCommandStreaming<\/span><\/td>/);
   assert.match(markup,/href="https:\/\/github\.com\/cline\/cline"[^>]*>cline\/cline<\/a> · branch feature<\/td>/);assert.match(markup,/>HTTP 499<\/span>/);
   assert.doesNotMatch(markup,/Response received|<article|<p>/);
   assert.match(markup,/createCommitOnBranch/);assert.match(markup,/&lt;script&gt;/);

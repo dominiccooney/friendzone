@@ -1426,6 +1426,28 @@ async fn api_state(State(state): State<UiState>) -> Json<StateView> {
 
 fn permission_state_view(app: &AppState, settings: &crate::settings::Settings) -> StateView {
     let mut view = app.view();
+    for summary in view
+        .pending_requests
+        .iter_mut()
+        .chain(&mut view.recent_reviews)
+    {
+        if let Some(credential) = summary
+            .display_binding
+            .as_ref()
+            .and_then(|binding| crate::github::Credential::current(settings, binding))
+            && let Some(facts) = &mut summary.facts
+        {
+            for target in facts
+                .operations
+                .iter_mut()
+                .flat_map(|operation| &mut operation.targets)
+            {
+                target.lookup =
+                    app.github
+                        .cached_display(&target.id, &target.expected_type, &credential);
+            }
+        }
+    }
     for permission in &mut view.comment_permissions {
         permission.credential_active = Some(
             settings
@@ -1486,7 +1508,40 @@ async fn review_request(
         .or_else(|| state.app.jobs.inspect(id))
         .or_else(|| state.app.pushes.inspect(id))
     {
-        Some(detail) => ([(header::CACHE_CONTROL, "no-store")], Json(detail)).into_response(),
+        Some(mut detail) => {
+            let credential =
+                detail.summary.display_binding.as_ref().and_then(|binding| {
+                    crate::github::Credential::current(&state.settings, binding)
+                });
+            detail
+                .resolve_display(&state.app.github, credential.as_ref())
+                .await;
+            if credential.as_ref().is_some_and(|credential| {
+                crate::github::Credential::current(&state.settings, &credential.binding).is_none()
+            }) {
+                detail.resolve_display(&state.app.github, None).await;
+            }
+            let Some(current) = state
+                .app
+                .reviews
+                .inspect(id)
+                .or_else(|| state.app.jobs.inspect(id))
+                .or_else(|| state.app.pushes.inspect(id))
+            else {
+                return (StatusCode::NOT_FOUND, "Request no longer retained.").into_response();
+            };
+            let facts = detail.summary.facts.take();
+            detail.summary = current.summary;
+            detail.graphql_response = current.graphql_response;
+            detail.comment_permission_supported = current.comment_permission_supported;
+            detail.resolved_target = current.resolved_target;
+            detail.resolution_id = current.resolution_id;
+            detail.summary.facts = facts;
+            if credential.is_some() {
+                state.app.notify();
+            }
+            ([(header::CACHE_CONTROL, "no-store")], Json(detail)).into_response()
+        }
         None => (
             StatusCode::NOT_FOUND,
             "Request not retained (broker restarted or history limit reached).",
@@ -2096,6 +2151,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn display_summaries_resolve_proxy_and_async_targets_without_granting_or_sending() {
+        use http_body_util::BodyExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+        let dir = std::env::temp_dir().join(format!("fz-display-summary-{}", uuid::Uuid::new_v4()));
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "github".into(),
+                hosts: vec!["api.github.com".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fake".into(),
+                real_env: None,
+                guest_env: None,
+            })
+            .unwrap();
+        settings.set_secret("github", "host-secret").unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = hits.clone();
+        let (started, mut lookup_started) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let server_release = release.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/graphql", post(move |headers: axum::http::HeaderMap, Json(request): Json<serde_json::Value>| {
+                let hits = observed.clone();
+                let started = started.clone();
+                let release = server_release.clone();
+                async move {
+                    assert_eq!(headers["authorization"], "Bearer host-secret");
+                    assert!(request["query"].as_str().unwrap().starts_with("query FriendzoneDisplayTarget"));
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    if request["variables"]["id"] == "slow" {
+                        started.send(()).unwrap();
+                        release.acquire().await.unwrap().forget();
+                    }
+                    let pr = serde_json::json!({"id":"canonical-pr","number":482,"title":"PR","url":"https://github.com/cline/cline/pull/482","repository":{"id":"repo-id","nameWithOwner":"cline/cline"},"baseRefName":"main","headRefName":"feature","headRefOid":"a".repeat(40),"headRepository":null,"headRef":null});
+                    let node = if request["variables"]["id"] == "thread" { serde_json::json!({"id":"canonical-thread","__typename":"PullRequestReviewThread","pullRequest":pr}) }
+                    else { let mut node = pr; node["__typename"]="PullRequest".into(); node };
+                    Json(serde_json::json!({"data":{"node":node}}))
+                }
+            }))).await.unwrap();
+        });
+        let mut app = AppState::load(&dir).unwrap();
+        app.github = crate::github::Client::for_test(&format!("http://{addr}/graphql"));
+        app.add_container("guest").unwrap();
+        let request = hudsucker::hyper::Request::builder()
+            .method("POST")
+            .uri(crate::github::ENDPOINT)
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer fake")
+            .body(hudsucker::Body::empty())
+            .unwrap();
+        let query = "mutation MisleadingRead { addPullRequestReview(input:{pullRequestId:\"pr\",event:APPROVE}){clientMutationId} addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:\"thread\",body:\"reply\"}){clientMutationId} unknown(input:{x:1}){id} }";
+        let body = serde_json::json!({"query":query,"operationName":null,"variables":null}).to_string();
+        let mut detail =
+            crate::review::Detail::from_request("guest", &request, body.as_bytes()).unwrap();
+        detail.summary.display_binding = crate::github::display_credential(&settings, &request)
+            .map(|credential| credential.binding);
+        let id = detail.summary.id;
+        let fingerprint = detail.summary.fingerprint.clone();
+        let ticket = app.reviews.enqueue(detail).unwrap();
+        let job = app
+            .jobs
+            .submit(
+                &app,
+                &settings,
+                "guest",
+                "127.0.0.1".parse().unwrap(),
+                crate::jobs::Submission {
+                    request_key: "review".into(),
+                    session_id: "s".into(),
+                    query: query.into(),
+                    variables: serde_json::Value::Null,
+                    operation_name: None,
+                },
+            )
+            .unwrap();
+        let ui = ui_router(UiState {
+            app: app.clone(),
+            settings: settings.clone(),
+            registry: crate::mcp::ForwardRegistry::load(&dir, settings.clone()).unwrap(),
+            oauth: Default::default(),
+            cline: Default::default(),
+            ui_addr: "127.0.0.1:8081".parse().unwrap(),
+            bootstrap_addr: "127.0.0.1:8082".parse().unwrap(),
+        });
+        for review_id in [id.to_string(), job["id"].as_str().unwrap().into()] {
+            let response = ui
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(format!("/api/requests/{review_id}"))
+                        .header("host", "127.0.0.1:8081")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                json["graphql"]["analysis"]["operations"][0]["action"],
+                "APPROVE"
+            );
+            assert_eq!(
+                json["graphql"]["analysis"]["operations"][0]["targets"][0]["lookup"]["repository"],
+                "cline/cline"
+            );
+            assert_eq!(
+                json["graphql"]["analysis"]["operations"][1]["targets"][0]["lookup"]["number"],
+                482
+            );
+            assert!(
+                json["graphql"]["analysis"]["operations"][2]["warnings"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("not summarized")
+            );
+            assert_eq!(json["body"], body);
+            assert!(!String::from_utf8_lossy(&bytes).contains("host-secret"));
+            assert_eq!(json["status"], "pending");
+            assert_eq!(json["comment_permission_supported"], false);
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "job inspection reuses the same credential-scoped display cache"
+        );
+        assert_eq!(
+            app.reviews.detail(id).unwrap().summary.fingerprint,
+            fingerprint
+        );
+        let view = permission_state_view(&app, &settings);
+        assert!(view.pending_requests.iter().all(|summary| {
+            summary.facts.as_ref().unwrap().operations[0].targets[0]
+                .lookup
+                .is_some()
+        }));
+        assert!(view.comment_permissions.is_empty());
+        let slow_body = serde_json::json!({"query":"mutation {addPullRequestReview(input:{pullRequestId:\"slow\",event:APPROVE}){clientMutationId}}"}).to_string();
+        let mut slow = crate::review::Detail::from_request("guest", &request, slow_body.as_bytes()).unwrap();
+        slow.summary.display_binding = crate::github::display_credential(&settings, &request).map(|credential| credential.binding);
+        let slow_id = slow.summary.id;
+        let slow_fingerprint = slow.summary.fingerprint.clone();
+        let slow_ticket = app.reviews.enqueue(slow).unwrap();
+        let lookup = tokio::spawn(ui.clone().oneshot(axum::http::Request::get(format!("/api/requests/{slow_id}")).header("host", "127.0.0.1:8081").body(axum::body::Body::empty()).unwrap()));
+        tokio::time::timeout(std::time::Duration::from_secs(2), lookup_started.recv()).await.unwrap().unwrap();
+        settings.set_secret("github", "rotated").unwrap();
+        app.reviews.decide(slow_id, &slow_fingerprint, crate::review::Decision::Deny).unwrap();
+        release.add_permits(1);
+        let response = lookup.await.unwrap().unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["status"], "denied", "outcome changes during a lookup remain visible");
+        assert!(json["graphql"]["analysis"]["operations"][0]["targets"][0]["lookup"].is_null());
+        assert!(json["graphql"]["analysis"]["operations"][0]["targets"][0]["error"].as_str().unwrap().contains("No current"));
+        assert_eq!(slow_ticket.wait().await.unwrap(), crate::review::Decision::Deny);
+        assert!(
+            permission_state_view(&app, &settings)
+                .pending_requests
+                .iter()
+                .all(
+                    |summary| summary.facts.as_ref().unwrap().operations[0].targets[0]
+                        .lookup
+                        .is_none()
+                )
+        );
+        drop(ticket);
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn async_guest_routes_return_immediately_and_host_api_controls_execution() {
         let dir = std::env::temp_dir().join(format!("fz-async-http-{}", uuid::Uuid::new_v4()));
         let settings = crate::settings::Settings::load(&dir).unwrap();
@@ -2672,7 +2903,9 @@ mod tests {
                 let lookups = lookups_seen.clone();
                 async move {
                     assert_eq!(headers["authorization"], "Bearer host-secret");
-                    if json["query"].as_str().unwrap().starts_with("query FriendzoneTarget") {
+                    if json["query"].as_str().unwrap().starts_with("query FriendzoneDisplayTarget") {
+                        Json(crate::github::tests::response())
+                    } else if json["query"].as_str().unwrap().starts_with("query FriendzoneTarget") {
                         crate::github::tests::assert_lookup(&json);
                         lookups.fetch_add(1, Ordering::SeqCst);
                         let mut response = crate::github::tests::response();

@@ -359,7 +359,7 @@ impl AppState {
     }
 
     /// Wakes SSE subscribers; call after every visible mutation.
-    fn notify(&self) {
+    pub(crate) fn notify(&self) {
         self.changes.send_modify(|version| *version += 1);
     }
 

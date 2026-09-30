@@ -294,14 +294,7 @@ impl Settings {
             // GitHub CLI sends `token <PAT>`, not Bearer. Match only an exact
             // fake in an Authorization entry configured for token escrow; keep
             // the same pin/secret checks and configured upstream prefix.
-            let github_token = entry.header.eq_ignore_ascii_case("authorization")
-                && entry.prefix == "Bearer "
-                && entry.hosts.iter().any(|host| host == "api.github.com")
-                && value.split_once(' ').is_some_and(|(scheme, token)| {
-                    scheme.eq_ignore_ascii_case("token")
-                        && !entry.fake.is_empty()
-                        && token == entry.fake
-                });
+            let github_token = github_token_matches(&entry, &value);
             if !literal_match && !oauth_facade_match && !github_token && basic.is_none() {
                 continue;
             }
@@ -339,6 +332,15 @@ impl Settings {
         }
         Substitution::None
     }
+}
+
+pub(crate) fn github_token_matches(entry: &EscrowEntry, value: &str) -> bool {
+    entry.header.eq_ignore_ascii_case("authorization")
+        && entry.prefix == "Bearer "
+        && entry.hosts.iter().any(|host| host == "api.github.com")
+        && value.split_once(' ').is_some_and(|(scheme, token)| {
+            scheme.eq_ignore_ascii_case("token") && !entry.fake.is_empty() && token == entry.fake
+        })
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {

@@ -1027,6 +1027,7 @@ impl Job {
             facts: self.facts.clone(),
             request_key: Some(self.submission.request_key.clone()),
             upstream: self.upstream.clone(),
+            display_binding: Some(self.binding.clone()),
         }
     }
     fn terminal(&self) -> bool {

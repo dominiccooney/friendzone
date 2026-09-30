@@ -1000,6 +1000,8 @@ impl EventHandler {
             .map_err(|e| error(e.to_string()))?;
         // Keep the review ID searchable/correlatable with its single audit row.
         detail.summary.id = event;
+        detail.summary.display_binding = crate::github::display_credential(&self.settings, &req)
+            .map(|credential| credential.binding);
         if detail.graphql_read {
             if !self.state.admit_graphql_read(event, container, peer, epoch) {
                 return Err(error(

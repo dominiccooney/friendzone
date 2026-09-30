@@ -935,6 +935,7 @@ pub struct Analysis {
     /// Large strings are stored once, not expanded into every occurrence.
     pub large_values: BTreeMap<String, String>,
     pub warnings: Vec<String>,
+    pub operations: Vec<OperationSummary>,
     /// Not deserialized from UI data. A strict, reconstructable command,
     /// independent of the advisory field/target summaries above.
     #[serde(skip)]
@@ -1136,6 +1137,36 @@ pub struct Facts {
     #[serde(default)]
     pub artifacts: Vec<ArtifactFact>,
     pub more: bool,
+    #[serde(default)]
+    pub operations: Vec<OperationSummary>,
+    #[serde(default)]
+    pub omitted_operations: usize,
+}
+
+/// Advisory summaries retain every occurrence, including conditional fields.
+/// They never authorize a request or replace its exact arguments.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OperationSummary {
+    pub field_index: usize,
+    pub field: String,
+    pub action: String,
+    pub effects: Vec<String>,
+    pub warnings: Vec<String>,
+    pub conditional: bool,
+    #[serde(default)]
+    pub read: bool,
+    pub targets: Vec<SummaryTarget>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SummaryTarget {
+    pub input_path: String,
+    pub id: String,
+    pub expected_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lookup: Option<crate::github::DisplayLookup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1155,6 +1186,24 @@ impl Review {
             operation_type: analysis.operation_type.clone(),
             ..Default::default()
         };
+        facts.operations = analysis
+            .operations
+            .iter()
+            .filter(|operation| !operation.read)
+            .chain(
+                analysis
+                    .operations
+                    .iter()
+                    .filter(|operation| operation.read),
+            )
+            .take(8)
+            .cloned()
+            .collect();
+        facts.omitted_operations = analysis
+            .operations
+            .len()
+            .saturating_sub(facts.operations.len());
+        facts.more = facts.omitted_operations > 0;
         for field in &analysis.fields {
             if field.parent.is_none() {
                 push_fact(&mut facts.fields, &field.field, &mut facts.more);
@@ -1572,6 +1621,7 @@ fn analyze_parsed(parsed: &ParsedRequest) -> Result<Analysis> {
     };
     let conditions = expander.conditions(&selected.directives, &[])?;
     expander.expand(&selected.selections, None, &[], &conditions, 0)?;
+    let operations = operation_summaries(&selected.kind, &expander.fields, &expander.large_values);
     Ok(Analysis {
         version: 1,
         operation_type: selected.kind.clone(),
@@ -1583,6 +1633,7 @@ fn analyze_parsed(parsed: &ParsedRequest) -> Result<Analysis> {
         fields: expander.fields,
         large_values: expander.large_values,
         warnings,
+        operations,
         comment,
     })
 }
@@ -1859,6 +1910,313 @@ impl Expander<'_> {
     }
 }
 
+fn summary_text<'a>(
+    value: &'a Value,
+    large_values: &'a BTreeMap<String, String>,
+) -> Option<&'a str> {
+    match value {
+        Value::String(value) | Value::Enum(value) => Some(value.as_str()),
+        Value::Reference(id) => large_values.get(id).map(String::as_str),
+        _ => None,
+    }
+}
+
+fn operation_summaries(
+    kind: &str,
+    fields: &[FieldView],
+    large_values: &BTreeMap<String, String>,
+) -> Vec<OperationSummary> {
+    fields
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| {
+            field.parent.is_none() || !field.arguments.is_empty() || field.target.is_some()
+        })
+        .map(|(field_index, field)| {
+            let mut summary = OperationSummary {
+                field_index,
+                field: field.field.clone(),
+                action: field.field.clone(),
+                effects: vec![],
+                warnings: vec![],
+                conditional: !field.conditions.is_empty(),
+                targets: vec![],
+                read: kind != "mutation" || field.parent.is_some() || field.field == "__typename",
+            };
+            let text = |value| summary_text(value, large_values);
+            if summary.read {
+                summary.action = format!("READ {}", field.field);
+                if let Some(Target::NodeId {
+                    input_path,
+                    id,
+                    expected_type,
+                }) = &field.target
+                {
+                    summary.targets.push(SummaryTarget {
+                        input_path: input_path.clone(),
+                        id: id.clone(),
+                        expected_type: (*expected_type).into(),
+                        lookup: None,
+                        error: None,
+                    });
+                }
+                if field.field == "repository" {
+                    if let (Some(owner), Some(name)) = (
+                        field.arguments.get("owner").and_then(&text),
+                        field.arguments.get("name").and_then(&text),
+                    ) {
+                        summary
+                            .effects
+                            .push(short_fact(&format!("{owner}/{name} (request value)")));
+                    }
+                    for child in fields
+                        .iter()
+                        .filter(|child| child.parent == Some(field_index))
+                    {
+                        let target = match &child.target {
+                            Some(Target::RepositoryNumber { number, .. }) => {
+                                format!("{} #{number}", child.field)
+                            }
+                            _ => child.field.clone(),
+                        };
+                        summary.effects.push(short_fact(&target));
+                    }
+                }
+                if let Some(Target::RepositoryNumber {
+                    owner,
+                    repository,
+                    number,
+                    ..
+                }) = &field.target
+                {
+                    summary.effects.push(short_fact(&format!(
+                        "{owner}/{repository} #{number} (request values)"
+                    )));
+                }
+                if !field.arguments.is_empty() {
+                    summary.effects.push(short_fact(&format!(
+                        "Arguments: {}",
+                        field
+                            .arguments
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+                return summary;
+            }
+            let (action, allowed): (&str, &[&str]) = match field.field.as_str() {
+                "addComment" => ("COMMENT", &["subjectId", "body"]),
+                "addPullRequestReview" => (
+                    "ADD REVIEW",
+                    &[
+                        "pullRequestId",
+                        "event",
+                        "body",
+                        "commitOID",
+                        "comments",
+                        "threads",
+                    ],
+                ),
+                "submitPullRequestReview" => (
+                    "SUBMIT REVIEW",
+                    &["pullRequestId", "pullRequestReviewId", "event", "body"],
+                ),
+                "addPullRequestReviewThread" => (
+                    "POST REVIEW THREAD",
+                    &[
+                        "pullRequestId",
+                        "pullRequestReviewId",
+                        "body",
+                        "path",
+                        "line",
+                        "startLine",
+                        "side",
+                        "startSide",
+                        "subjectType",
+                    ],
+                ),
+                "addPullRequestReviewThreadReply" => (
+                    "REPLY TO REVIEW THREAD",
+                    &["pullRequestReviewThreadId", "pullRequestReviewId", "body"],
+                ),
+                "addPullRequestReviewComment" => (
+                    "POST REVIEW COMMENT",
+                    &[
+                        "pullRequestId",
+                        "pullRequestReviewId",
+                        "inReplyTo",
+                        "body",
+                        "path",
+                        "position",
+                        "commitOID",
+                    ],
+                ),
+                "updatePullRequest" => (
+                    "UPDATE PR",
+                    &[
+                        "pullRequestId",
+                        "baseRefName",
+                        "title",
+                        "body",
+                        "state",
+                        "maintainerCanModify",
+                        "assigneeIds",
+                        "milestoneId",
+                        "labelIds",
+                        "projectIds",
+                    ],
+                ),
+                "createPullRequest" => (
+                    "CREATE PR",
+                    &[
+                        "repositoryId",
+                        "headRepositoryId",
+                        "headRefName",
+                        "baseRefName",
+                        "title",
+                        "body",
+                        "draft",
+                        "maintainerCanModify",
+                    ],
+                ),
+                "updateIssue" => (
+                    "UPDATE ISSUE",
+                    &[
+                        "id",
+                        "title",
+                        "body",
+                        "state",
+                        "stateReason",
+                        "assigneeIds",
+                        "milestoneId",
+                        "labelIds",
+                        "projectIds",
+                    ],
+                ),
+                "closeIssue" => (
+                    "CLOSE ISSUE",
+                    &["issueId", "stateReason", "duplicateIssueId"],
+                ),
+                "reopenIssue" => ("REOPEN ISSUE", &["issueId"]),
+                "createCommitOnBranch" => (
+                    "CREATE COMMIT",
+                    &["branch", "expectedHeadOid", "message", "fileChanges"],
+                ),
+                _ => (field.field.as_str(), &[]),
+            };
+            summary.action = action.into();
+            if allowed.is_empty() {
+                summary
+                    .warnings
+                    .push("Mutation not summarized; inspect every argument".into());
+                return summary;
+            }
+            let Some(Value::Object(input)) = field.arguments.get("input") else {
+                summary
+                    .warnings
+                    .push("Mutation input unavailable; summary incomplete".into());
+                return summary;
+            };
+            if field.arguments.keys().any(|key| key != "input") {
+                summary
+                    .warnings
+                    .push("Additional arguments not summarized".into());
+            }
+            for key in input.keys().filter(|key| {
+                key.as_str() != "clientMutationId" && !allowed.contains(&key.as_str())
+            }) {
+                summary
+                    .warnings
+                    .push(short_fact(&format!("input.{key} not summarized")));
+            }
+            for (key, expected_type) in [
+                ("subjectId", "Issue or PullRequest"),
+                ("pullRequestId", "PullRequest"),
+                ("pullRequestReviewId", "PullRequestReview"),
+                ("pullRequestReviewThreadId", "PullRequestReviewThread"),
+                ("inReplyTo", "PullRequestReviewComment"),
+                ("repositoryId", "Repository"),
+                ("headRepositoryId", "Repository"),
+                ("issueId", "Issue"),
+                ("duplicateIssueId", "Issue"),
+                ("id", "Issue"),
+            ] {
+                if !allowed.contains(&key) {
+                    continue;
+                }
+                if let Some(value) = input.get(key).filter(|value| !matches!(value, Value::Null)) {
+                    if let Some(id) = text(value).filter(|id| !id.is_empty() && id.len() <= 512) {
+                        summary.targets.push(SummaryTarget {
+                            input_path: format!("input.{key}"),
+                            id: id.into(),
+                            expected_type: expected_type.into(),
+                            lookup: None,
+                            error: None,
+                        });
+                    } else {
+                        summary
+                            .warnings
+                            .push(format!("input.{key} is not a resolvable node ID"));
+                    }
+                }
+            }
+            if matches!(
+                field.field.as_str(),
+                "addPullRequestReview" | "submitPullRequestReview"
+            ) {
+                match input.get("event").and_then(&text) {
+                    Some(event @ ("APPROVE" | "REQUEST_CHANGES" | "COMMENT")) => {
+                        summary.action = event.into()
+                    }
+                    _ => summary
+                        .warnings
+                        .push("Review event omitted or unsupported; inspect input.event".into()),
+                }
+            }
+            for (key, value) in input {
+                if !allowed.contains(&key.as_str())
+                    || summary
+                        .targets
+                        .iter()
+                        .any(|target| target.input_path == format!("input.{key}"))
+                    || key == "event"
+                {
+                    continue;
+                }
+                let effect = match key.as_str() {
+                    "body" | "title" => format!("{key} supplied"),
+                    "comments" | "threads" => match value {
+                        Value::List(items) => {
+                            format!("{} {key}; inspect content and locations", items.len())
+                        }
+                        _ => format!("{key} supplied; inspect full value"),
+                    },
+                    "branch" => match (
+                        value.member("repositoryNameWithOwner").and_then(&text),
+                        value.member("branchName").and_then(&text),
+                    ) {
+                        (Some(repository), Some(branch)) => {
+                            format!("{repository} · branch {branch} (request values)")
+                        }
+                        _ => "branch supplied; inspect full value".into(),
+                    },
+                    "message" | "fileChanges" | "assigneeIds" | "labelIds" | "projectIds" => {
+                        format!("{key} supplied; inspect full value")
+                    }
+                    _ => format!("{key}: {}", value.format()),
+                };
+                summary.effects.push(short_fact(&effect));
+            }
+            if summary.targets.is_empty() && field.field != "createCommitOnBranch" {
+                summary.warnings.push("Mutation target unresolved".into());
+            }
+            summary
+        })
+        .collect()
+}
+
 fn target_for(
     kind: &str,
     field: &str,
@@ -2035,6 +2393,63 @@ fn mutation_inputs(field: &str, args: &BTreeMap<String, Value>) -> Vec<MutationI
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn summaries_keep_every_mutation_effect_target_and_secondary_read() {
+        let analysis = parse(r#"mutation InnocentName($input:AddPullRequestReviewInput!){
+            harmless:addPullRequestReview(input:$input){pullRequest{number comments(first:5){totalCount}}}
+            addPullRequestReview(input:{pullRequestId:"other",event:REQUEST_CHANGES}){clientMutationId}
+            updatePullRequest(input:{pullRequestId:"pr",baseRefName:"release",state:CLOSED,labelIds:["label"]}){clientMutationId}
+            addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:"thread",pullRequestReviewId:"review",body:"reply"}){clientMutationId}
+            mystery(input:{id:"unknown"}){id}
+        }"#, json!({"input":{"pullRequestId":"pr","event":"APPROVE","body":"ignored summary text","surprise":"unknown effect"}}), None).unwrap();
+        assert_eq!(analysis.operations.len(), 6);
+        let approval = &analysis.operations[0];
+        assert_eq!(approval.action, "APPROVE");
+        assert_eq!(approval.field, "addPullRequestReview");
+        assert_eq!(approval.targets[0].id, "pr");
+        assert_eq!(approval.warnings, vec!["input.surprise not summarized"]);
+        assert!(analysis.operations[1].read);
+        assert_eq!(analysis.operations[2].action, "REQUEST_CHANGES");
+        assert!(
+            analysis.operations[3]
+                .effects
+                .iter()
+                .any(|effect| effect == "state: CLOSED")
+        );
+        assert!(
+            analysis.operations[3]
+                .effects
+                .iter()
+                .any(|effect| effect == "baseRefName: \"release\"")
+        );
+        assert_eq!(analysis.operations[4].targets.len(), 2);
+        assert!(analysis.operations[5].warnings[0].contains("not summarized"));
+        assert!(
+            !serde_json::to_string(&analysis.operations)
+                .unwrap()
+                .contains("ignored summary text")
+        );
+        let conditional = parse("mutation($skip:Boolean=false){...F @skip(if:$skip)} fragment F on Mutation{addComment(input:{subjectId:\"pr\",body:\"text\"}){id}}", Json::Null, None).unwrap();
+        assert!(conditional.operations[0].conditional);
+    }
+
+    #[test]
+    fn summary_overview_reports_omitted_operations_and_legacy_facts_still_load() {
+        let query = format!(
+            "mutation {{ {} }}",
+            (0..10)
+                .map(|index| format!("a{index}:unknown(input:{{x:{index}}}){{id}} "))
+                .collect::<String>()
+        );
+        let review = review(&json!({"query":query}).to_string(), "application/json");
+        let facts = review.facts().unwrap();
+        assert_eq!(facts.operations.len(), 8);
+        assert_eq!(facts.omitted_operations, 2);
+        assert!(facts.more);
+        let legacy: Facts = serde_json::from_value(json!({"operation_name":null,"operation_type":"mutation","fields":["addComment"],"repositories":[],"targets":[],"more":false})).unwrap();
+        assert!(legacy.operations.is_empty());
+    }
 
     #[test]
     fn read_classification_uses_selected_operation_not_names_strings_or_display_limits() {

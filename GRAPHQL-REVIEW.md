@@ -68,6 +68,42 @@ unrelated variables or decoded opaque IDs. These hints remain unverified until
 an explicit host lookup; they never authorize an operation. Summary metadata,
 but not input bodies, is included in host UI state updates.
 
+### Mutation summaries and target lookups
+
+The review shows each selected mutation field and its key effects before the
+requester-controlled operation name. Names and aliases appear in smaller grey
+text. Review events such as `APPROVE`, `REQUEST_CHANGES` and `COMMENT` remain
+distinct. Repeated mutation fields are retained, additional target IDs are
+shown, and conditional execution is labeled. Reads with arguments or targets
+appear after mutations with lower prominence. Response-only selections remain
+available in the secondary disclosure.
+
+Unknown mutations, additional unsupported inputs, and unresolved targets carry
+explicit warnings. The overview shows at most eight summaries and reports the
+number omitted; the detail retains all summaries within the existing parser
+limits. A summary is advisory and never replaces the exact arguments or grants
+permission to execute.
+
+Opening host-local request details resolves supported Issue, PullRequest,
+Repository, PullRequestReview, PullRequestReviewThread and
+PullRequestReviewComment IDs through a fixed GitHub query. Proxy reviews use the
+request's matched escrow binding; durable jobs use their captured binding. No
+arbitrary guest token or lookup endpoint is accepted. Lookups return repository
+identity, issue/PR number and URL, and PR branch context including fork and
+absent-ref information. Each detail lookup is bounded to 32 distinct targets,
+four concurrent reads and eight seconds overall. Failures remain unresolved;
+reopening details retries them. Lookups do not send or approve the reviewed
+request.
+
+Successful display lookups have a credential-scoped, in-memory cache of at most
+256 entries, expiring after 60 seconds. The UI shows lookup time and cache use.
+Node IDs are opaque references; repository names, issue locations, branches and
+credential access can change. The cache is not persisted and is never used for
+comment-grant creation or automatic write authorization, which retain their
+fresh verification. Credential rotation invalidates display access on the next
+lookup or state refresh; results completed under a changed binding are discarded.
+The Inbox uses already-cached targets without making background API calls.
+
 **This is not schema validation.** The broker does not know all GitHub
 types, validate field merges, coerce custom inputs or evaluate directives.
 Fields may be invalid for their declared type. Enum literals and supplied

@@ -329,10 +329,13 @@ function reviewRow(request) {
   const status = reviewStatus(request), pending = !request.status || request.status === "pending";
   const outcome = reviewOutcomeText(request);
   const facts=request.facts;
-  const operation=facts?.operation_name || facts?.fields?.join(", ") || `${request.method} ${request.url}`;
+  const operations=[...(facts?.operations || [])].sort((a,b)=>Number(!!a.read)-Number(!!b.read));
+  const operation=facts?.operation_type==="git_push"?"Publish Git branch":operations.length?operations.filter(operation=>!operation.read || facts.operation_type!=="mutation").map(operation=>`${operation.action} (${operation.field})`).join("; "):facts?.fields?.join(", ") || request.method;
   const target=reviewTarget(facts);
   const description=[facts?.operation_type,...(facts?.fields || []),facts?.more?"More operations/targets in details":"",request.url].filter(Boolean).join(" · ");
-  return `<tr class="review-row"><td class="review-operation" data-label="Operation" title="${esc(description)}">${esc(operation)}</td><td class="review-target" data-label="Target" title="${esc(target.text || 'Repository not identified; inspect request details')}">${target.markup}${facts?.more?" …":""}</td><td class="review-guest" data-label="Guest">${esc(request.container)}</td><td class="review-state" data-label="Status"><span class="request-badge ${status.color}" title="${esc(outcome)}">${esc(status.label)}</span></td><td class="review-time" data-label="Time" title="${pending?'Approval deadline':'Last update'}">${pending?'by ':''}${esc(displayTime(pending?request.expires_at:request.updated_at || request.created_at))}</td><td class="review-action"><button type="button" data-review="${esc(request.id)}">${pending?"Review":"Details"}</button></td></tr>`;
+  const effects=operations.map(operation=>operationSummaryText(operation)).join("; ");
+  const warnings=[...operations.flatMap(operation=>operation.warnings || []),facts?.omitted_operations?`${facts.omitted_operations} additional fields not shown; inspect details`:""].filter(Boolean);
+  return `<tr class="review-row"><td class="review-operation" data-label="Operation" title="${esc(description)}">${esc(operation)}${effects?`<span class="review-effects">${esc(effects)}</span>`:""}${warnings.length?`<span class="review-effects graphql-conditions">${esc(warnings.join("; "))}</span>`:""}${facts?.operation_name&&facts?.operation_type!=="git_push"?`<span class="graphql-client-name">Client name: ${esc(facts.operation_name)}</span>`:""}</td><td class="review-target" data-label="Target" title="${esc(target.text || 'Repository not identified; inspect request details')}">${target.markup}${facts?.more?" …":""}</td><td class="review-guest" data-label="Guest">${esc(request.container)}</td><td class="review-state" data-label="Status"><span class="request-badge ${status.color}" title="${esc(outcome)}">${esc(status.label)}</span></td><td class="review-time" data-label="Time" title="${pending?'Approval deadline':'Last update'}">${pending?'by ':''}${esc(displayTime(pending?request.expires_at:request.updated_at || request.created_at))}</td><td class="review-action"><button type="button" data-review="${esc(request.id)}">${pending?"Review":"Details"}</button></td></tr>`;
 }
 function applyReviewOutcome(summary) {
   if (!activeReview) return;
@@ -401,9 +404,11 @@ async function openRequestReview(id, {historyMode="push"} = {}) {
     const detail = {...await response.json()};
     if (generation !== reviewGeneration) return;
     activeReview = detail;
+    const detailFacts=detail.facts;
     // A detail fetch may finish after a newer SSE decision/response update.
     const current = [...(snapshot.pending_requests || []), ...(snapshot.recent_reviews || [])].find(request=>request.id===id);
     if (current && (current.updated_at || "") >= (detail.updated_at || "")) Object.assign(detail, current);
+    if(detailFacts)detail.facts=detailFacts;
     $("#request-review-title").textContent = `${detail.container} · ${detail.method}`;
     $("#request-review-url").textContent = detail.url;
     $("#request-review-reason").textContent = detail.reason;
@@ -443,7 +448,7 @@ $("#resolve-comment-target").onclick = async () => {
     if (!response.ok) throw new Error(await response.text());
     const detail = await response.json();
     if (generation !== commentPermissionGeneration || activeReview?.id !== reviewed.id) return;
-    activeReview = {...detail}; renderCommentPermissionPanel(activeReview);
+    activeReview = {...detail,graphql:reviewed.graphql}; renderCommentPermissionPanel(activeReview); renderGraphqlReview(activeReview.graphql);
     $("#comment-permission-status").textContent = "Inspect the repository, number and title above. Resolving has not granted anything.";
   } catch (error) {
     if (generation !== commentPermissionGeneration) return;
@@ -520,13 +525,32 @@ function graphqlFieldMarkup(field, largeValues = {}) {
   const targetText = !target ? "" : target.kind === "node_id"
     ? `${target.expected_type} node ID (unverified): ${target.id}. Not an issue/PR number.`
     : `${target.owner}/${target.repository} #${target.number} · ${target.expected_type} (not a verified pin).`;
-  const context = [field.action ? field.field : "", field.response_name !== field.field ? `alias ${field.response_name}` : "", field.parent===null?"":field.path.join(" → ")].filter(Boolean).join(" · ");
-  return `<article class="graphql-field"><h4>${esc(field.action || field.field)}</h4>${context?`<p class="meta">${esc(context)}</p>`:""}${targetText?`<p class="graphql-target">${esc(targetText)}</p>`:""}${conditions.length?`<p class="graphql-conditions"><strong>When this field is included:</strong> ${esc(conditions.join("; "))}</p>`:""}${rows.length?graphqlValuesMarkup(rows):'<p class="meta">No arguments.</p>'}</article>`;
+  const context = [field.response_name !== field.field ? `Client alias: ${field.response_name}` : "", field.parent===null?"":`Client path: ${field.path.join(" → ")}`].filter(Boolean).join(" · ");
+  return `<article class="graphql-field"><h4>${esc(field.field)}${field.action?` · ${esc(field.action)}`:""}</h4>${context?`<p class="graphql-client-name">${esc(context)}</p>`:""}${targetText?`<p class="graphql-target">${esc(targetText)}</p>`:""}${conditions.length?`<p class="graphql-conditions"><strong>When this field is included:</strong> ${esc(conditions.join("; "))}</p>`:""}${rows.length?graphqlValuesMarkup(rows):'<p class="meta">No arguments.</p>'}</article>`;
+}
+
+function operationSummaryText(operation) {
+  return [...(operation.targets || []).map(target=>target.lookup
+    ? `${target.lookup.repository}${target.lookup.number?` #${target.lookup.number}`:""} (${target.input_path})`
+    : `Unresolved ${target.expected_type} (${target.input_path})`),...(operation.effects || []),operation.conditional?"Conditional; inspect conditions":""].filter(Boolean).join(" · ");
+}
+function operationSummaryMarkup(operation, read) {
+  const targets=(operation.targets || []).map(target=>{
+    const lookup=target.lookup;
+    if(!lookup)return `<p class="graphql-summary-warning">Unresolved ${esc(target.expected_type)} · ${esc(target.input_path)}: ${esc(target.error || "not looked up")} <span class="graphql-client-name">${esc(target.id)}</span></p>`;
+    const url=lookup.url, safe=/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/(?:pull|issues)\/[1-9][0-9]*)?$/.test(url);
+    const label=`${lookup.repository}${lookup.number?` #${lookup.number}`:""}`;
+    const branch=lookup.branch;
+    return `<p>${safe?`<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`:esc(label)} <span class="meta">${esc(target.input_path)} · ${esc(lookup.kind)}</span></p>${branch?`<p class="meta">Head: ${esc(branch.head_repository || "repository unavailable")} · ${esc(branch.head)}${branch.head_exists?"":" (ref absent)"} → base ${esc(branch.base)} · ${esc(branch.head_oid)}</p>`:""}<p class="meta">GitHub lookup ${esc(new Date(lookup.fetched_at).toLocaleString())}${lookup.cached?" · cached (up to 60s old)":""}. Display metadata only.</p>`;
+  }).join("");
+  return `<article class="graphql-summary${read?" read":""}"><strong>${esc(operation.action)}</strong> <code>${esc(operation.field)}</code>${targets}${(operation.effects || []).length?`<p>${esc(operation.effects.join(" · "))}</p>`:""}${operation.conditional?'<p class="graphql-summary-warning">Conditional; inspect the field conditions below.</p>':""}${(operation.warnings || []).map(warning=>`<p class="graphql-summary-warning">${esc(warning)}</p>`).join("")}</article>`;
 }
 function renderGraphqlReview(graphql) {
   $("#request-graphql").hidden = !graphql;
   for (const id of ["operation","warning","document","variables"]) $("#request-graphql-"+id).textContent = "";
   $("#request-graphql-fields").innerHTML = "";
+  $("#request-graphql-summary").innerHTML = "";
+  $("#request-graphql-heading").textContent = "";
   $("#request-graphql-effective").innerHTML = "";
   $("#request-graphql-response").textContent = "";
   $("#request-graphql-no-arguments-count").textContent = "";
@@ -538,7 +562,10 @@ function renderGraphqlReview(graphql) {
     return;
   }
   const analysis = graphql.analysis;
-  $("#request-graphql-operation").textContent = `${analysis.operation_type.toUpperCase()} · ${analysis.operation_name || "(anonymous)"} · ${analysis.operation_count} operation(s)`;
+  $("#request-graphql-heading").textContent = analysis.operation_type === "mutation" ? "Selected GitHub mutations" : "Selected GitHub reads";
+  $("#request-graphql-operation").textContent = `${analysis.operation_type.toUpperCase()} · Client name: ${analysis.operation_name || "(anonymous)"} · ${analysis.operation_count} operation(s) in document; only the selected operation executes`;
+  const operations=analysis.operations || analysis.fields.filter(field=>field.parent===null).map((field,index)=>({field_index:index,field:field.field,action:field.action || field.field,warnings:analysis.operation_type==="mutation"?["Mutation summary unavailable; inspect every argument"]:[],targets:[],effects:[],conditional:(field.conditions_text || []).length>0}));
+  $("#request-graphql-summary").innerHTML = [...operations].sort((a,b)=>Number(!!a.read)-Number(!!b.read)).map(operation=>operationSummaryMarkup(operation,operation.read || analysis.operation_type!=="mutation")).join("");
   $("#request-graphql-warning").textContent = (analysis.warnings || []).join("\n");
   $("#request-graphql-document").textContent = analysis.formatted_document;
   $("#request-graphql-variables").textContent = analysis.supplied_variables;

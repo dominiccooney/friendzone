@@ -304,7 +304,7 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     assert.equal(await evaluate("document.querySelector('#request-review-body').children.length"),0);
     assert.equal(await evaluate("document.querySelector('#request-graphql-document').textContent"),detail.graphql.analysis.formatted_document);
     assert.equal(await evaluate("document.querySelector('#request-graphql-fields').querySelectorAll('img').length"),0);
-    assert.match(await evaluate("document.querySelector('#request-graphql-fields').textContent"),/Post comment.*addComment/s);
+    assert.match(await evaluate("document.querySelector('#request-graphql-fields').textContent"),/addComment.*Post comment/s);
     assert.match(await evaluate("document.querySelector('#request-graphql-fields').textContent"),/Not an issue\/PR number/);
     assert.equal(await evaluate("!!window.pwned"),false);
     assert.equal(await evaluate("document.querySelector('#inbox-count').textContent"),"1");
@@ -378,7 +378,9 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
     for(const width of [1058,480]){
       await send('Emulation.setDeviceMetricsOverride',{width,height:1000,deviceScaleFactor:1,mobile:false});
       const layout=await evaluate(`(()=>{const row=document.querySelector('#recent-reviews tbody tr'),visible=n=>{const r=n.getBoundingClientRect();return r.left>=0&&r.right<=innerWidth&&r.width>0},links=[...row.querySelectorAll('.review-target a')].map(link=>({href:link.href,text:link.textContent,target:link.target,rel:link.rel,visible:visible(link)}));return {height:row.getBoundingClientRect().height,text:row.textContent,operation:row.cells[0].textContent,repository:row.cells[1].textContent,paragraphs:row.querySelectorAll('p').length,page:document.documentElement.scrollWidth,scroll:document.querySelector('#recent-reviews .review-table-scroll').scrollWidth,statusVisible:visible(row.querySelector('.request-badge')),actionVisible:visible(row.querySelector('button')),links};})()`);
-      assert.equal(layout.operation,'InspectPullRequest');assert.equal(layout.repository,'cline/cline · #1234');assert.deepEqual(layout.links.map(link=>[link.href,link.text]),[['https://github.com/cline/cline','cline/cline'],['https://github.com/cline/cline/pull/1234','#1234']]);assert.ok(layout.links.every(link=>link.target==='_blank'&&link.rel.includes('noopener')&&link.visible));assert.equal(layout.paragraphs,0);assert.ok(width>700?layout.height<50:layout.height<110);assert.match(layout.text,/HTTP 499/);assert.doesNotMatch(layout.text,/Response received|HTTP error/);assert.ok(layout.page<=width+1);assert.equal(layout.statusVisible,true);assert.equal(layout.actionVisible,true);
+      assert.equal(layout.operation,'repositoryClient name: InspectPullRequest');assert.equal(layout.repository,'cline/cline · #1234');assert.deepEqual(layout.links.map(link=>[link.href,link.text]),[['https://github.com/cline/cline','cline/cline'],['https://github.com/cline/cline/pull/1234','#1234']]);assert.ok(layout.links.every(link=>link.target==='_blank'&&link.rel.includes('noopener')&&link.visible));assert.equal(layout.paragraphs,0);
+      // The client name occupies a separate, smaller line below the real field.
+      assert.ok(width>700?layout.height<65:layout.height<135,JSON.stringify(layout));assert.match(layout.text,/HTTP 499/);assert.doesNotMatch(layout.text,/Response received|HTTP error/);assert.ok(layout.page<=width+1);assert.equal(layout.statusVisible,true);assert.equal(layout.actionVisible,true);
       assert.equal(await evaluate("(() => {const cell=document.querySelector('#recent-reviews tbody tr').lastElementChild;return cell.querySelector('button').getBoundingClientRect().right<=cell.getBoundingClientRect().right;})()"),true,'action must fit inside its cell');
       if(process.env.FZ_SCREENSHOT_DIR){const shot=await send('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(process.env.FZ_SCREENSHOT_DIR,`request-table-${width}.png`),Buffer.from(shot.data,'base64'));}
     }
@@ -397,6 +399,22 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
       assert.equal(await evaluate("document.querySelector('#request-graphql-effective').checkVisibility()"),true);
       assert.equal(await evaluate("document.querySelector('#request-review-actions').hidden"),false);
       if(process.env.FZ_SCREENSHOT_DIR){const shot=await send('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});fs.writeFileSync(path.join(process.env.FZ_SCREENSHOT_DIR,`approval-values-${width}.png`),Buffer.from(shot.data,'base64'));}
+    }
+    const approvalLookup={node_id:"pr",kind:"PullRequest",repository_id:"repo",repository:"cline/cline",number:482,url:"https://github.com/cline/cline/pull/482",fetched_at:"2026-09-30T00:00:00Z",cached:true,branch:{base:"main",head:"feature",head_oid:"a".repeat(40),head_repository:"fork/cline",head_exists:false}};
+    const summaryGraph={status:"parsed",analysis:{...draft.graphql.analysis,operation_name:"AddPostMergeReviewComment",operations:[
+      {field_index:0,field:"addPullRequestReview",action:"APPROVE",effects:["body supplied"],warnings:[],targets:[{id:"pr",expected_type:"PullRequest",input_path:"input.pullRequestId",lookup:approvalLookup}],read:false},
+      {field_index:1,field:"deleteUnknown",action:"deleteUnknown",effects:[],warnings:["Mutation not summarized; inspect every argument"],targets:[],read:false},
+      {field_index:2,field:"comments",action:"READ comments",effects:["Arguments: first"],warnings:[],targets:[],read:true},
+    ]}};
+    await evaluate(`renderGraphqlReview(${JSON.stringify(summaryGraph)});document.querySelector('#request-review').hidden=false;document.querySelector('#request-raw').open=false`);
+    for(const width of [1058,480]) {
+      await send("Emulation.setDeviceMetricsOverride",{width,height:1000,deviceScaleFactor:1,mobile:false});
+      await evaluate("document.querySelector('#request-graphql').scrollIntoView({block:'start'})");
+      const summary=await evaluate(`(() => {const root=document.querySelector('#request-graphql-summary'),primary=root.querySelector('strong'),name=document.querySelector('#request-graphql-operation'),read=root.querySelector('.read');return {text:root.textContent,url:root.querySelector('a').href,nameSize:parseFloat(getComputedStyle(name).fontSize),primarySize:parseFloat(getComputedStyle(primary).fontSize),nameColor:getComputedStyle(name).color,primaryColor:getComputedStyle(primary).color,readSize:parseFloat(getComputedStyle(read).fontSize),overflow:document.documentElement.scrollWidth>innerWidth+1};})()`);
+      assert.match(summary.text,/APPROVE.*cline\/cline #482.*Mutation not summarized.*READ comments/s);
+      assert.equal(summary.url,'https://github.com/cline/cline/pull/482');assert.equal(summary.overflow,false);
+      assert.ok(summary.nameSize<summary.primarySize);assert.notEqual(summary.nameColor,summary.primaryColor);assert.ok(summary.readSize<summary.primarySize);
+      if(process.env.FZ_SCREENSHOT_DIR){const shot=await send('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(process.env.FZ_SCREENSHOT_DIR,`graphql-summary-${width}.png`),Buffer.from(shot.data,'base64'));}
     }
     assert.deepEqual(errors, []);
   } finally {
