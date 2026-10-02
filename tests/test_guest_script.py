@@ -23,6 +23,12 @@ GIT_CONFIG = '''# Friendzone managed Git configuration v1
 \thelper =
 \thelper = "!fz_github_credential() { test \\"$1\\" = get || exit 0; protocol=; host=; while IFS= read -r line; do case \\"$line\\" in protocol=*) protocol=${line#protocol=} ;; host=*) host=${line#host=} ;; esac; done; test \\"$protocol\\" = https && test \\"$host\\" = github.com && test -n \\"$GITHUB_TOKEN\\" || exit 0; printf \\"%s\\\\n\\" \\"username=x-access-token\\" \\"password=$GITHUB_TOKEN\\"; }; fz_github_credential"
 '''
+GIT_CONFIG += '''[http "https://github.com"]
+\tproxy = "http://192.0.2.1:9080"
+'''
+INFRASTRUCTURE = json.loads((SOURCE.parents[1] / "infrastructure.json").read_text(encoding="utf-8"))
+INFRASTRUCTURE_NO_PROXY = INFRASTRUCTURE["hosts"] + [entry for address in INFRASTRUCTURE["addresses"]
+    for entry in ([address, "[" + address + "]"] if ":" in address else [address])] + INFRASTRUCTURE["ranges"]
 spec = importlib.util.spec_from_file_location("configure", SOURCE)
 configure = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(configure)
@@ -36,7 +42,8 @@ class GuestScriptTests(unittest.TestCase):
         self.config = self.home / "config"
         self.data = dict(broker="http://192.0.2.1:9082", container="guest", proxy_port=9080,
                          plugin=base64.b64encode((SOURCE.parents[1] / "plugin/friendzone.js").read_bytes()).decode(),
-                         ca=TEST_CA, git_credential_config=GIT_CONFIG,
+                         ca=TEST_CA, git_credential_config=GIT_CONFIG, infrastructure_no_proxy=INFRASTRUCTURE_NO_PROXY,
+                         proxy_hosts=["api.cline.bot", "api.github.com", "github.com"],
                          fakes={"CLINE_API_KEY": "fake'$(bad)", "OTHER_KEY": "other", "GITHUB_TOKEN": "fz-test-github-token"})
 
     def apply(self, env=None):
@@ -149,6 +156,8 @@ class GuestScriptTests(unittest.TestCase):
 test "$GIT_CONFIG_COUNT" = 1
 test "$GIT_CONFIG_KEY_0" = include.path
 test "$GIT_CONFIG_VALUE_0" = "$2"
+test "$(git config --get-urlmatch http.proxy https://github.com/owner/repo)" = http://192.0.2.1:9080
+test -z "$(git config --get-urlmatch http.proxy https://unconfigured.example/owner/repo || true)"
 github=$(printf 'protocol=https\nhost=github.com\n\n' | GIT_TERMINAL_PROMPT=0 git credential fill)
 case "$github" in *'username=x-access-token'*'password=fz-test-github-token'*) ;; *) exit 10;; esac
 for input in 'protocol=http\nhost=github.com\n\n' 'protocol=https\nhost=github.com.evil.test\n\n' 'protocol=https\nhost=api.github.com\n\n'; do
@@ -277,8 +286,9 @@ case "$output" in *fz-test-github-token*|*username=x-access-token*) exit 12;; es
         env = dict(os.environ, HOME=str(self.home), NO_PROXY="existing.test", no_proxy="existing.test,second.test")
         env.pop("BASH_ENV", None)
         env.pop("ENV", None)
-        command = '. "$1"; . "$1"; test "$NO_PROXY" = "192.0.2.1,localhost,127.0.0.1,::1,[::1],existing.test,second.test"; bash --noprofile --norc -c \'test "$PREVIOUS_HOOK" = preserved && test "$HTTP_PROXY" = http://192.0.2.1:9080\''
-        result = subprocess.run([bash, "--noprofile", "--norc", "-ec", command, "test", str(activation)], env=env, capture_output=True, timeout=10)
+        expected = ",".join(["192.0.2.1", "localhost", "127.0.0.1", "::1", "[::1]"] + INFRASTRUCTURE_NO_PROXY + ["existing.test", "second.test"])
+        command = '. "$1"; . "$1"; test "$NO_PROXY" = "$2"; test "$no_proxy" = "$2"; bash --noprofile --norc -c \'test "$PREVIOUS_HOOK" = preserved && test "$FZ_PROXY" = http://192.0.2.1:9080 && test "${HTTP_PROXY-}" != http://192.0.2.1:9080\''
+        result = subprocess.run([bash, "--noprofile", "--norc", "-ec", command, "test", str(activation), expected], env=env, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr.decode())
 
     def test_manual_hook_is_replaced_and_conflicting_hook_fails(self):
@@ -292,6 +302,27 @@ case "$output" in *fz-test-github-token*|*username=x-access-token*) exit 12;; es
         profile.write_text(configure.MARKER + "\n. /elsewhere\n")
         with self.assertRaises(ValueError):
             self.apply()
+
+    def test_direct_defaults_retire_owned_proxy_and_compatibility_is_explicit(self):
+        self.config.mkdir()
+        old = "http://old-broker:8080"
+        (self.config / "friendzone-env.sh").write_text("# Friendzone guest environment\nexport HTTP_PROXY=" + old + "\nexport http_proxy=" + old + "\n")
+        activation = self.apply()
+        self.apply()
+        bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "/bin/bash"
+        command = r'''. "$1"
+test -z "${HTTP_PROXY-}" && test -z "${http_proxy-}"
+test "$HTTPS_PROXY" = http://external-proxy:8080
+test "$FZ_PROXY_HOSTS" = api.cline.bot,api.github.com,github.com
+test "$FZ_PAC_URL" = http://192.0.2.1:9082/bootstrap/proxy.pac
+. "$2"
+test "$HTTP_PROXY" = "$FZ_PROXY" && test "$https_proxy" = "$FZ_PROXY"
+"$3" --noprofile --norc -c 'test "$HTTP_PROXY" = "$FZ_PROXY"'
+. "$1"
+test -z "${HTTP_PROXY-}" && test -z "${HTTPS_PROXY-}"'''
+        result = subprocess.run([bash,"--noprofile","--norc","-ec",command,"test",str(activation),str(self.config / "friendzone-proxy-env.sh"),bash],
+            env=dict(os.environ, HTTP_PROXY=old, http_proxy=old, HTTPS_PROXY="http://external-proxy:8080"), capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
 
     def test_previous_binary_installation_hook_migrates_in_place(self):
         activation = self.config / "activate.sh"

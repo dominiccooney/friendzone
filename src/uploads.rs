@@ -154,14 +154,14 @@ impl Credential {
             entry.fake == fake
                 && !fake.is_empty()
                 && entry.header == "authorization"
-                && entry.hosts.iter().any(|pinned| pinned == host)
+                && entry.hosts.iter().any(|pinned| crate::settings::host_matches(pinned, host))
         });
         let entry = matches.next().with_context(|| format!("No matching host credential pinned to {host}. Configure it in host Settings > Credentials; never put a real token in the guest."))?;
         if matches.next().is_some() {
             bail!("ambiguous upload credential");
         }
         if destination == Destination::Github
-            && !entry.hosts.iter().any(|host| host == "api.github.com")
+            && !entry.hosts.iter().any(|host| crate::settings::host_matches(host, "api.github.com"))
         {
             bail!(
                 "GitHub upload credential must also pin api.github.com for the repository lookup"

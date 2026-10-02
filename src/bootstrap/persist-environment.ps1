@@ -229,8 +229,8 @@ function Undo-FzSystemProxyTransaction($Transaction) {
     }elseif([bool]$Transaction.backupBefore.exists){Write-Warning 'Windows proxy backup disappeared; not recreating it during rollback'}
     if($changed){Notify-FzInternetSettings}
 }
-function Invoke-FzSystemProxy([string]$ProxyHost, [int]$ProxyPort, [string]$BackupFile, [bool]$Undo) {
-    $names=@('ProxyEnable','ProxyServer','ProxyOverride')
+function Invoke-FzSystemProxy([string]$PacUrl, [string]$BackupFile, [bool]$Undo) {
+    $names=@('ProxyEnable','ProxyServer','ProxyOverride','AutoConfigURL')
     if($Undo){
         if(-not (Test-Path -LiteralPath $BackupFile)){return}
         $saved=Get-Content -Raw -Encoding UTF8 -LiteralPath $BackupFile | ConvertFrom-Json
@@ -245,21 +245,15 @@ function Invoke-FzSystemProxy([string]$ProxyHost, [int]$ProxyPort, [string]$Back
         if($changed){Notify-FzInternetSettings}
         return
     }
-    $bareHost=$ProxyHost.Trim('[',']')
-    if([string]::IsNullOrWhiteSpace($ProxyHost) -or $ProxyHost -cne $ProxyHost.Trim() -or $ProxyHost.IndexOfAny(@([char]';',[char]'=',[char]'/',[char]'\',[char]'@',[char]'?',[char]'#',[char]0)) -ge 0 -or [Uri]::CheckHostName($bareHost) -eq [UriHostNameType]::Unknown -or $ProxyPort -lt 1 -or $ProxyPort -gt 65535){throw 'Invalid Friendzone Windows proxy address'}
-    $hostForAuthority=if($bareHost.Contains(':')){"[$bareHost]"}else{$bareHost}
-    $authority=$hostForAuthority+':'+$ProxyPort
-    $currentOverride=Get-FzInternetSetting 'ProxyOverride'
-    if([bool]$currentOverride.exists -and [string]$currentOverride.kind -notin @('String','ExpandString')){throw 'Existing Windows proxy bypass has an unsupported registry type; no proxy settings changed'}
-    $overrideItems=if([bool]$currentOverride.exists){@(([string]$currentOverride.value).Split(';'))}else{@()}
-    $seen=@{};$merged=@()
-    foreach($item in @($overrideItems)+@($bareHost,$hostForAuthority,'localhost','127.0.0.1','::1','[::1]')){
-        $item=$item.Trim();if(-not $item){continue};$key=$item.ToLowerInvariant();if(-not $seen.ContainsKey($key)){$seen[$key]=$true;$merged+=$item}
-    }
+    $pac=[Uri]$PacUrl
+    # PAC and manual modes share the same ownership record. Old v1 records
+    # without AutoConfigURL remain readable during static-to-PAC migration.
+    if($pac.Scheme -notin @('http','https') -or [string]::IsNullOrEmpty($pac.Host) -or -not[string]::IsNullOrEmpty($pac.UserInfo) -or $pac.AbsolutePath -cne '/bootstrap/proxy.pac' -or -not[string]::IsNullOrEmpty($pac.Query) -or -not[string]::IsNullOrEmpty($pac.Fragment)){throw 'Invalid Friendzone PAC URL; no proxy settings changed'}
     $applied=@{
-        ProxyEnable=@{exists=$true;kind='DWord';value=1}
-        ProxyServer=@{exists=$true;kind='String';value=('http='+$authority+';https='+$authority)}
-        ProxyOverride=@{exists=$true;kind='String';value=($merged -join ';')}
+        ProxyEnable=@{exists=$true;kind='DWord';value=0}
+        ProxyServer=@{exists=$false;kind=$null;value=$null}
+        ProxyOverride=@{exists=$false;kind=$null;value=$null}
+        AutoConfigURL=@{exists=$true;kind='String';value=$PacUrl}
     }
     $before=@{};foreach($name in $names){$before[$name]=Get-FzInternetSetting $name}
     $backupBefore=@{exists=(Test-Path -LiteralPath $BackupFile);base64=$null}
@@ -316,6 +310,11 @@ function Invoke-FzUserEnvironment($Values, [string]$BackupFile, [bool]$Undo) {
         if ($name -cnotmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw "Invalid environment variable name" }
         $planned[$name] = [string]$property.Value
     }
+    # Retire only proxy variables owned by a previous Friendzone setup. Null
+    # values remain in recovery metadata, so rollback restores the original.
+    foreach($name in @('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY')){
+        if($backup.ContainsKey($name) -and -not $planned.ContainsKey($name) -and (Get-FzUserValue $name) -ceq $backup[$name].applied){$planned[$name]=$null}
+    }
     # Windows names are case-insensitive. Only one user value is written.
     $planned['NO_PROXY'] = @((($planned['NO_PROXY'] + ',' + (Get-FzUserValue 'NO_PROXY') + ',' + $env:NO_PROXY).Split(',')) | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique) -join ','
     $before = @{}
@@ -343,15 +342,13 @@ function Invoke-FzWindowsPersistence($Values, [string]$EnvironmentBackupFile, [s
     if($Undo){
         $firstError=$null
         try{Invoke-FzCertificateTrust $null $CertificateTrustStateFile $true}catch{$firstError=$_}
-        try{Invoke-FzSystemProxy $null 0 $SystemProxyBackupFile $true}catch{if($null -eq $firstError){$firstError=$_}}
+        try{Invoke-FzSystemProxy $null $SystemProxyBackupFile $true}catch{if($null -eq $firstError){$firstError=$_}}
         try{Invoke-FzUserEnvironment $null $EnvironmentBackupFile $true}catch{if($null -eq $firstError){$firstError=$_}}
         if($null -ne $firstError){throw $firstError}
         return
     }
-    $proxy=[Uri]$Values.HTTP_PROXY
-    if($proxy.Scheme -cne 'http' -or -not [string]::IsNullOrEmpty($proxy.UserInfo) -or $proxy.AbsolutePath -cne '/' -or -not [string]::IsNullOrEmpty($proxy.Query) -or -not [string]::IsNullOrEmpty($proxy.Fragment)){throw 'Invalid managed HTTP_PROXY; no persistent settings changed'}
     $certificateTransaction=Invoke-FzCertificateTrust $CertificatePath $CertificateTrustStateFile $false
-    try{$systemTransaction=Invoke-FzSystemProxy $proxy.DnsSafeHost $proxy.Port $SystemProxyBackupFile $false}catch{Undo-FzCertificateTrustTransaction $certificateTransaction;throw}
+    try{$systemTransaction=Invoke-FzSystemProxy ([string]$Values.FZ_PAC_URL) $SystemProxyBackupFile $false}catch{Undo-FzCertificateTrustTransaction $certificateTransaction;throw}
     try{Invoke-FzUserEnvironment $Values $EnvironmentBackupFile $false}catch{
         $failure=$_;$rollbackError=$null
         try{Undo-FzSystemProxyTransaction $systemTransaction}catch{$rollbackError=$_}

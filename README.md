@@ -44,7 +44,25 @@ set for guest loopback and restart old guest processes to stop those requests
 reaching the proxy at all. This is not a DNS-rebinding or general LAN guard;
 see the network isolation guide for the remaining limitations.
 
+GCE metadata and link-local infrastructure must also stay on the guest's own
+instance. Setup adds bypasses for `metadata`, `metadata.google.internal`,
+`169.254.169.254`, `fd20:ce::254` (bare and bracketed), `169.254.0.0/16`, and
+`fe80::/10`. The proxy independently returns **403** for these destinations,
+including HTTP, CONNECT, normalized numeric aliases, and IPv4-in-IPv6 forms,
+on every port. The bootstrap exception never permits infrastructure access.
+This prevents a guest metadata request from returning the broker instance's
+identity. Restart the broker to load the policy; rerun guest setup, activate
+the environment, and restart guest processes to load the bypasses. See the
+network isolation guide for client compatibility and DNS limitations.
+
 ## Containers
+
+Guest setup uses selective routing: Windows receives a live PAC URL and Git
+receives URL-scoped proxy settings from configured escrow hosts. Other hosts
+go direct. Setup does not install global HTTP_PROXY/HTTPS_PROXY; Cline CLI,
+curl, and other non-PAC clients need explicit proxy settings or the generated
+compatibility profile when using escrow. See [guest routing](GUEST-BOOTSTRAP.md#selective-routing).
+Direct networking is not governed by Friendzone's Kill or request policies.
 
 Containers are dynamic. Setup supplies a human-readable guest name, while
 runtime proxy, MCP, and async-job traffic is identified by its unique explicit
@@ -574,8 +592,16 @@ correctly block that direct WebSocket connection. Both need the guest's Cline
 API access set to Full; in Basic mode the cloud-session list is empty and the
 Hub upgrade is denied.
 
+Non-PAC Cline clients must be launched with the explicit compatibility profile
+described in the guest guide; normal direct-by-default activation is not enough
+to use their fake credentials.
+
 The environment includes `FZ_HOST`, `FZ_BROKER`, and both `NO_PROXY`/`no_proxy`
-with the broker host plus `localhost`, `127.0.0.1`, `::1`, and `[::1]`.
+with the broker host, loopback addresses, and the GCE metadata/link-local
+exclusions listed above.
+`FZ_PROXY` names the explicit proxy; `FZ_PAC_URL` names the live selective PAC;
+`FZ_PROXY_HOSTS` records the setup-time escrow host snapshot. These do not
+implicitly configure standard environment-only HTTP clients.
 Existing exclusions from both cases are merged without duplicates. This
 keeps guest Cline hub requests on guest loopback instead of sending them to
 the host proxy. `GIT_SSL_CAINFO` and other runtime CA variables are included.

@@ -14,9 +14,10 @@ $script:fakeInternet = @{
     ProxyEnable = @{exists=$true;kind='DWord';value=0}
     ProxyServer = @{exists=$true;kind='ExpandString';value='%OLD_PROXY%:8123'}
     ProxyOverride = @{exists=$true;kind='String';value='existing.test;<local>'}
+    AutoConfigURL = @{exists=$true;kind='ExpandString';value='http://old-proxy/proxy.pac'}
 }
 $script:internetWrites=@();$script:internetNotifications=0
-function Get-FzInternetSetting([string]$Name) { Copy-FzTestSetting $script:fakeInternet[$Name] }
+function Get-FzInternetSetting([string]$Name) { if($script:fakeInternet.ContainsKey($Name)){Copy-FzTestSetting $script:fakeInternet[$Name]}else{@{exists=$false;kind=$null;value=$null}} }
 function Set-FzInternetSetting([string]$Name, $Setting) {$script:internetWrites+=$Name;$script:fakeInternet[$Name]=Copy-FzTestSetting $Setting}
 function Notify-FzInternetSettings {$script:internetNotifications++}
 $script:fakeRoots=@{}
@@ -24,27 +25,29 @@ function Get-FzTrustedCertificate([string]$Thumbprint){if($script:fakeRoots.Cont
 function Add-FzTrustedCertificate([string]$Der){$certificate=New-Object Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList (,[Convert]::FromBase64String($Der));try{$script:fakeRoots[$certificate.Thumbprint.ToUpperInvariant()]=$Der}finally{$certificate.Dispose()}}
 function Remove-FzTrustedCertificate([string]$Thumbprint,[string]$ExpectedDer){if($script:fakeRoots.ContainsKey($Thumbprint)-and $script:fakeRoots[$Thumbprint]-cne$ExpectedDer){throw 'mock root changed'};$script:fakeRoots.Remove($Thumbprint)}
 $systemBackup=Join-Path $TemporaryDirectory 'system-proxy-backup.json'
-$transaction=Invoke-FzSystemProxy '192.0.2.1' 8080 $systemBackup $false
-if($script:fakeInternet.ProxyEnable.kind -cne 'DWord' -or $script:fakeInternet.ProxyEnable.value -ne 1){throw 'system proxy was not enabled as DWORD'}
-if($script:fakeInternet.ProxyServer.value -cne 'http=192.0.2.1:8080;https=192.0.2.1:8080'){throw 'wrong credential-free system proxy mapping'}
-foreach($bypass in @('existing.test','<local>','192.0.2.1','localhost','127.0.0.1','::1','[::1]')){if(-not @($script:fakeInternet.ProxyOverride.value.Split(';')).Contains($bypass)){throw "system proxy bypass missing $bypass"}}
+$pacUrl='http://192.0.2.1:8082/bootstrap/proxy.pac'
+$transaction=Invoke-FzSystemProxy $pacUrl $systemBackup $false
+if($script:fakeInternet.ProxyEnable.kind -cne 'DWord' -or $script:fakeInternet.ProxyEnable.value -ne 0){throw 'manual system proxy was not disabled'}
+if($script:fakeInternet.ProxyServer.exists -or $script:fakeInternet.ProxyOverride.exists){throw 'static proxy survived PAC setup'}
+if($script:fakeInternet.AutoConfigURL.value-cne$pacUrl){throw 'wrong PAC URL'}
 $savedSystem=Get-Content -Raw -Encoding UTF8 -LiteralPath $systemBackup|ConvertFrom-Json
 if($savedSystem.settings.ProxyServer.previous.kind -cne 'ExpandString' -or $savedSystem.settings.ProxyServer.previous.value -cne '%OLD_PROXY%:8123'){throw 'typed original proxy was not preserved'}
 $beforeSystemWrites=$script:internetWrites.Count;$beforeNotifications=$script:internetNotifications
-$null=Invoke-FzSystemProxy '192.0.2.1' 8080 $systemBackup $false
+$null=Invoke-FzSystemProxy $pacUrl $systemBackup $false
 if($script:internetWrites.Count -ne $beforeSystemWrites -or $script:internetNotifications -ne $beforeNotifications){throw 'system proxy rerun was not idempotent'}
 $script:fakeInternet.ProxyServer=@{exists=$true;kind='String';value='externally-edited:9000'}
-Invoke-FzSystemProxy $null 0 $systemBackup $true
+Invoke-FzSystemProxy $null $systemBackup $true
 if($script:fakeInternet.ProxyServer.value -cne 'externally-edited:9000'){throw 'external system proxy edit was overwritten'}
 if($script:fakeInternet.ProxyEnable.value -ne 0 -or $script:fakeInternet.ProxyOverride.value -cne 'existing.test;<local>'){throw 'owned system proxy values were not restored'}
+if($script:fakeInternet.AutoConfigURL.kind-cne'ExpandString'-or$script:fakeInternet.AutoConfigURL.value-cne'http://old-proxy/proxy.pac'){throw 'original PAC was not restored with its registry type'}
 
 # A failed registry write restores completed writes and the pre-transaction backup.
-$script:fakeInternet=@{ProxyEnable=@{exists=$true;kind='DWord';value=0};ProxyServer=@{exists=$false;kind=$null;value=$null};ProxyOverride=@{exists=$false;kind=$null;value=$null}}
+$script:fakeInternet=@{ProxyEnable=@{exists=$true;kind='DWord';value=1};ProxyServer=@{exists=$true;kind='String';value='old:8000'};ProxyOverride=@{exists=$false;kind=$null;value=$null}}
 $failureBackup=Join-Path $TemporaryDirectory 'failed-system-proxy.json'
 $script:systemSetCalls=0
 function Set-FzInternetSetting([string]$Name, $Setting){$script:systemSetCalls++;if($script:systemSetCalls -eq 2){throw 'simulated system proxy failure'};$script:fakeInternet[$Name]=Copy-FzTestSetting $Setting}
-try{Invoke-FzSystemProxy '192.0.2.1' 8080 $failureBackup $false;throw 'expected system proxy failure'}catch{if($_.Exception.Message -eq 'expected system proxy failure'){throw}}
-if($script:fakeInternet.ProxyEnable.value -ne 0 -or (Test-Path -LiteralPath $failureBackup)){throw 'partial system proxy transaction was not rolled back'}
+try{Invoke-FzSystemProxy $pacUrl $failureBackup $false;throw 'expected system proxy failure'}catch{if($_.Exception.Message -eq 'expected system proxy failure'){throw}}
+if($script:fakeInternet.ProxyEnable.value -ne 1 -or $script:fakeInternet.ProxyServer.value-cne'old:8000' -or (Test-Path -LiteralPath $failureBackup)){throw 'partial system proxy transaction was not rolled back'}
 
 # Environment failure after successful system-proxy writes rolls both stores back.
 $script:fakeInternet=@{ProxyEnable=@{exists=$true;kind='DWord';value=0};ProxyServer=@{exists=$true;kind='String';value='old:8000'};ProxyOverride=@{exists=$true;kind='String';value='existing.test'}}
@@ -56,7 +59,7 @@ $compositeCertificate=Join-Path $TemporaryDirectory 'composite-ca.pem'
 function Read-FzCertificateIdentity([string]$Path){@{thumbprint=('A'*40);der='ZmFrZQ=='}}
 function Set-FzInternetSetting([string]$Name, $Setting){$script:fakeInternet[$Name]=Copy-FzTestSetting $Setting}
 function Set-FzUserValue([string]$Name, $Value){throw 'simulated environment failure'}
-$compositeValues=[pscustomobject]@{HTTP_PROXY='http://192.0.2.1:8080';NO_PROXY='192.0.2.1'}
+$compositeValues=[pscustomobject]@{FZ_PAC_URL=$pacUrl;NO_PROXY='192.0.2.1'}
 try{Invoke-FzWindowsPersistence $compositeValues $compositeEnvironmentBackup $compositeSystemBackup $compositeCertificate $compositeTrustState $false;throw 'expected composite failure'}catch{if($_.Exception.Message -eq 'expected composite failure'){throw}}
 if($script:fakeInternet.ProxyEnable.value -ne 0 -or $script:fakeInternet.ProxyServer.value -cne 'old:8000' -or $script:fakeInternet.ProxyOverride.value -cne 'existing.test'){throw 'system proxy survived failed environment transaction'}
 if($script:fakeRoots.Count -or (Test-Path -LiteralPath $compositeTrustState) -or (Test-Path -LiteralPath $compositeSystemBackup) -or (Test-Path -LiteralPath $compositeEnvironmentBackup)){throw 'failed composite transaction retained trust or recovery metadata'}
@@ -72,6 +75,12 @@ if ($script:writes.Count -ne $before) { throw 'rerun wrote unchanged values' }
 $script:fakeUser.CLINE_API_KEY = 'external-edit'
 Invoke-FzUserEnvironment $null $backup $true
 if ($script:fakeUser.HTTP_PROXY -cne 'previous-proxy') { throw 'original proxy not restored' }
+Invoke-FzUserEnvironment ([pscustomobject]@{HTTP_PROXY=$values.HTTP_PROXY;NO_PROXY='localhost'}) $backup $false
+Invoke-FzUserEnvironment ([pscustomobject]@{FZ_PAC_URL=$pacUrl;NO_PROXY='localhost'}) $backup $false
+if($null-ne(Get-FzUserValue 'HTTP_PROXY')){throw 'owned global proxy survived selective migration'}
+Invoke-FzUserEnvironment ([pscustomobject]@{FZ_PAC_URL=$pacUrl;NO_PROXY='localhost'}) $backup $false
+Invoke-FzUserEnvironment $null $backup $true
+if((Get-FzUserValue 'HTTP_PROXY')-cne'previous-proxy'){throw 'selective migration lost original environment for rollback'}
 if ($script:fakeUser.CLINE_API_KEY -cne 'external-edit') { throw 'external edit overwritten by rollback' }
 if ($script:fakeUser.NO_PROXY -cne 'existing.example') { throw 'original exclusion not restored' }
 $before = $script:writes.Count
@@ -118,7 +127,7 @@ function Invoke-FzRegistrationRequest([string]$Url){[pscustomobject]@{status=200
 try{Invoke-FzGuestRegistration $registrationData;throw 'expected invalid canonical name'}catch{if($_.Exception.Message-eq'expected invalid canonical name'){throw};if(-not$_.Exception.Message.Contains('did not identify a valid guest')){throw 'invalid canonical guest error was not actionable'}}
 function Get-FzUserValue([string]$Name) { $script:fakeUser[$Name] }
 function Set-FzUserValue([string]$Name, $Value) { $script:fakeUser[$Name]=$Value }
-function Get-FzInternetSetting([string]$Name) { Copy-FzTestSetting $script:fakeInternet[$Name] }
+function Get-FzInternetSetting([string]$Name) { if($script:fakeInternet.ContainsKey($Name)){Copy-FzTestSetting $script:fakeInternet[$Name]}else{@{exists=$false;kind=$null;value=$null}} }
 function Set-FzInternetSetting([string]$Name, $Setting) {$script:internetWrites+=$Name;$script:fakeInternet[$Name]=Copy-FzTestSetting $Setting}
 function Notify-FzInternetSettings {$script:internetNotifications++}
 $script:fakeInternet=@{ProxyEnable=@{exists=$true;kind='DWord';value=0};ProxyServer=@{exists=$true;kind='String';value='old:8000'};ProxyOverride=@{exists=$true;kind='String';value='existing.test'}}
@@ -139,6 +148,8 @@ $payloadMatch=[regex]::Match($bootstrapText, '\$data=\[Text.Encoding\]::UTF8.Get
 if(-not $payloadMatch.Success){throw 'Could not find generated bootstrap payload'}
 $payload=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payloadMatch.Groups[1].Value)) | ConvertFrom-Json
 $data | Add-Member -NotePropertyName plugin -NotePropertyValue $payload.plugin
+$data | Add-Member -NotePropertyName infrastructure_no_proxy -NotePropertyValue $payload.infrastructure_no_proxy
+$data | Add-Member -NotePropertyName proxy_hosts -NotePropertyValue $payload.proxy_hosts
 $data.ca=[string]$payload.ca
 if($payload.cline_oauth -ne $true){throw 'bootstrap payload for a connected Cline session must advertise cline_oauth'}
 $data | Add-Member -NotePropertyName git_credential_config -NotePropertyValue ([string]$payload.git_credential_config)
@@ -155,6 +166,12 @@ $otherPlugin=Join-Path $homeDir '.cline/plugins/other.js'
 Write-FzFile $otherPlugin '// unrelated plugin'
 $EnvironmentFile=Invoke-FzConfigure $data $homeDir $configDir
 $EnvironmentFile=Invoke-FzConfigure $data $homeDir $configDir
+foreach($bypass in @('metadata','metadata.google.internal','169.254.169.254','fd20:ce::254','[fd20:ce::254]','169.254.0.0/16','fe80::/10')){
+    if(-not @($script:fakeUser.NO_PROXY.Split(',')).Contains($bypass)){throw "persistent GCE exclusion missing $bypass"}
+}
+if($script:fakeInternet.AutoConfigURL.value-cne$data.broker+'/bootstrap/proxy.pac'){throw 'generated installer PAC URL is wrong'}
+if($script:fakeUser.FZ_PROXY-cne'http://192.0.2.1:9080'){throw 'explicit proxy address missing'}
+if((Get-Content -Raw -LiteralPath (Join-Path $configDir 'user-environment.json')) -match '"HTTPS?_PROXY"'){throw 'default setup installed global proxy environment'}
 $caIdentity=Read-FzCertificateIdentity (Join-Path $configDir 'friendzone-ca.pem')
 if($script:fakeRoots.Count-ne 1 -or -not $script:fakeRoots.ContainsKey($caIdentity.thumbprint) -or $script:fakeRoots[$caIdentity.thumbprint]-cne$caIdentity.der){throw 'generated installer did not trust the exact Friendzone CA'}
 if(-not (Test-Path -LiteralPath (Join-Path $configDir 'certificate-trust-state.json'))){throw 'generated installer did not persist CA ownership state'}
@@ -184,8 +201,7 @@ Invoke-FzCertificateTrust $null $trustState $true
 if($script:fakeRoots.ContainsKey($caIdentity.thumbprint)-or(Test-Path -LiteralPath $trustState)){throw 'owned Friendzone root or ownership state survived uninstall'}
 $null=Invoke-FzCertificateTrust (Join-Path $configDir 'friendzone-ca.pem') $trustState $false
 if(-not $script:fakeRoots.ContainsKey($caIdentity.thumbprint)){throw 'Friendzone CA could not be reinstalled after uninstall'}
-if($script:fakeInternet.ProxyEnable.value -ne 1 -or $script:fakeInternet.ProxyServer.value -cne 'http=192.0.2.1:9080;https=192.0.2.1:9080'){throw 'generated installer did not configure the current-user system proxy'}
-if(@($script:fakeInternet.ProxyOverride.value.Split(';')).Contains('<local>')){throw 'generated installer introduced a broad local-host bypass'}
+if($script:fakeInternet.ProxyEnable.value -ne 0 -or $script:fakeInternet.ProxyServer.exists){throw 'generated installer retained static system proxy'}
 if(-not (Test-Path -LiteralPath (Join-Path $configDir 'system-proxy-backup.json'))){throw 'generated installer did not persist system proxy recovery metadata'}
 $plugin=Join-Path $homeDir '.cline/plugins/friendzone.js'
 if([Convert]::ToBase64String([IO.File]::ReadAllBytes($plugin)) -cne $payload.plugin){throw 'installed plugin differs from bootstrap payload'}
@@ -225,6 +241,7 @@ Write-FzFile $provider (ConvertTo-Json -InputObject $root -Depth 100)
 if ($env:FZ_HOST -ne '192.0.2.1') { throw 'wrong broker host' }
 if ($env:CLINE_API_KEY -cne "fake'`$(not-a-command)") { throw 'fake changed or evaluated' }
 if ($env:NO_PROXY -notmatch 'localhost' -or $env:NO_PROXY -notmatch '127.0.0.1') { throw 'loopback exclusions missing' }
+foreach($bypass in $payload.infrastructure_no_proxy){if(-not @($env:NO_PROXY.Split(',')).Contains($bypass)){throw "activated GCE exclusion missing $bypass"}}
 if($env:NODE_EXTRA_CA_CERTS -cne (Join-Path $configDir 'friendzone-ca.pem')){throw 'CA path with spaces/apostrophe did not survive activation'}
 if($env:CARGO_HTTP_CAINFO -cne (Join-Path $configDir 'friendzone-ca.pem')){throw 'Cargo CA path with spaces/apostrophe did not survive activation'}
 if($env:CARGO_HTTP_CHECK_REVOKE -cne 'false'){throw 'Cargo Schannel revocation override was not activated'}
@@ -257,7 +274,7 @@ if($git){
 }
 # Removing GitHub escrow replaces the include with a marker and retires only
 # Friendzone's last applied fake from both persistent and activated environments.
-$withoutGithub=[pscustomobject]@{broker=$data.broker;container=$data.container;proxy_port=$data.proxy_port;ca=$data.ca;plugin=$data.plugin;git_credential_config="# Friendzone managed Git configuration v1`n";fakes=[pscustomobject]@{CLINE_API_KEY=$data.fakes.CLINE_API_KEY}}
+$withoutGithub=[pscustomobject]@{broker=$data.broker;container=$data.container;proxy_port=$data.proxy_port;ca=$data.ca;plugin=$data.plugin;proxy_hosts=$data.proxy_hosts;infrastructure_no_proxy=$data.infrastructure_no_proxy;git_credential_config="# Friendzone managed Git configuration v1`n";fakes=[pscustomobject]@{CLINE_API_KEY=$data.fakes.CLINE_API_KEY}}
 $EnvironmentFile=Invoke-FzConfigure $withoutGithub $homeDir $configDir
 if($null-ne(Get-FzUserValue 'GITHUB_TOKEN')){throw 'removed GitHub escrow left the managed user token'}
 if([IO.File]::ReadAllText((Join-Path $configDir 'friendzone.gitconfig'))-cne"# Friendzone managed Git configuration v1`n"){throw 'removed GitHub escrow left the credential helper'}

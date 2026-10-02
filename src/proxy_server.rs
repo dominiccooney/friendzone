@@ -169,7 +169,7 @@ pub async fn serve(
             settings,
             management_port,
             bootstrap_port,
-        ))
+        ).protect_broker_listener(addr))
         .with_graceful_shutdown(pending())
         .build()
         .context("build proxy")?

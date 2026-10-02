@@ -540,6 +540,7 @@ pub struct EventHandler {
     /// Listener policy is fixed at broker startup; the bootstrap exception
     /// and actual listener use the same configured port, including in clones.
     bootstrap_port: u16,
+    broker_proxy: Option<std::net::SocketAddr>,
     response_watch: Option<std::sync::Arc<ResponseWatch>>,
 }
 
@@ -558,8 +559,15 @@ impl EventHandler {
             tunnel_requires_pin: false,
             management_port,
             bootstrap_port,
+            broker_proxy: None,
             response_watch: None,
         }
+    }
+
+    /// Listener addresses and the self-access guard change together on restart.
+    pub(crate) fn protect_broker_listener(mut self, proxy: std::net::SocketAddr) -> Self {
+        self.broker_proxy = Some(proxy);
+        self
     }
 
     fn container(
@@ -739,7 +747,7 @@ impl EventHandler {
         }
         let killed = self.state.is_killed(&container);
         if let Some(reason) =
-            destination_denial(req.uri(), self.management_port, self.bootstrap_port)
+            self.broker_destination_denial(req.uri()).or_else(|| destination_denial(req.uri(), self.management_port, self.bootstrap_port))
         {
             let id = self.state.record(
                 container,
@@ -923,6 +931,26 @@ impl EventHandler {
         }
     }
 
+    fn broker_destination_denial(&self, uri: &hudsucker::hyper::Uri) -> Option<&'static str> {
+        let proxy = self.broker_proxy?;
+        let port = uri.port_u16().or_else(|| match uri.scheme_str() { Some("http") => Some(80), Some("https") => Some(443), _ => None });
+        // Block the proxy port globally, including aliases, to prevent a
+        // recursive connection changing the authenticated source address.
+        if port == Some(proxy.port()) {
+            return Some("friendzone: proxy access to the proxy listener is forbidden; contact guest services directly");
+        }
+        if uri.host().is_some_and(crate::routing::loopback_host) {
+            return None; // The shared loopback rule owns its bootstrap exception.
+        }
+        let host = crate::routing::normalize_host(uri.host()?)?;
+        let ip = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().ok()?;
+        let ip = match ip { std::net::IpAddr::V6(v6) => v6.to_ipv4().map(std::net::IpAddr::V4).unwrap_or(ip), _ => ip };
+        if proxy.ip() == ip && port != Some(self.bootstrap_port) {
+            return Some("friendzone: proxy access to the broker host is forbidden except on the guest-services listener");
+        }
+        None
+    }
+
     async fn await_review(
         &self,
         container: &str,
@@ -1095,7 +1123,7 @@ impl EventHandler {
 
 /// Applies to absolute HTTP(S) URLs, CONNECT authorities, and requests
 /// decrypted inside a tunnel, before any upstream connection or escrow work.
-/// This checks literal/normalized loopback names, not resolved DNS addresses.
+/// This checks literal/normalized destinations, not resolved DNS addresses.
 fn destination_denial(
     uri: &hudsucker::hyper::Uri,
     management_port: u16,
@@ -1110,7 +1138,15 @@ fn destination_denial(
     if destination_port == Some(management_port) {
         return Some("friendzone: proxy access to the management UI port is forbidden");
     }
-    if uri.host().is_some_and(is_loopback_host)
+    if uri
+        .host()
+        .is_some_and(crate::infrastructure::is_infrastructure_host)
+    {
+        return Some(
+            "friendzone: proxy access to instance-local infrastructure is forbidden; configure NO_PROXY/no_proxy for GCE metadata and link-local destinations and restart the guest client",
+        );
+    }
+    if uri.host().is_some_and(crate::routing::loopback_host)
         && (bootstrap_port == 0 || destination_port != Some(bootstrap_port))
     {
         return Some(
@@ -1118,32 +1154,6 @@ fn destination_denial(
         );
     }
     None
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if host == "localhost" || host.ends_with(".localhost") {
-        return true;
-    }
-    // Reuse the existing URL parser for numeric aliases (127.1, octal/hex,
-    // decimal IPv4). Do not resolve DNS here: a preflight DNS lookup without
-    // pinning the connector's chosen address would not stop DNS rebinding.
-    let Ok(url) = reqwest::Url::parse(&format!("http://{host}/")) else {
-        return false;
-    };
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    if host == "localhost" || host.ends_with(".localhost") {
-        return true;
-    }
-    match host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback(),
-        Ok(std::net::IpAddr::V6(ip)) => {
-            ip.is_loopback() || ip.to_ipv4().is_some_and(|v4| v4.is_loopback())
-        }
-        Err(_) => false,
-    }
 }
 
 impl HttpHandler for EventHandler {
@@ -2035,6 +2045,89 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         assert!(state.reviews.summaries().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn infrastructure_denial_has_no_bootstrap_exception() {
+        for host in crate::infrastructure::no_proxy() {
+            if host.contains('/') {
+                continue;
+            }
+            let host = if host.contains(':') && !host.starts_with('[') {
+                format!("[{host}]")
+            } else {
+                host
+            };
+            for url in [
+                format!("http://{host}:9082/"),
+                format!("https://{host}/"),
+                format!("{host}:9082"),
+            ] {
+                assert!(
+                    destination_denial(&url.parse().unwrap(), 8081, 9082)
+                        .unwrap()
+                        .contains("instance-local infrastructure"),
+                    "{url}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn infrastructure_denial_precedes_escrow_review_and_tunnel_setup() {
+        let dir = std::env::temp_dir().join(format!("fz-infrastructure-{}", uuid::Uuid::new_v4()));
+        let state = AppState::default();
+        state.add_container("guest").unwrap();
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        let mut handler = EventHandler::new(state.clone(), settings, 8081, 9082);
+        let peer = "10.0.0.2:12345".parse().unwrap();
+        for (method, url) in [
+            ("GET", "http://metadata.google.internal/computeMetadata/v1/"),
+            ("POST", "http://169.254.169.254:9082/graphql"),
+            ("DELETE", "https://[fd20:ce::254]/resource"),
+            ("CONNECT", "metadata:443"),
+        ] {
+            assert_eq!(
+                status(
+                    handler
+                        .handle_from_peer(peer, request(method, url, Some("guest")))
+                        .await
+                ),
+                StatusCode::FORBIDDEN
+            );
+            assert!(handler.pending.is_none());
+            assert!(handler.tunnel_identity.is_none());
+            let view = state.view();
+            assert!(view.pending_requests.is_empty());
+            assert_eq!(view.requests[0].status, Some(403));
+            assert!(
+                view.requests[0]
+                    .detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("instance-local infrastructure")
+            );
+        }
+        // Decrypted requests run the same guard after a permitted CONNECT.
+        assert!(matches!(
+            handler
+                .handle_from_peer(peer, request("CONNECT", "example.com:443", Some("guest")))
+                .await,
+            RequestOrResponse::Request(_)
+        ));
+        let mut intercepted = handler.clone();
+        assert_eq!(
+            status(
+                intercepted
+                    .handle_from_peer(
+                        peer,
+                        request("GET", "https://metadata.google.internal/", None)
+                    )
+                    .await
+            ),
+            StatusCode::FORBIDDEN
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

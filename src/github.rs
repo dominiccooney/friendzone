@@ -167,7 +167,7 @@ impl Credential {
         settings: &crate::settings::Settings,
         entry: &crate::settings::EscrowEntry,
     ) -> Option<Self> {
-        if !entry.hosts.iter().any(|h| h == "api.github.com")
+        if !entry.hosts.iter().any(|h| crate::settings::host_matches(h, "api.github.com"))
             || entry.header != "authorization"
             || entry.prefix != "Bearer "
         {

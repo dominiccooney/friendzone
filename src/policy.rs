@@ -48,7 +48,7 @@ pub fn classify(req: &Request<Body>) -> Decision {
     };
     // Linear file-upload credentials must not grant unreviewed arbitrary API
     // mutations through the general proxy. Text writes keep the one-shot gate.
-    if host.eq_ignore_ascii_case("api.linear.app") {
+    if crate::settings::host_matches(host, "api.linear.app") {
         return if matches!(req.method().as_str(), "GET" | "HEAD" | "OPTIONS") {
             Decision::AllowRead
         } else {
@@ -57,7 +57,7 @@ pub fn classify(req: &Request<Body>) -> Decision {
     }
     if !GITHUB_HOSTS
         .iter()
-        .any(|github| host.eq_ignore_ascii_case(github))
+        .any(|github| crate::settings::host_matches(host, github))
     {
         return Decision::Unpoliced;
     }
@@ -180,7 +180,7 @@ pub fn cline_verdict(
     let Some(host) = req.uri().host() else {
         return ClineVerdict::Allow;
     };
-    if !host.eq_ignore_ascii_case(CLINE_API_HOST) && !is_cline_host(host) {
+    if !crate::settings::host_matches(host, CLINE_API_HOST) && !is_cline_host(host) {
         return ClineVerdict::Allow;
     }
     let path = req.uri().path();
@@ -238,6 +238,13 @@ mod tests {
             .uri(uri)
             .body(Body::empty())
             .unwrap()
+    }
+
+    #[test]
+    fn canonical_hosts_cannot_bypass_write_or_cline_gates() {
+        assert_eq!(classify(&req("POST", "https://API.GITHUB.COM./graphql")), Decision::RequireReview);
+        assert_eq!(classify(&req("POST", "https://API.LINEAR.APP./graphql")), Decision::RequireReview);
+        assert!(matches!(cline_verdict(&req("POST", "https://API.CLINE.BOT./api/v1/api-keys"), ClineAccess::Full, |_| false), ClineVerdict::Deny(_)));
     }
 
     #[test]

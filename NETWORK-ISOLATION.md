@@ -15,6 +15,13 @@ below as deployment requirements, not optional diagnostics.
 
 ## Two separate boundaries
 
+**Deployment choice:** normal guest setup is direct-by-default. PAC-capable
+applications and managed Git use Friendzone only for configured escrow hosts.
+The confinement recipe below remains opt-in and requires explicit proxy
+configuration/compatibility profiles for other HTTP clients. Direct networking
+is outside Friendzone's approval, review, and Kill controls. Windows activation
+can use direct TCP `35.190.247.13:1688` where the deployment permits it.
+
 1. **Guest egress:** the guest may connect only to two host listener ports.
 2. **Management isolation:** neither direct guest traffic **nor requests via
    the proxy** may reach the UI/API. It controls approvals, permissions,
@@ -57,7 +64,7 @@ guest DNS. ARP needed to reach the IPv4 host on-link is not Internet egress.
 If your platform requires DHCP or IPv6 neighbor discovery, that is additional
 explicit infrastructure policy; the static IPv4 example below needs no DHCP.
 
-### Management and loopback protection in this build
+### Management, loopback, and infrastructure protection
 
 `fz broker` now rejects non-loopback `--ui-addr` and requires its fixed port
 to differ from the proxy/bootstrap ports. The proxy rejects HTTP requests
@@ -86,6 +93,36 @@ or use its guest-facing IP. When configured with port zero, no loopback
 exception is granted. Listener configuration changes take effect on restart.
 Keep guest `NO_PROXY`/`no_proxy` exclusions and restart stale guest processes
 as well: correct clients should contact their own hub directly, not get 403s.
+
+GCE metadata is instance-local: the broker must never answer a guest's
+metadata request with its own instance metadata or service-account token.
+The proxy rejects `metadata`, `metadata.google.internal`, `169.254.169.254`,
+`fd20:ce::254`, and all literal IPv4/IPv6 link-local destinations
+(`169.254.0.0/16`, `fe80::/10`). This rule covers HTTP, CONNECT, and decrypted
+requests, with case/trailing-dot normalization, numeric IPv4 aliases, and
+IPv4-mapped/compatible IPv6. It has no bootstrap-port exception. Denials
+return 403 and enter the request log, never the review queue.
+
+Both guest setup platforms include these destinations in their bypass
+defaults while retaining existing exclusions. Exact metadata addresses
+remain alongside CIDRs because `NO_PROXY` support varies between clients.
+Windows Internet Settings uses selective PAC, with unpinned hosts direct.
+Client routing is a convenience, not the
+enforcement boundary. No Google public API or general RFC1918 bypass is added.
+The policy is compiled into the broker and changes on restart. Existing
+guests must refetch/rerun setup and restart processes to inherit new defaults.
+
+The proxy also denies its own listener port on all hosts to prevent recursive
+proxying. Literal access to the configured broker listener IPs is denied
+outside the guest-services port. This does not discover every host interface
+or arbitrary DNS alias; keep management network isolation in place.
+
+These endpoints provide GCE metadata, DNS, and NTP; they are not a universal
+list of internal services. DNS aliases and DNS rebinding into these ranges
+are not covered by this literal-destination guard. Custom infrastructure
+names, VPC subnet gateways, and direct guest DNS/DHCP/NTP allowances depend
+on deployment. Permit required instance-local services through external
+guest isolation separately, rather than relay them through the broker.
 
 Do not publish the UI via portproxy, SSH forwarding accessible to the guest,
 a reverse proxy, WSL localhost forwarding, or another port: a relay would
@@ -394,3 +431,8 @@ with existing policy. Use the recorded backup if you chose a different plan.
 - [Microsoft: Remove-VMNetworkAdapterExtendedAcl](https://learn.microsoft.com/en-us/powershell/module/hyper-v/remove-vmnetworkadapterextendedacl)
 - [Microsoft: Hyper-V Firewall (including WSL loopback policy)](https://learn.microsoft.com/en-us/windows/security/operating-system-security/network-security/windows-firewall/hyper-v-firewall)
 - [Softnet isolation and dynamic policy](https://github.com/cirruslabs/softnet)
+- [Google: metadata endpoints and proxy bypass settings](https://docs.cloud.google.com/compute/docs/troubleshooting/troubleshoot-metadata-server)
+- [Google: internal DNS and metadata server addresses](https://docs.cloud.google.com/compute/docs/internal-dns)
+- [Google: instance-local NTP](https://docs.cloud.google.com/compute/docs/instances/configure-ntp)
+- [RFC 3927: IPv4 link-local addresses](https://www.rfc-editor.org/rfc/rfc3927)
+- [RFC 4291: IPv6 link-local addresses](https://www.rfc-editor.org/rfc/rfc4291#section-2.5.6)

@@ -19,7 +19,7 @@ use uuid::Uuid;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EscrowEntry {
     pub name: String,
-    /// Hosts the real value may be sent to (exact match).
+    /// Hosts the real value may be sent to (canonical host match, no subdomains).
     pub hosts: Vec<String>,
     /// Header carrying the credential, e.g. "authorization", "x-api-key".
     pub header: String,
@@ -211,7 +211,13 @@ pub fn is_cline_entry(entry: &EscrowEntry) -> bool {
     entry
         .hosts
         .iter()
-        .any(|host| host.eq_ignore_ascii_case(crate::policy::CLINE_API_HOST))
+        .any(|host| host_matches(host, crate::policy::CLINE_API_HOST))
+}
+
+pub(crate) fn host_matches(pinned: &str, host: &str) -> bool {
+    crate::routing::normalize_host(pinned)
+        .zip(crate::routing::normalize_host(host))
+        .is_some_and(|(pinned, host)| pinned == host)
 }
 
 impl Settings {
@@ -220,12 +226,12 @@ impl Settings {
     /// Cline OAuth session. The per-container Cline gate covers exactly this
     /// set, so an administrator who pins the account to another origin (for
     /// example a staging API) extends the allowlist there automatically.
-    /// Uses the same exact host comparison as `substitute`, so the two can
+    /// Uses the same canonical host comparison as `substitute`, so the two can
     /// never disagree about where the token goes.
     pub fn is_cline_credential_host(&self, host: &str) -> bool {
         self.entries().iter().any(|entry| {
             (is_cline_entry(entry) || crate::oauth::ClineSession::load(self, &entry.name).is_some())
-                && entry.hosts.iter().any(|pinned| pinned == host)
+                && entry.hosts.iter().any(|pinned| host_matches(pinned, host))
         })
     }
 }
@@ -267,7 +273,7 @@ impl Settings {
             // exchange that returns real rotated credentials to the guest.
             if cline_oauth
                 && path == "/api/v1/auth/refresh"
-                && entry.hosts.iter().any(|pinned| pinned == host)
+                && entry.hosts.iter().any(|pinned| host_matches(pinned, host))
             {
                 return Substitution::Block(
                     "friendzone: Cline OAuth refresh is host-owned; reconnect it in Friendzone settings"
@@ -298,7 +304,7 @@ impl Settings {
             if !literal_match && !oauth_facade_match && !github_token && basic.is_none() {
                 continue;
             }
-            if !entry.hosts.iter().any(|h| h == host) {
+            if !entry.hosts.iter().any(|h| host_matches(h, host)) {
                 return Substitution::Block(format!(
                     "friendzone: fake credential '{}' sent to non-pinned host {host}",
                     entry.name
@@ -337,7 +343,7 @@ impl Settings {
 pub(crate) fn github_token_matches(entry: &EscrowEntry, value: &str) -> bool {
     entry.header.eq_ignore_ascii_case("authorization")
         && entry.prefix == "Bearer "
-        && entry.hosts.iter().any(|host| host == "api.github.com")
+        && entry.hosts.iter().any(|host| host_matches(host, "api.github.com"))
         && value.split_once(' ').is_some_and(|(scheme, token)| {
             scheme.eq_ignore_ascii_case("token") && !entry.fake.is_empty() && token == entry.fake
         })
@@ -499,7 +505,7 @@ mod tests {
     fn basic_fake_keeps_host_pin_and_missing_or_invalid_secret_denials() {
         let (settings, dir) = basic_settings();
         let auth = format!("Basic {}", STANDARD.encode(b"octocat:fake-github-token"));
-        for host in ["evil.example", "github.com.evil.example", "github.com."] {
+        for host in ["evil.example", "github.com.evil.example"] {
             let Substitution::Block(reason) = basic_substitution(&settings, host, &auth) else {
                 panic!("pin bypass")
             };
@@ -507,6 +513,7 @@ mod tests {
             assert!(!reason.contains("real-token"));
             assert!(!reason.contains(&auth));
         }
+        assert!(matches!(basic_substitution(&settings, "GITHUB.COM.", &auth), Substitution::Replace { .. }));
         settings.remove_secret("github").unwrap();
         assert!(matches!(
             basic_substitution(&settings, "github.com", &auth),
@@ -668,7 +675,7 @@ mod tests {
         assert!(!settings.is_cline_credential_host("api.cline.bot"));
 
         // A Cline entry (by host) governs every host it pins, connected or not.
-        // Host comparison is exact, precisely as in `substitute`: a pin that
+        // Host comparison is canonical, precisely as in `substitute`: a pin that
         // would not receive the token does not widen the gate either.
         let cline = settings
             .add_entry(EscrowEntry {
@@ -684,8 +691,8 @@ mod tests {
         assert!(settings.is_cline_credential_host("api.cline.bot"));
         assert!(settings.is_cline_credential_host("core-api.staging.int.cline.bot"));
         assert!(
-            !settings.is_cline_credential_host("CORE-API.staging.int.cline.bot"),
-            "substitute would not match this spelling, so neither does the gate predicate"
+            settings.is_cline_credential_host("CORE-API.staging.int.cline.bot."),
+            "the gate and substitution recognize the same canonical host"
         );
         assert!(!settings.is_cline_credential_host("api.anthropic.com"));
         assert!(!settings.is_cline_credential_host("cline.bot"));

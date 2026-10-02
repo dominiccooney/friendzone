@@ -152,6 +152,134 @@ impl Broker {
 }
 
 #[tokio::test]
+async fn live_pac_tracks_credential_hosts_not_secret_availability() {
+    let dir = TempDir::new();
+    let broker = Broker::start(&dir).await;
+    let url = format!("{}/bootstrap/proxy.pac", broker.bootstrap);
+    let execute = |source: &str, cases: Value| {
+        let script = dir.0.join("generated.pac");
+        let expected = dir.0.join("expected.json");
+        std::fs::write(&script, source).unwrap();
+        std::fs::write(&expected, cases.to_string()).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/check_pac.cjs"))
+            .arg(&script).arg(&expected).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    };
+    // PAC is available for setup before a guest is approved or pinned.
+    let response = broker.client.get(&url).send().await.unwrap();
+    assert_eq!(response.headers()["content-type"], "application/x-ns-proxy-autoconfig");
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    execute(&response.text().await.unwrap(), json!([["api.example.com", "DIRECT"], ["example.com", "DIRECT"]]));
+    let proxy = format!("PROXY {}", broker.proxy.strip_prefix("http://").unwrap());
+    let response = broker.post("/api/escrow", json!({"name":"test", "hosts":["API.Example.COM.","api.example.com","storage.googleapis.com","metadata","metadata.google.internal","169.254.169.254","[fd20:ce::254]","localhost","127.1"], "header":"authorization", "prefix":"Bearer ", "guest_env":"TEST_API_KEY"})).await;
+    assert!(response.status().is_success());
+    let entry: Value = response.json().await.unwrap();
+    let response = broker.client.get(&url).send().await.unwrap();
+    execute(&response.text().await.unwrap(), json!([
+        ["api.example.com",proxy], ["API.EXAMPLE.COM.",proxy], ["storage.googleapis.com",proxy],
+        ["api.example.com.evil.test","DIRECT"], ["example.com","DIRECT"], ["metadata","DIRECT"],
+        ["metadata.google.internal","DIRECT"], ["169.254.169.254","DIRECT"], ["[fd20:ce::254]","DIRECT"],
+        ["localhost","DIRECT"], ["127.0.0.1","DIRECT"], ["35.190.247.13","DIRECT"]
+    ]));
+    assert!(entry["fake"].as_str().unwrap().starts_with("fz-"));
+    let response = broker.client.put(format!("{}/api/escrow/test", broker.ui))
+        .json(&json!({"hosts":["new.example.com"],"header":"authorization","prefix":"Bearer ","guest_env":"TEST_API_KEY"})).send().await.unwrap();
+    assert!(response.status().is_success());
+    let source = broker.client.get(&url).send().await.unwrap().text().await.unwrap();
+    execute(&source, json!([["api.example.com","DIRECT"],["new.example.com",proxy],["storage.googleapis.com","DIRECT"]]));
+    assert!(broker.client.delete(format!("{}/api/escrow/test",broker.ui)).send().await.unwrap().status().is_success());
+    let source = broker.client.get(&url).send().await.unwrap().text().await.unwrap();
+    execute(&source, json!([["new.example.com","DIRECT"]]));
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn proxy_rejects_gce_infrastructure_over_http_and_connect() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = TempDir::new();
+    let broker = Broker::start(&dir).await;
+    assert!(
+        broker
+            .post("/api/containers", json!({"name":"guest"}))
+            .await
+            .status()
+            .is_success()
+    );
+    let proxy_port = reqwest::Url::parse(&broker.proxy).unwrap().port().unwrap();
+    for host in ["127.0.0.1", "localhost", "broker-alias.test"] {
+        for method in ["GET", "CONNECT"] {
+            let target = if method == "CONNECT" { format!("{host}:{proxy_port}") } else { format!("http://{host}:{proxy_port}/") };
+            let mut socket = tokio::net::TcpStream::connect(broker.proxy.strip_prefix("http://").unwrap()).await.unwrap();
+            socket.write_all(format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\nProxy-Authorization: Basic Z3Vlc3Q6eA==\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            let mut bytes = Vec::new();
+            tokio::time::timeout(Duration::from_secs(3), socket.read_to_end(&mut bytes)).await.unwrap().unwrap();
+            let response = String::from_utf8(bytes).unwrap();
+            assert!(response.starts_with("HTTP/1.1 403") && response.contains("proxy listener"), "{response}");
+        }
+    }
+    let port = reqwest::Url::parse(&broker.bootstrap)
+        .unwrap()
+        .port()
+        .unwrap();
+    let hosts = [
+        "metadata",
+        "METADATA.GOOGLE.INTERNAL.",
+        "169.254.169.254",
+        "169.254.0.1",
+        "169.254.255.254",
+        "2852039166",
+        "0xa9fea9fe",
+        "0251.0376.0251.0376",
+        "[::ffff:169.254.169.254]",
+        "[::169.254.169.254]",
+        "[fd20:ce::254]",
+        "[fe80::1]",
+        "[febf:ffff::1]",
+    ];
+    for host in hosts {
+        for method in ["GET", "POST", "CONNECT"] {
+            // Even the actual bootstrap port must not grant an exception.
+            let target = if method == "CONNECT" {
+                format!("{host}:{port}")
+            } else {
+                format!("http://{host}:{port}/computeMetadata/v1/")
+            };
+            let mut socket =
+                tokio::net::TcpStream::connect(broker.proxy.strip_prefix("http://").unwrap())
+                    .await
+                    .unwrap();
+            socket.write_all(format!("{method} {target} HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic Z3Vlc3Q6eA==\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            let mut bytes = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+            let response = String::from_utf8(bytes).unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "{method} {target}: {response}"
+            );
+            assert!(
+                response.contains("instance-local infrastructure"),
+                "{response}"
+            );
+        }
+    }
+    let view = broker.snapshot().await;
+    assert!(view["pending_requests"].as_array().unwrap().is_empty());
+    let requests = view["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), hosts.len() * 3 + 6);
+    assert!(
+        requests
+            .iter()
+            .all(|r| r["verdict"] == "blocked" && r["status"] == 403)
+    );
+    broker.stop().await;
+}
+
+#[tokio::test]
 async fn proxy_blocks_guest_loopback_but_allows_configured_bootstrap() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

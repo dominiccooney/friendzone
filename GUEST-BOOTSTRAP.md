@@ -45,10 +45,61 @@ The script prints the replacement; it never creates a second identity for that
 IP. Registration failures now include the exact bootstrap URL, HTTP status, and
 the broker's recovery action before any guest settings are changed.
 
-The environment contains FZ_HOST/FZ_BROKER, credential-free HTTP_PROXY/HTTPS_PROXY, CA variables
+The environment contains FZ_HOST/FZ_BROKER, FZ_PROXY, FZ_PAC_URL, FZ_PROXY_HOSTS, CA variables
 for common runtimes, and fake provider keys. NO_PROXY/no_proxy includes the
 broker host, localhost, 127.0.0.1, ::1 and [::1], preserving existing exclusions.
+It also includes `metadata`, `metadata.google.internal`, `169.254.169.254`,
+`fd20:ce::254`, `[fd20:ce::254]`, `169.254.0.0/16`, and `fe80::/10` so GCE
+metadata and link-local infrastructure stay on the guest's instance. Exact
+metadata addresses cover clients without CIDR support. The proxy rejects these infrastructure destinations
+even if a client ignores the bypass settings. Refetch and rerun setup, then
+restart guest processes to update an existing installation.
 Real credentials and OAuth refresh tokens never enter the script.
+
+### Selective routing
+
+Setup is direct by default: it does not install global `HTTP_PROXY` or
+`HTTPS_PROXY`. Windows Internet Settings uses the live PAC URL
+`$FZ_BROKER/bootstrap/proxy.pac`; configure that URL manually in PAC-capable
+Linux applications. The PAC selects Friendzone only for exact hosts pinned
+by configured escrow entries, even when their credentials are disconnected.
+All other hosts go direct, including Windows activation, metadata, loopback,
+and the broker. Google API hosts are not special: they use Friendzone only
+when pinned. The proxy still rejects metadata/link-local destinations if
+explicitly contacted. PAC does not request direct fallback for pinned hosts.
+
+The managed Git include sets `http.https://HOST.proxy` for the same host
+snapshot. No general Git proxy is installed. PAC updates when applications
+fetch it again; their caches may require a restart. Git and environment
+snapshots update when setup is downloaded and rerun. FZ_PROXY_HOSTS is
+informational; standard clients do not interpret it as a proxy allowlist.
+
+**Cline CLI, curl, and many SDKs do not support PAC.** Standard proxy
+environment variables cannot express a host allowlist. For a command that
+needs escrow, use `curl --proxy "$FZ_PROXY" --noproxy '' ...`, or launch it
+from an explicit compatibility environment:
+
+```sh
+( . "${XDG_CONFIG_HOME:-$HOME/.config}/friendzone/friendzone-proxy-env.sh"; cline )
+```
+
+```powershell
+. "$env:APPDATA/friendzone/friendzone-proxy-env.ps1"
+cline
+```
+
+This profile sets ordinary proxy variables for that process and its children;
+it is not selective. On Linux, source `activate.sh` to reset the inherited bash
+hook; on Windows, source `friendzone-env.ps1`, or start a fresh terminal on
+either platform to leave it. Setup removes old Friendzone-owned global proxy values
+but preserves unrelated user settings. Existing network-isolated deployments
+must keep using explicit proxy configuration for clients that cannot connect
+directly. No guest routing daemon or machine-wide network policy is installed.
+
+MCP, setup, health, jobs, Git publication, attachment uploads, and optional
+tracing connect directly to the guest-services listener. They do not need a
+proxy hop; management is not exposed there. Kill controls broker-backed
+services, not direct Internet traffic.
 
 Setup does not install tracing packages. For a focused timeout reproduction,
 activate this environment and use the traced-command wrapper described in
@@ -211,7 +262,9 @@ Set-ItemProperty $key -Name ProxyEnable -Value $previousProxyEnable
 [QaProxy.WinInet]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0)
 ```
 
-Do not leave `ProxyEnable` set to `0`. Restart any installer or client that does
+For an old static-proxy installation, restore its previous `ProxyEnable` value.
+Selective PAC installations intentionally leave it at `0` and set
+`AutoConfigURL`; unrelated installer hosts normally go direct. Restart any installer or client that does
 not observe either notification. This workaround changes only the current-user
 Windows Internet proxy switch; it does not remove Friendzone's saved proxy
 address, environment variables, CA, or host-enforced network policy.
@@ -220,12 +273,13 @@ address, environment variables, CA, or host-enforced network policy.
 
 Files live in `%APPDATA%\friendzone`. The script writes **User**, never
 **Machine**, environment values and activates its PowerShell process. It also
-sets the current user's Windows Internet Settings (`ProxyEnable`, `ProxyServer`,
-and `ProxyOverride`) to the credential-free Friendzone proxy. This is the proxy
+sets the current user's Windows Internet Settings `AutoConfigURL` to the live
+PAC URL, disables the static `ProxyEnable` setting, and removes static
+`ProxyServer`/`ProxyOverride` values while retaining them for rollback. This is the proxy
 used by many WinINET-aware and modern .NET HTTP clients; it is not a machine-wide
 WinHTTP `netsh` change and cannot force software that ignores system proxy
-settings. The broker and explicit loopback forms are added to the bypass list;
-existing bypass entries are preserved. Its children inherit the new environment;
+settings. Original PAC and static settings are restored by ownership-aware
+rollback. Its children inherit the new environment;
 existing applications do not. Sign out
 and back in for GUI launchers, and restart guest agents/hubs and existing
 `HttpClient` owners. PowerShell
@@ -285,11 +339,11 @@ host-enforced network isolation in [NETWORK-ISOLATION.md](NETWORK-ISOLATION.md).
    that will run Cline. Execution policy still applies: do not use Bypass or
    change machine-wide policy to force installation.
 4. **Approve + pin IP** for the new guest in Inbox. Check that `$env:FZ_BROKER` and
-   `$env:HTTP_PROXY` point at the current host, and `$env:NO_PROXY` includes the
+   `$env:FZ_PROXY` point at the current host, and `$env:NO_PROXY` includes the
    host and loopback addresses. User environment values affect new launchers;
    old Cline hubs and already-running applications retain their old environment.
-   Check `Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' ProxyEnable,ProxyServer,ProxyOverride`
-   and confirm the user proxy points to the current Friendzone host/port. Confirm
+   Check `Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' ProxyEnable,AutoConfigURL`
+   and confirm `ProxyEnable=0` and `AutoConfigURL` points to the bootstrap PAC URL. Confirm
    `Get-ChildItem Cert:\CurrentUser\Root` contains the Friendzone Local CA shown
    by the setup script's saved `friendzone-ca.pem` thumbprint.
 5. Verify the installed module **without executing it**. Use

@@ -79,13 +79,18 @@ pub fn script(
     // Cline credentials are OAuth-only. The guest fake is delivered only while
     // the broker holds a session, so a disconnected entry writes no facade.
     let mut cline_oauth = false;
-    for entry in settings.entries() {
+    // Routing, fake environment and Git configuration travel as one snapshot.
+    let entries = settings.entries();
+    let origin = reqwest::Url::parse(&broker)?;
+    let proxy_hosts = crate::routing::credential_hosts(&entries, origin.host_str().unwrap());
+    let proxy = crate::routing::proxy_origin(&broker, proxy_port);
+    for entry in entries {
         git_github_auth |= entry.guest_env.as_deref() == Some("GITHUB_TOKEN")
             && entry.header.eq_ignore_ascii_case("authorization")
             && entry
                 .hosts
                 .iter()
-                .any(|host| host.eq_ignore_ascii_case("github.com"));
+                .any(|host| crate::settings::host_matches(host, "github.com"));
         if let Some(name) = entry.guest_env {
             if name.is_empty()
                 || !name.bytes().enumerate().all(|(i, c)| {
@@ -98,6 +103,9 @@ pub fn script(
                     "ALL_PROXY",
                     "FZ_HOST",
                     "FZ_BROKER",
+                    "FZ_PROXY",
+                    "FZ_PAC_URL",
+                    "FZ_PROXY_HOSTS",
                     "BASH_ENV",
                     "ENV",
                     "NODE_EXTRA_CA_CERTS",
@@ -138,8 +146,11 @@ pub fn script(
             fakes.insert(name, entry.fake);
         }
     }
+    let git_config = format!("{}{}", if git_github_auth {GITHUB_GIT_CONFIG} else {EMPTY_GIT_CONFIG}, crate::routing::git_proxy_config(&proxy_hosts, &proxy));
     let payload = serde_json::json!({"broker":broker,"container":container,"ca":ca,"proxy_port":proxy_port,"fakes":fakes,"cline_oauth":cline_oauth,
-        "git_credential_config":if git_github_auth {GITHUB_GIT_CONFIG} else {EMPTY_GIT_CONFIG},
+        "git_credential_config":git_config,
+        "proxy_hosts":proxy_hosts,
+        "infrastructure_no_proxy":crate::infrastructure::no_proxy(),
         "plugin":STANDARD.encode(include_bytes!("plugin/friendzone.js")),
         "persistence":STANDARD.encode(include_bytes!("bootstrap/persist-environment.ps1"))});
     let encoded = STANDARD.encode(serde_json::to_vec(&payload)?);
@@ -271,7 +282,9 @@ mod tests {
             assert!(payload["fakes"].get("CLINE_API_KEY").is_none(), "{}", payload["fakes"]);
             assert!(!text.contains("fz-disconnected-cline"));
             assert!(!text.contains("stale-static-key"));
-            assert_eq!(payload["git_credential_config"], GITHUB_GIT_CONFIG);
+            assert!(payload["git_credential_config"].as_str().unwrap().starts_with(GITHUB_GIT_CONFIG));
+            assert_eq!(payload["proxy_hosts"], serde_json::json!(["api.cline.bot", "api.github.com", "github.com"]));
+            assert!(payload["git_credential_config"].as_str().unwrap().contains("[http \"https://github.com\"]"));
             if !powershell {
                 assert!(text.contains("/usr/local/share/ca-certificates/friendzone-local-ca.crt"));
                 assert!(text.contains("update-ca-certificates"));
@@ -302,7 +315,9 @@ mod tests {
             .unwrap();
         let payload: serde_json::Value =
             serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
-        assert_eq!(payload["git_credential_config"], EMPTY_GIT_CONFIG);
+        assert!(payload["git_credential_config"].as_str().unwrap().starts_with(EMPTY_GIT_CONFIG));
+        assert_eq!(payload["proxy_hosts"], serde_json::json!(["api.cline.bot"]));
+        assert_eq!(payload["infrastructure_no_proxy"], serde_json::json!(crate::infrastructure::no_proxy()));
         assert!(payload["fakes"].get("GITHUB_TOKEN").is_none());
         let cmds = commands("http://host:9082", "guest").unwrap();
         assert!(cmds["sh"].as_str().unwrap().starts_with("curl "));

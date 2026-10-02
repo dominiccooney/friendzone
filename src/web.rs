@@ -316,7 +316,7 @@ async fn update_escrow(
     let becomes_cline = request
         .hosts
         .iter()
-        .any(|host| host.eq_ignore_ascii_case(crate::policy::CLINE_API_HOST));
+        .any(|host| crate::settings::host_matches(host, crate::policy::CLINE_API_HOST));
     if real.is_some() && (becomes_cline || is_cline_entry_name(&state.settings, &name)) {
         return (StatusCode::UNPROCESSABLE_ENTITY, CLINE_STATIC_KEY_REJECTED).into_response();
     }
@@ -808,6 +808,7 @@ fn bootstrap_router(state: BootstrapState) -> Router {
         .route("/bootstrap/hello", get(bootstrap_hello))
         .route("/bootstrap/env", get(bootstrap_env))
         .route("/bootstrap/setup", get(bootstrap_script))
+        .route("/bootstrap/proxy.pac", get(bootstrap_pac))
         .route(
             "/bootstrap/friendzone.js",
             get(|| async {
@@ -1360,6 +1361,22 @@ struct ScriptQuery {
     broker: Option<String>,
     #[serde(default)]
     container: String,
+}
+
+async fn bootstrap_pac(
+    State(state): State<BootstrapState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let raw = format!("http://{}", headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or(""));
+    match crate::bootstrap::broker_origin(&raw) {
+        Ok(broker) => (
+            [(header::CONTENT_TYPE, "application/x-ns-proxy-autoconfig"),
+             (header::CACHE_CONTROL, "no-store"),
+             (header::X_CONTENT_TYPE_OPTIONS, "nosniff")],
+            crate::routing::pac(&state.settings.entries(), &broker, state.proxy_port),
+        ).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
 }
 async fn bootstrap_script(
     State(state): State<BootstrapState>,
@@ -4970,7 +4987,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-            let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
                 .await
                 .unwrap();
             let text = String::from_utf8(body.to_vec()).unwrap();

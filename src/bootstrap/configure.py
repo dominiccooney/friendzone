@@ -224,6 +224,8 @@ def configure(data, home, config, zdotdir, environ):
         previous = ""
     old_environment = env.read_text(encoding="utf-8") if env.exists() else ""
     old_github_token = None
+    retired_proxy_path = config / "retired-proxy-values.json"
+    old_proxy_values = json.loads(retired_proxy_path.read_text(encoding="utf-8")) if retired_proxy_path.exists() else {}
     if old_environment.startswith("# Friendzone guest environment\n"):
         for line in old_environment.splitlines():
             try:
@@ -234,6 +236,10 @@ def configure(data, home, config, zdotdir, environ):
                 if old_github_token is not None:
                     raise ValueError("Invalid previous Friendzone GITHUB_TOKEN environment")
                 old_github_token = fields[1].split("=", 1)[1]
+            if len(fields) == 2 and fields[0] == "export" and "=" in fields[1]:
+                key, value = fields[1].split("=", 1)
+                if key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                    old_proxy_values[key] = value
     legacy_idle = "export CLINE_PLUGIN_IDLE_TIMEOUT_MS=90000000\n"
     legacy_idle_marker = config / "remove-legacy-cline-idle-timeout"
     # The old generated file proves ownership. Preserve any user-authored value.
@@ -242,7 +248,9 @@ def configure(data, home, config, zdotdir, environ):
     proxy_host = "[" + origin.hostname + "]" if ":" in origin.hostname else origin.hostname
     proxy = "http://{}:{}".format(proxy_host, data["proxy_port"])
     values = dict(data["fakes"])
-    values.update(FZ_HOST=origin.hostname, FZ_BROKER=data["broker"], HTTP_PROXY=proxy, HTTPS_PROXY=proxy, http_proxy=proxy, https_proxy=proxy)
+    values.update(FZ_HOST=origin.hostname, FZ_BROKER=data["broker"], FZ_PROXY=proxy,
+                  FZ_PAC_URL=data["broker"] + "/bootstrap/proxy.pac",
+                  FZ_PROXY_HOSTS=",".join(data["proxy_hosts"]))
     for key in ("NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "GIT_SSL_CAINFO", "GIT_PROXY_SSL_CAINFO", "CARGO_HTTP_CAINFO"):
         values[key] = str(cert)
     git_config_text = data.get("git_credential_config") or ""
@@ -257,12 +265,17 @@ def configure(data, home, config, zdotdir, environ):
         raise ValueError("Existing GIT_CONFIG_* environment entries conflict with Friendzone Git authentication")
     values.update(expected)
     content = "# Friendzone guest environment\n" + "".join(f"export {key}={shlex.quote(value)}\n" for key, value in values.items())
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        old_value = old_proxy_values.get(key, proxy)
+        content += 'if [ "${{{0}-}}" = {1} ] || [ "${{{0}-}}" = {2} ]; then unset {0}; fi\n'.format(key, shlex.quote(old_value), shlex.quote(proxy))
     if old_github_token is not None and "GITHUB_TOKEN" not in values:
         content += "if [ \"${{GITHUB_TOKEN-}}\" = {0} ]; then unset GITHUB_TOKEN; fi\n".format(shlex.quote(old_github_token))
     if remove_legacy_idle:
         marker = shlex.quote(str(legacy_idle_marker))
         content += "if [ -r {0} ]; then\n  if [ \"${{CLINE_PLUGIN_IDLE_TIMEOUT_MS-}}\" = 90000000 ]; then unset CLINE_PLUGIN_IDLE_TIMEOUT_MS; fi\n  rm -f -- {0}\nfi\n".format(marker)
-    content += '''_fz_rest="$FZ_HOST,localhost,127.0.0.1,::1,[::1],${NO_PROXY:-},${no_proxy:-},"
+    exclusions = ",".join([origin.hostname, "localhost", "127.0.0.1", "::1", "[::1]"] + data["infrastructure_no_proxy"])
+    content += '_fz_rest=' + shlex.quote(exclusions + ',') + '"${NO_PROXY:-},${no_proxy:-},"\n'
+    content += '''
 _fz_list=
 while [ -n "$_fz_rest" ]; do
   _fz_item=${_fz_rest%%,*}; _fz_rest=${_fz_rest#*,}
@@ -274,7 +287,12 @@ export NO_PROXY="$_fz_list" no_proxy="$_fz_list"
 unset _fz_rest _fz_list _fz_item
 '''
     source = ". " + shlex.quote(str(env)) + "\n"
+    compatibility = source + ''.join('export {0}="$FZ_PROXY"\n'.format(key)
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"))
+    compatibility += 'export BASH_ENV=' + shlex.quote(str(config / "friendzone-proxy-env.sh")) + '\n'
     edits = ([(legacy_idle_marker, "Friendzone previously managed the exact value 90000000; activation removes only that value.\n")] if remove_legacy_idle else []) + [(git_config, git_config_text), (cert, data["ca"]), (env, content), (old_hook, previous),
+             (config / "friendzone-proxy-env.sh", compatibility),
+             (retired_proxy_path, json.dumps(old_proxy_values) + "\n"),
              (activation, source + "export BASH_ENV=" + shlex.quote(str(wrapper)) + "\n"),
              (wrapper, ("if [ -r {0} ]; then . {0}; fi\n".format(shlex.quote(previous)) if previous else "") + source)]
     profiles = {home / ".profile", home / ".bashrc", zdotdir / ".zshenv"}
@@ -353,3 +371,5 @@ def main(encoded):
     print("Configured guest " + canonical + ". " + str(message))
     print("Installed the Friendzone Cline plugin for async GraphQL, reviewed Git publication, and session updates.")
     print("Activate this terminal, then restart guest Cline so it inherits the environment:\n  . " + shlex.quote(str(activation)))
+    print("Direct-by-default setup: set your application's PAC URL to " + data["broker"] + "/bootstrap/proxy.pac")
+    print("For Cline CLI or other non-PAC clients that need escrow, use the explicit compatibility profile:\n  . " + shlex.quote(str(config / "friendzone-proxy-env.sh")))

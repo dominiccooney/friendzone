@@ -350,9 +350,9 @@ sets Cargo's native `CARGO_HTTP_CAINFO` to the same managed CA bundle. Cargo's
 Windows-only revocation lookup is disabled because dynamically issued
 Friendzone certificates have no public revocation responder; chain and hostname
 verification remain enabled.
-It also configures the current user's Windows Internet proxy so WinINET-aware and
+It also configures selective current-user Windows PAC so WinINET-aware and
 modern .NET clients can route through Friendzone without relying on environment
-variables. Existing bypass entries are preserved. This is not machine-wide
+variables. Original settings are retained for rollback. This is not machine-wide
 WinHTTP configuration. Setup tracks roots it installed, rotates only those roots,
 and removes only those exact roots during rollback. Restart applications that
 cache proxy or trust settings.
@@ -366,13 +366,16 @@ BASH_ENV inherited from an activated parent. Plain sh and service launchers
 need explicit environment inheritance.
 
 Windows activates its PowerShell process, saves user environment variables, sets
-the current-user Windows Internet proxy, and trusts the CA in `CurrentUser\Root`.
+the current-user Windows PAC URL, and trusts the CA in `CurrentUser\Root`.
 Restart guest applications; sign out/in for other Windows launchers to acquire
 a fresh environment. Machine environment, WinHTTP, and execution policy are unchanged.
 
 Approve/pin the guest in the host Inbox, then restart guest Cline. The generated
-environment includes broker and loopback NO_PROXY entries, both proxy cases on
-Linux, fake provider keys and runtime CA paths. Linux setup also installs the
+environment includes broker and loopback NO_PROXY entries, explicit FZ_PROXY
+and FZ_PAC_URL values, fake provider keys and runtime CA paths. Global proxy
+variables are not installed. **Cline CLI requires the generated compatibility
+profile to use escrow;** see [selective routing](GUEST-BOOTSTRAP.md#selective-routing).
+Git is configured per escrow host. Linux setup also installs the
 native root. A Rust binary compiled with WebPKI-only roots must still be rebuilt
 with native-root support; system configuration cannot alter roots embedded in a
 binary. See

@@ -65,16 +65,22 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     $origin=[Uri]$Data.broker
     $builder=New-Object UriBuilder('http',$origin.Host,[int]$Data.proxy_port)
     $proxy=$builder.Uri.AbsoluteUri.TrimEnd('/')
-    $values=@{FZ_HOST=$origin.DnsSafeHost;FZ_BROKER=$Data.broker;HTTP_PROXY=$proxy;HTTPS_PROXY=$proxy}
+    $values=@{FZ_HOST=$origin.DnsSafeHost;FZ_BROKER=$Data.broker;FZ_PROXY=$proxy;FZ_PAC_URL=$Data.broker+'/bootstrap/proxy.pac';FZ_PROXY_HOSTS=(@($Data.proxy_hosts)-join ',')}
     foreach($key in @('NODE_EXTRA_CA_CERTS','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','GIT_SSL_CAINFO','GIT_PROXY_SSL_CAINFO','CARGO_HTTP_CAINFO')) {$values[$key]=$cert}
     # Friendzone's dynamic leaf certificates have no public CRL/OCSP endpoint.
     # Cargo/Schannel must skip revocation lookup while retaining CA/host checks.
     $values.CARGO_HTTP_CHECK_REVOKE='false'
     foreach($property in $Data.fakes.PSObject.Properties) {$values[$property.Name]=[string]$property.Value}
-    $values.NO_PROXY=$origin.DnsSafeHost+',localhost,127.0.0.1,::1,[::1]'
+    $values.NO_PROXY=(@($origin.DnsSafeHost,'localhost','127.0.0.1','::1','[::1]')+@($Data.infrastructure_no_proxy)) -join ','
     Add-FzGitConfiguration $values $gitConfig
     $lines=@('# Friendzone guest environment')
     $oldValuesPath=Join-Path $ConfigDirectory 'user-environment.json'
+    $retiredProxyPath=Join-Path $ConfigDirectory 'retired-proxy-values.json'
+    $retiredProxies=@{}
+    if(Test-Path -LiteralPath $retiredProxyPath){
+        $retired=Get-Content -Raw -LiteralPath $retiredProxyPath|ConvertFrom-Json
+        foreach($property in $retired.PSObject.Properties){$retiredProxies[$property.Name]=[string]$property.Value}
+    }
     $legacyIdleMarker=Join-Path $ConfigDirectory 'remove-legacy-cline-idle-timeout'
     $removeLegacyIdle=(Test-Path -LiteralPath $legacyIdleMarker)
     $legacyIdlePrevious=$null
@@ -86,6 +92,9 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     if(Test-Path -LiteralPath $oldValuesPath){
         try{$oldValues=Get-Content -Raw -LiteralPath $oldValuesPath|ConvertFrom-Json;$removeLegacyIdle=$removeLegacyIdle -or ($oldValues.CLINE_PLUGIN_IDLE_TIMEOUT_MS -ceq '90000000');if($null-ne$oldValues.PSObject.Properties['GITHUB_TOKEN']-and-not$values.ContainsKey('GITHUB_TOKEN')){$retiredGithubToken=[string]$oldValues.GITHUB_TOKEN}}catch{}
     }
+    foreach($key in @('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY')){
+        if($null-ne$oldValues -and $null-ne$oldValues.PSObject.Properties[$key]){$retiredProxies[$key]=[string]$oldValues.$key}
+    }
     if($removeLegacyIdle -and (Test-Path -LiteralPath $legacyIdleMarker)){
         try{$legacyIdlePrevious=(Get-Content -Raw -LiteralPath $legacyIdleMarker|ConvertFrom-Json).previous}catch{}
     }elseif($removeLegacyIdle -and (Test-Path -LiteralPath $backupPath)){
@@ -93,6 +102,10 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     }
     foreach($key in $values.Keys) {
         if ($key -ne 'NO_PROXY') {$lines += '[Environment]::SetEnvironmentVariable('+(Quote-FzPowerShell $key)+','+(Quote-FzPowerShell $values[$key])+",'Process')"}
+    }
+    foreach($key in @('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY')){
+        $oldProxy=if($retiredProxies.ContainsKey($key)){$retiredProxies[$key]}else{$proxy}
+        $lines += 'if ($env:'+ $key +' -ceq '+(Quote-FzPowerShell $oldProxy)+' -or $env:'+ $key +' -ceq '+(Quote-FzPowerShell $proxy)+') { Remove-Item Env:'+ $key +' }'
     }
     if($null-ne$retiredGithubToken){$lines += 'if ($env:GITHUB_TOKEN -ceq '+(Quote-FzPowerShell $retiredGithubToken)+') { Remove-Item Env:GITHUB_TOKEN }'}
     $lines += '$env:NO_PROXY = @(('+ (Quote-FzPowerShell $values.NO_PROXY) + ' + '','' + $env:NO_PROXY).Split('','') | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique) -join '','''
@@ -121,6 +134,9 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     if($removeLegacyIdle){Write-FzFile $legacyIdleMarker (ConvertTo-Json -InputObject @{previous=$legacyIdlePrevious})}
     Write-FzFile $cert $Data.ca
     Write-FzFile $envFile ($lines -join "`n")
+    Write-FzFile $retiredProxyPath (ConvertTo-Json -InputObject $retiredProxies)
+    $compatibility=@('. '+(Quote-FzPowerShell $envFile),'$env:HTTP_PROXY=$env:FZ_PROXY','$env:HTTPS_PROXY=$env:FZ_PROXY')
+    Write-FzFile (Join-Path $ConfigDirectory 'friendzone-proxy-env.ps1') ($compatibility -join "`n")
     if($providerJson){Write-FzFile $provider $providerJson}
     $valuesPath=$oldValuesPath
     Write-FzFile $valuesPath (ConvertTo-Json -InputObject $values)
@@ -194,6 +210,7 @@ function Start-FzGuestSetup($Data) {
     if([string]::IsNullOrWhiteSpace($registrationMessage)){$registrationMessage=if($approval.approved){'Approved and pinned.'}else{'Use Approve + pin IP in the host Inbox.'}}
     Write-Host ('Configured guest '+$Data.container+'. '+$registrationMessage)
     Write-Host 'Installed the Friendzone Cline plugin for async GraphQL, reviewed Git publication, and session updates.'
-    Write-Host 'Trusted the Friendzone CA and configured the current-user Windows Internet proxy. Restart applications that cache proxy or TLS settings.'
-    Write-Host 'Restart guest Cline from this terminal. Sign out/in to refresh other Windows launchers.'
+    Write-Host 'Trusted the Friendzone CA and configured selective current-user Windows PAC. Restart applications that cache proxy or TLS settings.'
+    Write-Host ('Cline CLI and other non-PAC clients need the explicit compatibility profile when using escrow: . '+(Quote-FzPowerShell (Join-Path $config 'friendzone-proxy-env.ps1')))
+    Write-Host 'Sign out/in to refresh other Windows launchers. Normal setup does not set global HTTP_PROXY/HTTPS_PROXY.'
 }
