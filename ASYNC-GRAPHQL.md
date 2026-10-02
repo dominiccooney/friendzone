@@ -126,6 +126,12 @@ test this boundary.
 
 ## Limits and durability
 
+`friendzone_upload_file` is a separate synchronous binary transfer: upload first,
+receive a URL/Markdown, then use it in a description or comment. It needs no
+issue/PR/comment ID and does not publish one. See the
+[file-upload workflow](README.md#upload-files-before-posting-descriptions-or-comments)
+for provider credential setup, limits and memory-only recovery.
+
 This is separate from the **unchanged 64 KiB, 120-second proxy review**:
 
 | Limit | GraphQL jobs | Git publication jobs |

@@ -3,6 +3,7 @@ let snapshot = { containers: [], requests: [], pending_requests: [] };
 let snapshotRevision = 0;
 let logRows = [], logCursor = null, logPaused = false, logGeneration = 0, logTimer;
 let order = readStoredOrder();
+let guestRegistrySignature = null;
 let mcpConnectData = null, mcpHostInitialized = false, mcpConnectGeneration = 0, mcpGuestSignature = "";
 const mcpOAuthPolls = new Map();
 let reviewingMcp = null;
@@ -40,7 +41,7 @@ function clineAccessControl(container) {
   const current = container.cline_access === "full" ? "full" : "basic";
   return `<label class="cline-access"><span class="sr-only">Cline API access for ${esc(container.name)}</span><select class="cline-access-select" aria-label="Cline API access for ${esc(container.name)}" title="What this guest may do on api.cline.bot. Basic: inference, model catalog, account/organization basics; cloud sessions look empty and cannot be created or driven. Full: everything except API key management, which is never available to guests.">${Object.entries(CLINE_ACCESS_LABELS).map(([value,label])=>`<option value="${value}"${value===current?" selected":""}>${esc(label)}</option>`).join("")}</select></label>`;
 }
-function ordered(containers) { return [...containers].sort((a,b) => { const ai=order.indexOf(a.id),bi=order.indexOf(b.id); if(ai<0&&bi<0)return 0;if(ai<0)return 1;if(bi<0)return-1;return ai-bi; }); }
+function ordered(containers) { return [...containers].sort((a,b) => { const ai=order.indexOf(a.id),bi=order.indexOf(b.id); if(ai<0&&bi<0)return a.id<b.id?-1:a.id>b.id?1:0;if(ai<0)return 1;if(bi<0)return-1;return ai-bi; }); }
 
 async function setKilled(id, killed) {
   const response = await fetch(`/api/containers/${encodeURIComponent(id)}/kill`, {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({killed})});
@@ -76,15 +77,27 @@ function renderContainers() {
 // A guest has one card: actionable joins in Inbox, managed guests in Settings.
 // Both use the same policy handlers; moving a card never changes its permissions.
 function renderGuestRegistry() {
+  const containers = ordered(snapshot.containers);
   const joins = guestJoinRequests();
-  const joining = $("#joining-guests"); joining.innerHTML = "";
-  const root = $("#containers"); root.innerHTML = "";
   $("#join-count").textContent = joins.length;
   $("#guest-joins").hidden = !joins.length && !$("#join-error").textContent;
   $("#review-guest-joins").hidden = !joins.length;
   $("#review-guest-joins").textContent = `Review ${joins.length} join request${joins.length===1?"":"s"} in Inbox`;
+  // Traffic updates change only text. Preserve controls, focus and open menus
+  // until guest membership, policy or the saved display order changes.
+  const signature = JSON.stringify(containers.map(({last_activity,request_count,...configuration})=>configuration));
+  if (signature === guestRegistrySignature) {
+    const byId = new Map(containers.map(container=>[container.id,container]));
+    for (const section of document.querySelectorAll("#containers .container, #joining-guests .container")) {
+      const container = byId.get(section.dataset.id);
+      section.querySelector(".container-traffic").textContent = `${container.request_count} retained requests · ${containerTraffic(container)}`;
+    }
+    return;
+  }
+  const joining = $("#joining-guests"); joining.innerHTML = "";
+  const root = $("#containers"); root.innerHTML = "";
   if (snapshot.containers.length === joins.length) root.append($("#empty-template").content.cloneNode(true));
-  for (const c of ordered(snapshot.containers)) {
+  for (const c of containers) {
     const killed = c.state === "killed";
     const pending = !killed && !c.approved;
     const section = document.createElement("section");
@@ -94,7 +107,7 @@ function renderGuestRegistry() {
     const actions = pending
       ? `<span class="state killed">awaiting approval</span><button class="approve-pin">Approve + pin IP</button><button class="quiet approve">Approve without pin (legacy)</button><button class="quiet remove">Deny</button>`
       : `<span class="state ${killed?"killed":"approved"}" title="Network authorization, not agent activity">${containerStatus(c)}</span>${clineAccessControl(c)}<button class="stop ${killed?"resume":""}">${killed?"Resume":"Kill"}</button><button class="quiet pin-edit">Pin…</button><button class="quiet remove">Remove</button>`;
-    section.innerHTML = `<div class="container-head"><span class="status-dot" style="background:${killed?"var(--red)":"#999"}" title="${esc(containerStatus(c))}; agent activity is not monitored"></span><div><div class="container-name">${esc(c.name)}</div><div class="meta">${c.request_count} retained requests · ${esc(containerTraffic(c))} · ${pin} · ${esc(clineAccessLabel(c))}</div></div><div class="actions">${actions}</div></div>${pending?'<div class="container-body">Join request · Approve + pin IP for credential-free access. New guests start with basic Cline access (inference and account basics only).</div>':""}`;
+    section.innerHTML = `<div class="container-head"><span class="status-dot" style="background:${killed?"var(--red)":"#999"}" title="${esc(containerStatus(c))}; agent activity is not monitored"></span><div><div class="container-name">${esc(c.name)}</div><div class="meta"><span class="container-traffic">${c.request_count} retained requests · ${esc(containerTraffic(c))}</span> · ${pin} · ${esc(clineAccessLabel(c))}</div></div><div class="actions">${actions}</div></div>${pending?'<div class="container-body">Join request · Approve + pin IP for credential-free access. New guests start with basic Cline access (inference and account basics only).</div>':""}`;
     section.querySelector(".stop")?.addEventListener("click", () => {$("#container-error").textContent="";return setKilled(c.id, !killed).catch(showContainerError);});
     section.querySelector(".cline-access-select")?.addEventListener("change", async (event) => {
       const access = event.target.value;
@@ -123,6 +136,7 @@ function renderGuestRegistry() {
     (pending ? joining : root).append(section);
   }
   root.ondragover = e => { e.preventDefault(); const active=root.querySelector(".dragging");if(!active)return;const next=[...root.querySelectorAll(".container:not(.dragging)")].find(n=>e.clientY<n.getBoundingClientRect().top+n.offsetHeight/2);root.insertBefore(active,next||null); };
+  guestRegistrySignature = signature;
 }
 
 function renderLog() {
@@ -355,6 +369,7 @@ function applyReviewOutcome(summary) {
   $("#request-review-outcome").textContent = reviewOutcomeText(activeReview) || (waiting ? "Waiting for your decision." : "");
   $("#request-review-upstream").textContent = upstreamDiagnostics(activeReview);
   renderGraphqlResponseDiagnostics(activeReview);
+  renderFileUploadReview(activeReview);
   $("#request-review-actions").hidden = !waiting;
   $("#request-approve").disabled = !waiting || decisionInFlight === activeReview.id;
   $("#request-deny").disabled = !waiting || decisionInFlight === activeReview.id;
@@ -417,6 +432,7 @@ async function openRequestReview(id, {historyMode="push"} = {}) {
     $("#request-review-body").textContent = detail.body || "(empty body)";
     renderGraphqlReview(detail.graphql);
     renderGitPushReview(detail.git_push);
+    renderFileUploadReview(detail);
     $("#request-raw-summary").textContent=detail.git_push?"Publication identity":"Exact request body";
     $("#request-raw").open = !detail.git_push && detail.graphql?.status !== "parsed";
     renderCommentPermissionPanel(detail);
@@ -587,6 +603,16 @@ function renderGitPushReview(review) {
   $("#request-git-push-patch").textContent=review?.patch||"";
 }
 
+function renderFileUploadReview(detail) {
+  const upload=detail.file_upload, panel=$("#request-file-upload"), image=$("#request-file-upload-image"), link=$("#request-file-upload-download");
+  panel.hidden=!upload;image.hidden=true;image.removeAttribute("src");link.hidden=true;link.removeAttribute("href");
+  $("#request-file-upload-metadata").textContent=upload?`${upload.filename} · ${upload.content_type}\nDestination: ${upload.destination}${upload.repository?` · ${upload.repository}`:""}\n${upload.bytes} bytes · File SHA-256 ${upload.sha256}\nHost credential: ${upload.credential}${upload.url?`\nUploaded URL: ${upload.url}`:""}`:"";
+  if(!upload || !["pending","approved","sending"].includes(detail.status))return;
+  const path=`/api/requests/${encodeURIComponent(detail.id)}/file`;
+  link.href=path;link.hidden=false;
+  if(["image/png","image/jpeg","image/gif"].includes(upload.content_type)){image.src=path;image.alt=upload.filename;image.hidden=false;}
+}
+
 async function decideRequest(decision) {
   if (!activeReview || (activeReview.status && activeReview.status !== "pending") || decisionInFlight === activeReview.id) return;
   const reviewed = activeReview;
@@ -665,8 +691,12 @@ const PROVIDER_PRESETS = {
     hint: "Leave the key field empty and click Add, then click 'Sign in with Cline…' on its row — the broker signs in with your Cline account and refreshes tokens automatically. Static Cline API keys are not supported. Guests receive the fake through CLINE_API_KEY and an OAuth-shaped facade in their Cline settings; each guest's Cline API access (basic or full) is set under Settings → Guests.",
   },
   github: {
-    name: "github", hosts: "api.github.com,github.com,codeload.github.com", header: "authorization", prefix: "Bearer ", guest: "GITHUB_TOKEN",
+    name: "github", hosts: "api.github.com,github.com,codeload.github.com,uploads.github.com", header: "authorization", prefix: "Bearer ", guest: "GITHUB_TOKEN",
     hint: "Use a fine-grained PAT from github.com → Settings → Developer settings → Personal access tokens (narrow scopes recommended), or reuse the gh CLI's token: run `gh auth token`. Agents and gh read the fake from GITHUB_TOKEN. GitHub GraphQL queries flow automatically. PR/review writes and tool-submitted Git branch bundles require Approve once in Inbox. Ordinary git push remains blocked. Approval cannot grant scopes your token lacks.",
+  },
+  linear: {
+    name:"linear",hosts:"api.linear.app",header:"authorization",prefix:"",guest:"LINEAR_API_KEY",
+    hint:"Create a Linear API key with file-write access and paste it here on the host. The guest receives only its fake LINEAR_API_KEY. friendzone_upload_file uploads first and returns a private Linear URL for descriptions/comments/documents; it does not create an issue or comment. This credential is separate from MCP OAuth.",
   },
   custom: { name: "", hosts: "", header: "", prefix: "", guest: "", hint: "Fill the advanced fields: pinned hosts, credential header, optional 'Bearer ' prefix, and the env var the agent expects." },
 };

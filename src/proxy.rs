@@ -2932,7 +2932,7 @@ mod tests {
         task.abort();
         let response = response.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(response.text().await.unwrap().contains("GitHub writes"));
+        assert!(response.text().await.unwrap().contains("write requires review"));
         let events = state.view().requests;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].container, "guest");

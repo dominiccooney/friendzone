@@ -33,13 +33,16 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
   const permissionActions=[];
   const guestActions=[];
   let failGuestChange = false;
+  const eventClients = new Set();
+  const publishState = () => { for (const response of eventClients) response.write("data: " + JSON.stringify(state) + "\n\n"); };
   const resolvedTarget={target:{node_id:"canonical",repository_id:"repo-id",repository:"cline/cline",kind:"Issue",number:482,title:"<img src=x onerror=window.pwned=true> A real issue",url:"https://github.com/cline/cline/issues/482"},credential:"github"};
   detail.comment_permission_supported=true;
   const server = http.createServer((request, response) => {
     const route = request.url.split("?")[0];
     if (route === "/api/events") {
       response.writeHead(200, { "content-type": "text/event-stream" });
-      response.write("data: " + JSON.stringify(state) + "\n\n"); return;
+      response.write("data: " + JSON.stringify(state) + "\n\n");
+      eventClients.add(response); response.on("close",()=>eventClients.delete(response)); return;
     }
     if (route === "/api/bootstrap/commands") {
       response.writeHead(200,{"content-type":"application/json"});
@@ -64,7 +67,7 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
         response.writeHead(204); response.end();
       }); return;
     }
-    if (route === "/api/containers" || /^\/api\/containers\/[^/]+(?:\/(approve|kill|pin))?$/.test(route)) {
+    if (route === "/api/containers" || /^\/api\/containers\/[^/]+(?:\/(approve|kill|pin|cline-access))?$/.test(route)) {
       let body="";request.on("data",chunk=>body+=chunk);request.on("end",()=>{
         const data=body?JSON.parse(body):{};
         guestActions.push({route,method:request.method,body:data});
@@ -76,6 +79,7 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
         else if(action==="approve"){guest.approved=true;guest.state="approved";if(data.pin_to_last_ip)guest.pinned_ip="10.0.0.2";}
         else if(action==="kill")guest.state=data.killed?"killed":"approved";
         else if(action==="pin")guest.pinned_ip=data.ip;
+        else if(action==="cline-access")guest.cline_access=data.access;
         response.writeHead(204);response.end();
       });return;
     }
@@ -182,6 +186,31 @@ test("MCP cards show full URLs and usable actions at desktop and narrow widths",
       if(process.env.FZ_SCREENSHOT_DIR){const shot=await send('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(process.env.FZ_SCREENSHOT_DIR,`guest-management-${width}.png`),Buffer.from(shot.data,'base64'));}
     }
     assert.equal(await evaluate("document.querySelector('#guest-preapprove').open"),false);
+    // Live traffic may reorder the incoming snapshot, but must neither replace
+    // the focused dropdown nor reset an in-progress selection or drag order.
+    await evaluate(`selectView('settings');selectSettings('guests');window.confirm=()=>true;
+      window.guestCards=[...document.querySelectorAll('#containers .container')];
+      window.guestDropdown=document.querySelector('[data-id=scratch-kali] .cline-access-select');guestDropdown.focus();guestDropdown.value='full'`);
+    assert.deepEqual(await evaluate("[...document.querySelectorAll('#containers .container')].map(card=>card.dataset.id)"),["joining-guest","scratch-kali"]);
+    for(let index=1;index<=5;index++) {
+      for(const guest of state.containers){guest.request_count=index;guest.last_activity=new Date(Date.now()+index*1000).toISOString();}
+      state.containers.reverse();publishState();
+      for(let wait=0;wait<100&&!await evaluate(`document.querySelector('[data-id=scratch-kali] .container-traffic').textContent.startsWith('${index} retained requests')`);wait++)await delay(10);
+      assert.equal(await evaluate("guestDropdown===document.querySelector('[data-id=scratch-kali] .cline-access-select') && document.activeElement===guestDropdown && guestDropdown.value==='full'"),true);
+      assert.equal(await evaluate("guestCards.every((card,index)=>card===document.querySelectorAll('#containers .container')[index])"),true);
+    }
+    await evaluate("guestDropdown.dispatchEvent(new Event('change',{bubbles:true}))");
+    for(let wait=0;wait<100&&!guestActions.some(action=>action.route.endsWith('/cline-access'));wait++)await delay(10);
+    assert.deepEqual(guestActions.find(action=>action.route.endsWith('/cline-access')).body,{access:"full"});
+    for(let wait=0;wait<100&&!await evaluate("snapshot.containers.find(guest=>guest.id==='scratch-kali').cline_access==='full'");wait++)await delay(10);
+    assert.equal(await evaluate("snapshot.containers.find(guest=>guest.id==='scratch-kali').cline_access"),'full');
+    await evaluate(`(() => {const root=document.querySelector('#containers'),card=root.querySelector('[data-id=scratch-kali]');root.insertBefore(card,root.firstElementChild);card.dispatchEvent(new Event('dragend'));renderGuestRegistry();window.draggedDropdown=document.querySelector('[data-id=scratch-kali] .cline-access-select');})()`);
+    state.containers.reverse();publishState();await delay(50);
+    assert.deepEqual(await evaluate("[...document.querySelectorAll('#containers .container')].map(card=>card.dataset.id)"),["scratch-kali","joining-guest"]);
+    assert.equal(await evaluate("draggedDropdown===document.querySelector('[data-id=scratch-kali] .cline-access-select')"),true);
+    assert.deepEqual(await evaluate("JSON.parse(localStorage.getItem('fz-order'))"),["scratch-kali","joining-guest"]);
+    for(const guest of state.containers){guest.request_count=0;guest.last_activity=null;}publishState();
+    for(let wait=0;wait<100&&!await evaluate("document.querySelector('[data-id=scratch-kali] .container-traffic').textContent.includes('No guest traffic observed')");wait++)await delay(10);
     // Managed operations still use the same API and expose failures beside the card.
     failGuestChange=true;
     await evaluate("document.querySelector('[data-id=joining-guest] .stop').click()");

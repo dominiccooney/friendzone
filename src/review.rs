@@ -249,6 +249,8 @@ pub struct Detail {
     /// The bundle itself stays in the host-only durable artifact store.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_push: Option<crate::pushes::Review>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_upload: Option<crate::uploads::Review>,
     /// Bounded evidence explaining an application-level GraphQL error. This is
     /// separate from HTTP status because a valid HTTP 200 response can contain
     /// GraphQL execution/validation errors.
@@ -368,6 +370,8 @@ impl Detail {
         });
         let reason = if is_graphql {
             "GitHub GraphQL operation requires approval."
+        } else if request.uri().host() == Some("api.linear.app") {
+            "Linear API operation requires approval."
         } else {
             "GitHub operation requires approval."
         };
@@ -396,6 +400,7 @@ impl Detail {
             body: body.into(),
             graphql,
             git_push: None,
+            file_upload: None,
             graphql_response: None,
             graphql_read,
             comment_permission_supported: false,
@@ -505,6 +510,11 @@ impl QueueData {
         // Retained snapshots are read-only: never a source of new grants.
         entry.detail.comment_context = None;
         entry.detail.comment_permission_supported = false;
+        if status != Status::Approved
+            && let Some(upload) = &mut entry.detail.file_upload
+        {
+            upload.content = None;
+        }
         self.recent.push_back(entry.detail);
         while self.recent.len() > HISTORY_LIMIT {
             self.recent.pop_front();
@@ -622,6 +632,62 @@ impl Queue {
                     .cloned()
             })
     }
+    pub fn upload_result(&self, id: Uuid, url: String) {
+        let mut entries = self.0.entries.lock().expect("review queue");
+        if let Some(detail) = entries.recent.iter_mut().find(|item| item.summary.id == id)
+            && let Some(upload) = &mut detail.file_upload
+        {
+            upload.url = Some(url);
+        }
+    }
+    pub fn guest_uploads(
+        &self,
+        container: &str,
+        instance: Uuid,
+        session: &str,
+    ) -> Vec<serde_json::Value> {
+        let entries = self.0.entries.lock().expect("review queue");
+        entries
+            .pending
+            .values()
+            .map(|entry| &entry.detail)
+            .chain(entries.recent.iter())
+            .filter_map(|detail| crate::uploads::guest_result(detail, container, instance, session))
+            .collect()
+    }
+    pub fn change_guest_upload(
+        &self,
+        id: Uuid,
+        container: &str,
+        instance: Uuid,
+        session: &str,
+        remove: bool,
+    ) -> Result<()> {
+        let mut entries = self.0.entries.lock().expect("review queue");
+        let detail = entries
+            .pending
+            .get(&id)
+            .map(|entry| &entry.detail)
+            .or_else(|| entries.recent.iter().find(|detail| detail.summary.id == id))
+            .context("upload not found")?;
+        if crate::uploads::guest_result(detail, container, instance, session).is_none() {
+            bail!("upload not found");
+        }
+        if remove {
+            if detail.summary.status.active() {
+                bail!("finish or cancel upload before removing it");
+            }
+            entries.recent.retain(|detail| detail.summary.id != id);
+        } else {
+            if detail.summary.status != Status::Pending {
+                bail!("only a pending upload can be cancelled; sending uploads cannot be undone");
+            }
+            entries.archive(id, Status::Cancelled, "Cancelled by guest. Not sent.");
+        }
+        drop(entries);
+        self.notify();
+        Ok(())
+    }
     #[cfg(test)]
     pub fn recent(&self) -> Vec<Summary> {
         self.0
@@ -706,6 +772,11 @@ impl Queue {
         detail.summary.updated_at = Utc::now();
         detail.summary.http_status = http_status;
         detail.summary.outcome = Some(outcome.into());
+        if !status.active()
+            && let Some(upload) = &mut detail.file_upload
+        {
+            upload.content = None;
+        }
         drop(entries);
         self.notify();
     }

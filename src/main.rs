@@ -20,6 +20,7 @@ mod settings;
 mod state;
 mod storage;
 mod telemetry;
+mod uploads;
 mod web;
 
 use std::{net::SocketAddr, path::PathBuf};

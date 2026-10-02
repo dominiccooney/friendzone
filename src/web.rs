@@ -37,6 +37,7 @@ struct BootstrapState {
     settings: crate::settings::Settings,
     proxy_port: u16,
     trace_relay: Option<crate::telemetry::TraceRelay>,
+    uploads: crate::uploads::Client,
 }
 
 /// Scans `<data-dir>/guest-bin/` for cross-built `fz` binaries to serve
@@ -106,6 +107,7 @@ pub async fn serve_bootstrap(
             settings,
             proxy_port,
             trace_relay,
+            uploads: crate::uploads::Client::default(),
         }),
         "bootstrap server",
     )
@@ -134,6 +136,7 @@ fn ui_router(state: UiState) -> Router {
         .route("/api/log", get(api_log))
         .route("/api/events", get(state_events))
         .route("/api/requests/{id}", get(review_request))
+        .route("/api/requests/{id}/file", get(review_upload_file))
         .route("/api/requests/{id}/decision", post(decide_request))
         .route(
             "/api/requests/{id}/github-target",
@@ -827,6 +830,7 @@ fn bootstrap_router(state: BootstrapState) -> Router {
         )
         .route("/guest/jobs", post(submit_job).get(list_jobs))
         .route("/guest/git-push", post(submit_git_push))
+        .route("/guest/uploads", post(upload_file))
         .route("/guest/jobs/{id}", get(get_job).delete(delete_job))
         .route("/guest/jobs/{id}/cancel", post(cancel_job))
         .route("/guest/jobs/{id}/acknowledge", post(acknowledge_job))
@@ -940,6 +944,80 @@ fn job_identity(
         .context("guest killed or unauthorized")?;
     Ok((name, instance))
 }
+
+async fn upload_file(
+    State(state): State<BootstrapState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    axum::extract::Query(input): axum::extract::Query<crate::uploads::Submission>,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    use http_body_util::BodyExt as _;
+    let (name, _) = match job_identity(&state, request.headers(), peer) {
+        Ok(identity) => identity,
+        Err(error) => return (StatusCode::FORBIDDEN, error.to_string()).into_response(),
+    };
+    let Some(epoch) = state.mcp.app.review_epoch(&name, peer.ip()) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if let Err(error) = input.validate() {
+        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+    }
+    if request.headers().contains_key(header::CONTENT_ENCODING) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "encoded file uploads are not supported",
+        )
+            .into_response();
+    }
+    let fake = request
+        .headers()
+        .get("x-friendzone-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let Ok(_slot) = crate::uploads::slots().clone().try_acquire_owned() else {
+        return (StatusCode::TOO_MANY_REQUESTS, "File upload slots busy").into_response();
+    };
+    let collected = match tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        http_body_util::Limited::new(request.into_body(), input.max_bytes()).collect(),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "File exceeds destination limit or upload was interrupted",
+            )
+                .into_response();
+        }
+        Err(_) => return (StatusCode::REQUEST_TIMEOUT, "File upload timed out").into_response(),
+    };
+    if collected.trailers().is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "File upload trailers are not supported",
+        )
+            .into_response();
+    }
+    match state
+        .uploads
+        .upload(
+            &state.mcp.app,
+            &state.settings,
+            crate::uploads::UploadRequest {
+                container: &name, peer: peer.ip(), fake: &fake, submission: input,
+                content: collected.to_bytes(), epoch,
+            },
+        )
+        .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
+}
+
 async fn submit_job(
     State(state): State<BootstrapState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
@@ -1109,6 +1187,13 @@ async fn list_jobs(
                     .pushes
                     .list(&name, instance, &query.session_id),
             );
+            jobs.extend(
+                state
+                    .mcp
+                    .app
+                    .reviews
+                    .guest_uploads(&name, instance, &query.session_id),
+            );
             Json(jobs).into_response()
         }
         Err(e) => (StatusCode::FORBIDDEN, e.to_string()).into_response(),
@@ -1134,6 +1219,22 @@ async fn get_job(
                 .app
                 .jobs
                 .get(&name, instance, id, &query.session_id)
+                .or_else(|error| {
+                    state
+                        .mcp
+                        .app
+                        .reviews
+                        .inspect(id)
+                        .and_then(|detail| {
+                            crate::uploads::guest_result(
+                                &detail,
+                                &name,
+                                instance,
+                                &query.session_id,
+                            )
+                        })
+                        .ok_or(error)
+                })
         }
     }) {
         Ok(value) => Json(value).into_response(),
@@ -1160,6 +1261,14 @@ async fn cancel_job(
                 .app
                 .jobs
                 .cancel(&name, instance, id, &query.session_id)
+                .or_else(|error| {
+                    state
+                        .mcp
+                        .app
+                        .reviews
+                        .change_guest_upload(id, &name, instance, &query.session_id, false)
+                        .map_err(|_| error)
+                })
         }
     }) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1186,6 +1295,23 @@ async fn acknowledge_job(
                 .app
                 .jobs
                 .acknowledge(&name, instance, id, &query.session_id)
+                .or_else(|error| {
+                    state
+                        .mcp
+                        .app
+                        .reviews
+                        .inspect(id)
+                        .and_then(|detail| {
+                            crate::uploads::guest_result(
+                                &detail,
+                                &name,
+                                instance,
+                                &query.session_id,
+                            )
+                        })
+                        .map(|_| ())
+                        .ok_or(error)
+                })
         }
     }) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1212,6 +1338,14 @@ async fn delete_job(
                 .app
                 .jobs
                 .delete(&name, instance, id, &query.session_id)
+                .or_else(|error| {
+                    state
+                        .mcp
+                        .app
+                        .reviews
+                        .change_guest_upload(id, &name, instance, &query.session_id, true)
+                        .map_err(|_| error)
+                })
         }
     }) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1487,6 +1621,61 @@ fn local_review_request(state: &UiState, headers: &axum::http::HeaderMap) -> boo
         && headers
             .get("sec-fetch-site")
             .is_none_or(|site| site != "cross-site")
+}
+
+async fn review_upload_file(
+    State(state): State<UiState>,
+    Path(id): Path<uuid::Uuid>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if !local_review_request(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(upload) = state
+        .app
+        .reviews
+        .inspect(id)
+        .and_then(|detail| detail.file_upload)
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(content) = upload.content else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let inline = matches!(
+        upload.submission.content_type.as_str(),
+        "image/png" | "image/jpeg" | "image/gif"
+    );
+    let mut response = content.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        if inline {
+            upload
+                .submission
+                .content_type
+                .parse()
+                .expect("validated MIME")
+        } else {
+            "application/octet-stream".parse().unwrap()
+        },
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        if inline { "inline" } else { "attachment" }
+            .parse()
+            .unwrap(),
+    );
+    response
+        .headers_mut()
+        .insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        "sandbox; default-src 'none'".parse().unwrap(),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
 }
 
 async fn review_request(
@@ -2020,6 +2209,365 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
+    async fn file_uploads_review_exact_binary_bytes_then_return_urls_without_posting_content() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let graphql = sent.clone();
+        let assets = sent.clone();
+        let linear = sent.clone();
+        let storage = sent.clone();
+        let receiver = Router::new()
+            .route("/graphql", post(move |headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| {
+                let sent = graphql.clone();
+                async move {
+                    sent.send(("lookup", headers, axum::body::Bytes::from(body.to_string()))).unwrap();
+                    Json(serde_json::json!({"data":{"repository":{"databaseId":42,"viewerPermission":"WRITE"}}}))
+                }
+            }))
+            .route("/assets", post(move |headers: axum::http::HeaderMap, axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String,String>>, body: axum::body::Bytes| {
+                let sent = assets.clone();
+                async move {
+                    assert_eq!(query["repository_id"], "42");
+                    assert_eq!(query["name"], "shot.png");
+                    assert_eq!(query["content_type"], "image/png");
+                    sent.send(("asset", headers, body)).unwrap();
+                    Json(serde_json::json!({"url":"https://github.com/user-attachments/assets/fixture"}))
+                }
+            }))
+            .route("/linear", post(move |headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| {
+                let sent = linear.clone();
+                async move {
+                    sent.send(("prepare", headers, axum::body::Bytes::from(body.to_string()))).unwrap();
+                    Json(serde_json::json!({"data":{"fileUpload":{"success":true,"uploadFile":{
+                        "uploadUrl":"https://storage.googleapis.com/linear-test/shot?X-Goog-Signature=test",
+                        "assetUrl":"https://uploads.linear.app/workspace/fixture",
+                        "headers":[{"key":"content-type","value":"image/png"},{"key":"cache-control","value":"public, max-age=31536000"},{"key":"x-goog-content-length-range","value":"100000,100000"},{"key":"Content-Disposition","value":"attachment; filename=\"shot.png\""}]
+                    }}}}))
+                }
+            }))
+            .route("/storage", axum::routing::put(move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                let sent = storage.clone();
+                async move { sent.send(("storage", headers, body)).unwrap(); StatusCode::OK }
+            }));
+        let receiver_task = tokio::spawn(async move { axum::serve(listener, receiver).await });
+        let settings = test_settings();
+        for (name, hosts, token) in [
+            (
+                "github",
+                vec!["api.github.com", "uploads.github.com"],
+                "ghp_fixture-secret",
+            ),
+            ("linear", vec!["api.linear.app"], "lin_api_fixture-secret"),
+        ] {
+            settings
+                .add_entry(crate::settings::EscrowEntry {
+                    name: name.into(),
+                    hosts: hosts.into_iter().map(str::to_owned).collect(),
+                    header: "authorization".into(),
+                    prefix: if name == "github" { "Bearer " } else { "" }.into(),
+                    fake: format!("fake-{name}"),
+                    real_env: None,
+                    guest_env: None,
+                })
+                .unwrap();
+            settings.set_secret(name, token).unwrap();
+        }
+        let app = AppState::default();
+        app.add_container("guest").unwrap();
+        app.set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
+            .unwrap();
+        let registry =
+            crate::mcp::ForwardRegistry::load(settings.data_dir(), settings.clone()).unwrap();
+        let bootstrap = bootstrap_router(BootstrapState {
+            cert: Arc::default(),
+            binary: Arc::default(),
+            guest_binaries: Arc::default(),
+            mcp: crate::mcp::McpState::new(app.clone(), registry.clone()),
+            settings: settings.clone(),
+            proxy_port: 8080,
+            trace_relay: None,
+            uploads: crate::uploads::Client::for_test(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap(),
+                &base,
+            ),
+        });
+        let ui = ui_router(UiState {
+            app: app.clone(),
+            settings: settings.clone(),
+            registry,
+            oauth: Default::default(),
+            cline: Default::default(),
+            ui_addr: "127.0.0.1:8081".parse().unwrap(),
+            bootstrap_addr: "127.0.0.1:8082".parse().unwrap(),
+        });
+        let bytes =
+            axum::body::Bytes::from((0..100000).map(|i| (i % 256) as u8).collect::<Vec<_>>());
+        let guest_request = |destination: &str,
+                             peer: &str,
+                             fake: &str,
+                             content: axum::body::Bytes| {
+            let uri = format!(
+                "/guest/uploads?destination={destination}&filename=shot.png&content_type=image/png&session_id=session{}",
+                if destination == "github" {
+                    "&repository=cline/cline"
+                } else {
+                    ""
+                }
+            );
+            let mut req = Request::post(uri)
+                .header("content-type", "application/octet-stream")
+                .header("x-friendzone-token", fake)
+                .body(Body::from(content))
+                .unwrap();
+            req.extensions_mut().insert(axum::extract::ConnectInfo(
+                peer.parse::<SocketAddr>().unwrap(),
+            ));
+            req
+        };
+        assert_eq!(
+            bootstrap
+                .clone()
+                .oneshot(guest_request(
+                    "github",
+                    "127.0.0.2:1234",
+                    "fake-github",
+                    bytes.clone()
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            bootstrap
+                .clone()
+                .oneshot(guest_request(
+                    "github",
+                    "127.0.0.1:1234",
+                    "wrong",
+                    bytes.clone()
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert!(app.reviews.summaries().is_empty());
+        assert!(received.try_recv().is_err());
+        for destination in ["github", "linear"] {
+            let request = guest_request(
+                destination,
+                "127.0.0.1:1234",
+                &format!("fake-{destination}"),
+                bytes.clone(),
+            );
+            let task = tokio::spawn(bootstrap.clone().oneshot(request));
+            let summary = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(summary) = app.reviews.summaries().first() {
+                        break summary.clone();
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let detail = app.reviews.detail(summary.id).unwrap();
+            let upload = detail.file_upload.as_ref().unwrap();
+            assert_eq!(upload.content.as_ref().unwrap(), &bytes);
+            assert!(
+                !serde_json::to_string(&detail)
+                    .unwrap()
+                    .contains("fixture-secret")
+            );
+            assert_eq!(detail.summary.body_bytes, bytes.len());
+            assert!(
+                detail.body.len() < bytes.len(),
+                "review metadata contains digest rather than binary/base64"
+            );
+            assert!(
+                received.try_recv().is_err(),
+                "no upstream calls before approval"
+            );
+            let response = ui
+                .clone()
+                .oneshot(
+                    Request::get(format!("/api/requests/{}/file", summary.id))
+                        .header("host", "localhost:8081")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 100001)
+                    .await
+                    .unwrap(),
+                bytes
+            );
+            assert!(
+                app.reviews
+                    .decide(
+                        summary.id,
+                        "wrong-fingerprint",
+                        crate::review::Decision::Approve
+                    )
+                    .is_err()
+            );
+            app.reviews
+                .decide(
+                    summary.id,
+                    &summary.fingerprint,
+                    crate::review::Decision::Approve,
+                )
+                .unwrap();
+            let response = task.await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let value: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                value["markdown"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("![shot.png]")
+            );
+            assert_eq!(
+                app.reviews.inspect(summary.id).unwrap().summary.status,
+                crate::review::Status::ResponseReceived
+            );
+            assert!(
+                app.reviews
+                    .inspect(summary.id)
+                    .unwrap()
+                    .file_upload
+                    .unwrap()
+                    .content
+                    .is_none()
+            );
+            let (kind, headers, body) = received.recv().await.unwrap();
+            if destination == "github" {
+                assert_eq!(kind, "lookup");
+                assert_eq!(headers["authorization"], "Bearer ghp_fixture-secret");
+                let lookup: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    lookup["variables"],
+                    serde_json::json!({"owner":"cline","name":"cline"})
+                );
+                let (kind, headers, body) = received.recv().await.unwrap();
+                assert_eq!(kind, "asset");
+                assert_eq!(headers["authorization"], "Bearer ghp_fixture-secret");
+                assert_eq!(headers["content-type"], "application/octet-stream");
+                assert_eq!(body, bytes);
+            } else {
+                assert_eq!(kind, "prepare");
+                assert_eq!(headers["authorization"], "lin_api_fixture-secret");
+                let prepare: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(prepare["variables"]["size"], bytes.len());
+                assert!(
+                    prepare["query"]
+                        .as_str()
+                        .unwrap()
+                        .contains("makePublic:false")
+                );
+                let (kind, headers, body) = received.recv().await.unwrap();
+                assert_eq!(kind, "storage");
+                assert!(!headers.contains_key("authorization"));
+                assert_eq!(headers["content-type"], "image/png");
+                assert_eq!(headers["x-goog-content-length-range"], "100000,100000");
+                assert_eq!(
+                    headers["content-disposition"],
+                    "attachment; filename=\"shot.png\""
+                );
+                assert_eq!(body, bytes);
+            }
+            let (instance, _) = app
+                .async_identity("guest", "127.0.0.1".parse().unwrap())
+                .unwrap();
+            let recovered = crate::uploads::guest_result(
+                &app.reviews.inspect(summary.id).unwrap(),
+                "guest",
+                instance,
+                "session",
+            )
+            .unwrap();
+            assert!(
+                recovered["result"]
+                    .as_str()
+                    .unwrap()
+                    .contains(value["url"].as_str().unwrap())
+            );
+            assert!(
+                crate::uploads::guest_result(
+                    &app.reviews.inspect(summary.id).unwrap(),
+                    "guest",
+                    instance,
+                    "other-session"
+                )
+                .is_none()
+            );
+        }
+        let task = tokio::spawn(bootstrap.clone().oneshot(guest_request(
+            "github",
+            "127.0.0.1:1234",
+            "fake-github",
+            bytes.clone(),
+        )));
+        let summary = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(summary) = app.reviews.summaries().first() {
+                    break summary.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        settings.set_secret("github", "ghp_rotated").unwrap();
+        app.reviews
+            .decide(
+                summary.id,
+                &summary.fingerprint,
+                crate::review::Decision::Approve,
+            )
+            .unwrap();
+        assert_eq!(task.await.unwrap().unwrap().status(), StatusCode::CONFLICT);
+        assert!(received.try_recv().is_err());
+        let oversized = axum::body::Bytes::from(vec![0; 10_000_001]);
+        assert_eq!(bootstrap.clone().oneshot(guest_request("github", "127.0.0.1:1234", "fake-github", oversized)).await.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
+        settings.set_secret("github", "ghp_fixture-secret").unwrap();
+        for action in ["deny", "cancel", "kill"] {
+            let task=tokio::spawn(bootstrap.clone().oneshot(guest_request("github", "127.0.0.1:1234", "fake-github", bytes.clone())));
+            let summary=tokio::time::timeout(std::time::Duration::from_secs(2), async {loop {if let Some(summary)=app.reviews.summaries().first(){break summary.clone();}tokio::task::yield_now().await;}}).await.unwrap();
+            match action {
+                "deny" => app.reviews.decide(summary.id, &summary.fingerprint, crate::review::Decision::Deny).unwrap(),
+                "cancel" => {
+                    let (instance, _) = app.async_identity("guest", "127.0.0.1".parse().unwrap()).unwrap();
+                    assert!(app.reviews.change_guest_upload(summary.id,"guest",instance,"wrong-session",false).is_err());
+                    app.reviews.change_guest_upload(summary.id,"guest",instance,"session",false).unwrap();
+                }
+                "kill" => app.set_killed("guest".into(),true).unwrap(),
+                _ => unreachable!(),
+            }
+            assert_eq!(task.await.unwrap().unwrap().status(), StatusCode::CONFLICT);
+            assert!(app.reviews.inspect(summary.id).unwrap().file_upload.unwrap().content.is_none());
+            assert!(received.try_recv().is_err());
+            if action=="kill"{app.set_killed("guest".into(),false).unwrap();}
+        }
+        receiver_task.abort();
+    }
+
+    #[tokio::test]
     async fn trace_relay_is_explicit_pinned_bounded_and_forwards_only_protobuf_body() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/v1/traces", listener.local_addr().unwrap());
@@ -2055,6 +2603,7 @@ mod tests {
             trace_relay: Some(
                 crate::telemetry::TraceRelay::new(endpoint.parse().unwrap()).unwrap(),
             ),
+            uploads: crate::uploads::Client::default(),
         };
         let router = bootstrap_router(state.clone());
         let request = |peer: &str, content_type: &str, body: Vec<u8>| {
@@ -2207,7 +2756,8 @@ mod tests {
             .body(hudsucker::Body::empty())
             .unwrap();
         let query = "mutation MisleadingRead { addPullRequestReview(input:{pullRequestId:\"pr\",event:APPROVE}){clientMutationId} addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:\"thread\",body:\"reply\"}){clientMutationId} unknown(input:{x:1}){id} }";
-        let body = serde_json::json!({"query":query,"operationName":null,"variables":null}).to_string();
+        let body =
+            serde_json::json!({"query":query,"operationName":null,"variables":null}).to_string();
         let mut detail =
             crate::review::Detail::from_request("guest", &request, body.as_bytes()).unwrap();
         detail.summary.display_binding = crate::github::display_credential(&settings, &request)
@@ -2294,23 +2844,48 @@ mod tests {
         }));
         assert!(view.comment_permissions.is_empty());
         let slow_body = serde_json::json!({"query":"mutation {addPullRequestReview(input:{pullRequestId:\"slow\",event:APPROVE}){clientMutationId}}"}).to_string();
-        let mut slow = crate::review::Detail::from_request("guest", &request, slow_body.as_bytes()).unwrap();
-        slow.summary.display_binding = crate::github::display_credential(&settings, &request).map(|credential| credential.binding);
+        let mut slow =
+            crate::review::Detail::from_request("guest", &request, slow_body.as_bytes()).unwrap();
+        slow.summary.display_binding = crate::github::display_credential(&settings, &request)
+            .map(|credential| credential.binding);
         let slow_id = slow.summary.id;
         let slow_fingerprint = slow.summary.fingerprint.clone();
         let slow_ticket = app.reviews.enqueue(slow).unwrap();
-        let lookup = tokio::spawn(ui.clone().oneshot(axum::http::Request::get(format!("/api/requests/{slow_id}")).header("host", "127.0.0.1:8081").body(axum::body::Body::empty()).unwrap()));
-        tokio::time::timeout(std::time::Duration::from_secs(2), lookup_started.recv()).await.unwrap().unwrap();
+        let lookup = tokio::spawn(
+            ui.clone().oneshot(
+                axum::http::Request::get(format!("/api/requests/{slow_id}"))
+                    .header("host", "127.0.0.1:8081")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            ),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), lookup_started.recv())
+            .await
+            .unwrap()
+            .unwrap();
         settings.set_secret("github", "rotated").unwrap();
-        app.reviews.decide(slow_id, &slow_fingerprint, crate::review::Decision::Deny).unwrap();
+        app.reviews
+            .decide(slow_id, &slow_fingerprint, crate::review::Decision::Deny)
+            .unwrap();
         release.add_permits(1);
         let response = lookup.await.unwrap().unwrap();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["status"], "denied", "outcome changes during a lookup remain visible");
+        assert_eq!(
+            json["status"], "denied",
+            "outcome changes during a lookup remain visible"
+        );
         assert!(json["graphql"]["analysis"]["operations"][0]["targets"][0]["lookup"].is_null());
-        assert!(json["graphql"]["analysis"]["operations"][0]["targets"][0]["error"].as_str().unwrap().contains("No current"));
-        assert_eq!(slow_ticket.wait().await.unwrap(), crate::review::Decision::Deny);
+        assert!(
+            json["graphql"]["analysis"]["operations"][0]["targets"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("No current")
+        );
+        assert_eq!(
+            slow_ticket.wait().await.unwrap(),
+            crate::review::Decision::Deny
+        );
         assert!(
             permission_state_view(&app, &settings)
                 .pending_requests
@@ -2358,6 +2933,7 @@ mod tests {
             settings: settings.clone(),
             proxy_port: 8080,
             trace_relay: None,
+            uploads: crate::uploads::Client::default(),
         });
         let ui = ui_router(UiState {
             app: app.clone(),
@@ -3513,6 +4089,7 @@ mod tests {
             settings,
             proxy_port: 8080,
             trace_relay: None,
+            uploads: crate::uploads::Client::default(),
         });
         let make_guest = |auth: bool| {
             let mut builder =
@@ -3713,6 +4290,7 @@ mod tests {
             settings: settings.clone(),
             proxy_port: 8080,
             trace_relay: None,
+            uploads: crate::uploads::Client::default(),
         });
         let config = serde_json::json!([{"name":"test", "url":"https://example.invalid/mcp", "tools":[], "guests":["guest"]}]);
         let saved = ui
@@ -4020,21 +4598,44 @@ mod tests {
         let cline = serde_json::json!({"name":"cline","hosts":["API.cline.bot"],"header":"authorization","prefix":"Bearer ","guest_env":"CLINE_API_KEY"});
         let mut with_key = cline.clone();
         with_key["real_value"] = "sk-static".into();
-        let response = ui.clone().oneshot(json("POST", "/api/escrow", with_key)).await.unwrap();
+        let response = ui
+            .clone()
+            .oneshot(json("POST", "/api/escrow", with_key))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(text(response).await.contains("OAuth-only"));
         assert!(settings.entries().is_empty());
         // Without a key the entry is created, disconnected until sign-in.
-        let response = ui.clone().oneshot(json("POST", "/api/escrow", cline)).await.unwrap();
+        let response = ui
+            .clone()
+            .oneshot(json("POST", "/api/escrow", cline))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
         for (method, path, body) in [
-            ("POST", "/api/escrow/cline/secret", serde_json::json!({"value":"sk-static"})),
-            ("PUT", "/api/escrow/cline", serde_json::json!({"hosts":["api.cline.bot"],"header":"authorization","prefix":"Bearer ","guest_env":"CLINE_API_KEY","real_value":"sk-static"})),
+            (
+                "POST",
+                "/api/escrow/cline/secret",
+                serde_json::json!({"value":"sk-static"}),
+            ),
+            (
+                "PUT",
+                "/api/escrow/cline",
+                serde_json::json!({"hosts":["api.cline.bot"],"header":"authorization","prefix":"Bearer ","guest_env":"CLINE_API_KEY","real_value":"sk-static"}),
+            ),
         ] {
             let response = ui.clone().oneshot(json(method, path, body)).await.unwrap();
-            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{method} {path}");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{method} {path}"
+            );
         }
-        assert!(settings.secret("cline").is_none(), "no static key may be stored");
+        assert!(
+            settings.secret("cline").is_none(),
+            "no static key may be stored"
+        );
         // A non-Cline entry cannot be re-pointed at Cline while pasting a key either.
         let response = ui
             .clone()
@@ -4050,61 +4651,109 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(settings.secret("other").as_deref(), Some("real"));
         // The UI never sees a Cline entry as connected without a session.
-        let list = ui.clone().oneshot(Request::get("/api/escrow").body(Body::empty()).unwrap()).await.unwrap();
+        let list = ui
+            .clone()
+            .oneshot(Request::get("/api/escrow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         let list: serde_json::Value = serde_json::from_str(&text(list).await).unwrap();
-        let entry = list["entries"].as_array().unwrap().iter().find(|e| e["name"] == "cline").unwrap();
+        let entry = list["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "cline")
+            .unwrap();
         assert_eq!(entry["connected"], false);
         // Sign-in attaches the account to an entry, so it is refused for entries
         // that are not Cline entries: the account cannot be pointed elsewhere.
         let response = ui
             .clone()
-            .oneshot(json("POST", "/api/escrow/other/cline-oauth/start", serde_json::json!({})))
+            .oneshot(json(
+                "POST",
+                "/api/escrow/other/cline-oauth/start",
+                serde_json::json!({}),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(text(response).await.contains("not pinned to api.cline.bot"));
         let response = ui
             .clone()
-            .oneshot(json("POST", "/api/escrow/missing/cline-oauth/start", serde_json::json!({})))
+            .oneshot(json(
+                "POST",
+                "/api/escrow/missing/cline-oauth/start",
+                serde_json::json!({}),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         // Per-guest Cline access: basic by default, changeable, validated, durable.
         let state = |ui: Router| async move {
-            let response = ui.oneshot(Request::get("/api/state").body(Body::empty()).unwrap()).await.unwrap();
+            let response = ui
+                .oneshot(Request::get("/api/state").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
             serde_json::from_str::<serde_json::Value>(&text(response).await).unwrap()
         };
-        assert_eq!(state(ui.clone()).await["containers"][0]["cline_access"], "basic");
+        assert_eq!(
+            state(ui.clone()).await["containers"][0]["cline_access"],
+            "basic"
+        );
         let response = ui
             .clone()
-            .oneshot(json("POST", "/api/containers/guest/cline-access", serde_json::json!({"access":"everything"})))
+            .oneshot(json(
+                "POST",
+                "/api/containers/guest/cline-access",
+                serde_json::json!({"access":"everything"}),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(app.cline_access("guest"), crate::state::ClineAccess::Basic);
         let response = ui
             .clone()
-            .oneshot(json("POST", "/api/containers/nobody/cline-access", serde_json::json!({"access":"full"})))
+            .oneshot(json(
+                "POST",
+                "/api/containers/nobody/cline-access",
+                serde_json::json!({"access":"full"}),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(text(response).await.contains("unknown container"));
         let response = ui
             .clone()
-            .oneshot(json("POST", "/api/containers/guest/cline-access", serde_json::json!({"access":"full"})))
+            .oneshot(json(
+                "POST",
+                "/api/containers/guest/cline-access",
+                serde_json::json!({"access":"full"}),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert_eq!(state(ui.clone()).await["containers"][0]["cline_access"], "full");
-        assert_eq!(AppState::load(&dir).unwrap().cline_access("guest"), crate::state::ClineAccess::Full);
+        assert_eq!(
+            state(ui.clone()).await["containers"][0]["cline_access"],
+            "full"
+        );
+        assert_eq!(
+            AppState::load(&dir).unwrap().cline_access("guest"),
+            crate::state::ClineAccess::Full
+        );
         let response = ui
             .clone()
-            .oneshot(json("POST", "/api/containers/guest/cline-access", serde_json::json!({"access":"basic"})))
+            .oneshot(json(
+                "POST",
+                "/api/containers/guest/cline-access",
+                serde_json::json!({"access":"basic"}),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert_eq!(AppState::load(&dir).unwrap().cline_access("guest"), crate::state::ClineAccess::Basic);
+        assert_eq!(
+            AppState::load(&dir).unwrap().cline_access("guest"),
+            crate::state::ClineAccess::Basic
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4140,6 +4789,7 @@ mod tests {
             settings,
             proxy_port: 8080,
             trace_relay: None,
+            uploads: crate::uploads::Client::default(),
         })
     }
 
@@ -4199,6 +4849,7 @@ mod tests {
             settings,
             proxy_port: 8080,
             trace_relay: None,
+            uploads: crate::uploads::Client::default(),
         };
         let peer: SocketAddr = "192.0.2.10:4567".parse().unwrap();
 

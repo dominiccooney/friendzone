@@ -213,6 +213,7 @@ impl Job {
             ),
             graphql: None,
             git_push: self.review.clone(),
+            file_upload: None,
             graphql_response: None,
             graphql_read: false,
             comment_permission_supported: false,

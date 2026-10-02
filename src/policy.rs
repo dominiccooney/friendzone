@@ -33,6 +33,7 @@ const GITHUB_HOSTS: &[&str] = &[
     "codeload.github.com",
     "raw.githubusercontent.com",
     "objects.githubusercontent.com",
+    "uploads.github.com",
 ];
 
 pub fn classify(req: &Request<Body>) -> Decision {
@@ -45,6 +46,15 @@ pub fn classify(req: &Request<Body>) -> Decision {
     let Some(host) = req.uri().host() else {
         return Decision::Unpoliced;
     };
+    // Linear file-upload credentials must not grant unreviewed arbitrary API
+    // mutations through the general proxy. Text writes keep the one-shot gate.
+    if host.eq_ignore_ascii_case("api.linear.app") {
+        return if matches!(req.method().as_str(), "GET" | "HEAD" | "OPTIONS") {
+            Decision::AllowRead
+        } else {
+            Decision::RequireReview
+        };
+    }
     if !GITHUB_HOSTS
         .iter()
         .any(|github| host.eq_ignore_ascii_case(github))
@@ -60,7 +70,7 @@ pub fn classify(req: &Request<Body>) -> Decision {
 pub fn note(decision: Decision) -> Option<&'static str> {
     match decision {
         Decision::RequireReview => {
-            Some("friendzone: GitHub writes require review; this request format is not reviewable")
+            Some("friendzone: this write requires review; this request format is not reviewable")
         }
         _ => None,
     }
@@ -92,21 +102,23 @@ fn is_api_key_management(path: &str) -> bool {
         || (path.starts_with("/api/v1/organizations/") && {
             let rest = &path["/api/v1/organizations/".len()..];
             match rest.split_once('/') {
-                Some((_, tail)) => {
-                    tail == "api-keys" || tail.starts_with("api-keys/")
-                }
+                Some((_, tail)) => tail == "api-keys" || tail.starts_with("api-keys/"),
                 None => false,
             }
         })
 }
 
 /// Basic mode allowlist: inference, the model catalog, and account basics
-/// (who am I, which organizations, switch the active one, balance/usage).
+/// (who am I, which organizations, switch the active one, balance/usage),
+/// desktop banners/configuration and a root content-type probe.
 /// Derived from cline/cline's SDK/CLI/desktop clients; everything else on
 /// the host (cloud sessions, connectors, integrations, auth, plans) is denied.
 fn basic_allows(method: &str, path: &str) -> bool {
     let read = matches!(method, "GET" | "HEAD" | "OPTIONS");
     match path {
+        // Link previews probe content type with HEAD, not a CORS preflight.
+        "/" => method == "HEAD",
+        "/banners/v2/messages" | "/api/v1/users/me/remote-config" => method == "GET",
         // Inference and model-backed tools.
         "/api/v1/chat/completions" | "/api/v1/images" => method == "POST",
         "/api/v1/search/websearch" | "/api/v1/search/webfetch" => method == "POST",
@@ -257,6 +269,7 @@ mod tests {
             )),
             Decision::RequireReview
         );
+        assert_eq!(classify(&req("POST", "https://api.linear.app/graphql")), Decision::RequireReview);
         assert_eq!(
             classify(&req("POST", "https://github.com/x/y.git/git-receive-pack")),
             Decision::RequireReview
@@ -277,7 +290,11 @@ mod tests {
 
     fn cline(method: &str, path: &str, access: ClineAccess) -> ClineVerdict {
         // The production host needs no help from the credential predicate.
-        cline_verdict(&req(method, &format!("https://api.cline.bot{path}")), access, |_| false)
+        cline_verdict(
+            &req(method, &format!("https://api.cline.bot{path}")),
+            access,
+            |_| false,
+        )
     }
 
     #[test]
@@ -320,7 +337,11 @@ mod tests {
             ("POST", "/api/v1/chat/completions"),
             ("PUT", "/api/v1/users/active-account"),
         ] {
-            assert_eq!(cline(method, path, ClineAccess::Full), ClineVerdict::Allow, "{method} {path}");
+            assert_eq!(
+                cline(method, path, ClineAccess::Full),
+                ClineVerdict::Allow,
+                "{method} {path}"
+            );
         }
     }
 
@@ -342,8 +363,55 @@ mod tests {
             ("GET", "/api/v1/organizations/org-1/balance"),
             ("GET", "/api/v1/organizations/org-1/members/member-9/usages"),
         ] {
-            assert_eq!(cline(method, path, ClineAccess::Basic), ClineVerdict::Allow, "{method} {path}");
+            assert_eq!(
+                cline(method, path, ClineAccess::Basic),
+                ClineVerdict::Allow,
+                "{method} {path}"
+            );
         }
+    }
+
+    #[test]
+    fn client_metadata_reads_are_narrow_and_query_independent() {
+        for query in [
+            "",
+            "?ide=vscode&extension_version=4.1.22&os=windows",
+            "?os=linux&ide=jetbrains&extension_version=9",
+            "?extra=x",
+        ] {
+            for path in ["/banners/v2/messages", "/api/v1/users/me/remote-config"] {
+                assert_eq!(
+                    cline("GET", &format!("{path}{query}"), ClineAccess::Basic),
+                    ClineVerdict::Allow
+                );
+                for method in ["POST", "PUT", "DELETE"] {
+                    assert!(matches!(
+                        cline(method, &format!("{path}{query}"), ClineAccess::Basic),
+                        ClineVerdict::Deny(_)
+                    ));
+                }
+            }
+        }
+        assert_eq!(cline("HEAD", "/", ClineAccess::Basic), ClineVerdict::Allow);
+        for (method, path) in [
+            ("GET", "/"),
+            ("OPTIONS", "/"),
+            ("HEAD", "/other"),
+            ("GET", "/banners/v2/messages/extra"),
+            ("GET", "/api/v1/users/me/remote-config/extra"),
+        ] {
+            assert!(matches!(
+                cline(method, path, ClineAccess::Basic),
+                ClineVerdict::Deny(_)
+            ));
+        }
+        assert_eq!(
+            classify(&req(
+                "POST",
+                "https://uploads.github.com/user-attachments/assets"
+            )),
+            Decision::RequireReview
+        );
     }
 
     #[test]
@@ -357,7 +425,10 @@ mod tests {
         }
         assert!(matches!(
             cline_verdict(
-                &req("GET", "https://api.cline.bot/api/v1/session?organizationId=org-1"),
+                &req(
+                    "GET",
+                    "https://api.cline.bot/api/v1/session?organizationId=org-1"
+                ),
                 ClineAccess::Basic,
                 |_| false
             ),
@@ -378,9 +449,11 @@ mod tests {
             ("GET", "/api/v1/plans"),
             ("POST", "/api/v1/users/me/budget/request"),
             ("GET", "/api/v1/users/me/featurebase-token"),
-            ("GET", "/api/v1/users/me/remote-config"),
             ("GET", "/api/v1/organizations/org-1/remote-config"),
-            ("GET", "/api/v1/organizations/org-1/integrations/github/repositories"),
+            (
+                "GET",
+                "/api/v1/organizations/org-1/integrations/github/repositories",
+            ),
             ("GET", "/api/v1/organizations/org-1/members/member-9"),
             ("GET", "/api/v1/organizations/"),
             ("GET", "/api/v1/users//balance"),
@@ -392,7 +465,10 @@ mod tests {
             ("GET", "/v1/mcp/anything"),
         ] {
             assert!(
-                matches!(cline(method, path, ClineAccess::Basic), ClineVerdict::Deny(_)),
+                matches!(
+                    cline(method, path, ClineAccess::Basic),
+                    ClineVerdict::Deny(_)
+                ),
                 "{method} {path} should be denied"
             );
         }
@@ -447,7 +523,11 @@ mod tests {
             "an unpinned subdomain is another origin: no token is substituted there, so nothing to gate"
         );
         assert_eq!(
-            cline_verdict(&req("CONNECT", "api.cline.bot:443"), ClineAccess::Basic, |_| true),
+            cline_verdict(
+                &req("CONNECT", "api.cline.bot:443"),
+                ClineAccess::Basic,
+                |_| true
+            ),
             ClineVerdict::Allow
         );
     }
@@ -459,7 +539,10 @@ mod tests {
         // must apply there, in every mode.
         let pinned = |host: &str| host == "core-api.staging.int.cline.bot";
         let staging = |method: &str, path: &str| {
-            req(method, &format!("https://core-api.staging.int.cline.bot{path}"))
+            req(
+                method,
+                &format!("https://core-api.staging.int.cline.bot{path}"),
+            )
         };
         for access in [ClineAccess::Basic, ClineAccess::Full] {
             assert!(matches!(
@@ -468,29 +551,53 @@ mod tests {
             ));
         }
         assert_eq!(
-            cline_verdict(&staging("GET", "/api/v1/session"), ClineAccess::Basic, pinned),
+            cline_verdict(
+                &staging("GET", "/api/v1/session"),
+                ClineAccess::Basic,
+                pinned
+            ),
             ClineVerdict::Synthetic(r#"{"success":true,"data":[]}"#)
         );
         assert!(matches!(
-            cline_verdict(&staging("POST", "/api/v1/session"), ClineAccess::Basic, pinned),
+            cline_verdict(
+                &staging("POST", "/api/v1/session"),
+                ClineAccess::Basic,
+                pinned
+            ),
             ClineVerdict::Deny(_)
         ));
         assert_eq!(
-            cline_verdict(&staging("POST", "/api/v1/chat/completions"), ClineAccess::Basic, pinned),
+            cline_verdict(
+                &staging("POST", "/api/v1/chat/completions"),
+                ClineAccess::Basic,
+                pinned
+            ),
             ClineVerdict::Allow
         );
         assert_eq!(
-            cline_verdict(&staging("POST", "/api/v1/session"), ClineAccess::Full, pinned),
+            cline_verdict(
+                &staging("POST", "/api/v1/session"),
+                ClineAccess::Full,
+                pinned
+            ),
             ClineVerdict::Allow
         );
         // Hosts the predicate does not claim stay ungoverned; production stays
         // governed even when the predicate claims nothing.
         assert_eq!(
-            cline_verdict(&req("POST", "https://evil.example/api/v1/session"), ClineAccess::Basic, pinned),
+            cline_verdict(
+                &req("POST", "https://evil.example/api/v1/session"),
+                ClineAccess::Basic,
+                pinned
+            ),
             ClineVerdict::Allow
         );
         assert!(matches!(
-            cline_verdict(&req("POST", "https://api.cline.bot/api/v1/session"), ClineAccess::Basic, |_| false),
+            cline_verdict(
+                &req("POST", "https://api.cline.bot/api/v1/session"),
+                ClineAccess::Basic,
+                |_| false
+            ),
             ClineVerdict::Deny(_)
         ));
     }

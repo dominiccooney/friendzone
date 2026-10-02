@@ -55,6 +55,13 @@
             <h5>Changed files</h5><div id="request-git-push-files"></div>
             <h5>Exact reviewed patch</h5><pre id="request-git-push-patch"></pre>
           </section>
+          <section id="request-file-upload" hidden>
+            <h4>File upload</h4>
+            <p class="meta">Approval uploads this exact file only. Its returned URL can be used in a separately submitted description or comment. Review for private data; files are untrusted content.</p>
+            <pre id="request-file-upload-metadata"></pre>
+            <img id="request-file-upload-image" style="max-width:100%;max-height:60vh" hidden>
+            <a id="request-file-upload-download" download hidden>Download exact file for inspection</a>
+          </section>
           <details id="request-raw"><summary id="request-raw-summary">Exact request body</summary><pre id="request-review-body"></pre></details>
           <div class="review-decision-bar"><div id="request-review-actions" class="mcp-card-actions"><button id="request-approve" type="button" disabled>Approve once</button><button id="request-deny" type="button" disabled>Deny</button></div><button id="request-close" type="button" class="quiet">Close</button><span class="meta">This request only</span></div>
           <details><summary>Request &amp; transport details</summary><p id="request-review-reason"></p><p id="request-review-meta" class="meta"></p><pre id="request-review-upstream"></pre><pre id="request-review-headers"></pre></details>
@@ -98,6 +105,7 @@
             <option value="anthropic">Anthropic</option>
             <option value="cline">Cline</option>
             <option value="github">GitHub</option>
+            <option value="linear">Linear file uploads</option>
             <option value="custom">Custom…</option>
           </select>
           <input id="e-real" type="password" placeholder="paste the REAL API key here (stays on the host)" autocomplete="off">

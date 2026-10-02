@@ -35,7 +35,7 @@ async function discover(plugin) {
   }
   assert.deepEqual(tools.map(tool=>tool.name).sort(),[
     'friendzone_cancel_request','friendzone_get_request','friendzone_list_requests',
-    'friendzone_remove_result','friendzone_submit_git_bundle','friendzone_submit_graphql',
+    'friendzone_remove_result','friendzone_submit_git_bundle','friendzone_submit_graphql','friendzone_upload_file',
   ]);
   const description=tools.find(tool=>tool.name==='friendzone_submit_git_bundle').description;
   assert.match(description,/GITHUB_TOKEN is Friendzone's fake escrow token/);

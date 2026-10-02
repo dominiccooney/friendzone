@@ -1045,11 +1045,7 @@ impl AppState {
                 cline_access: record.cline_access,
             })
             .collect();
-        containers.sort_by(|a, b| {
-            b.last_activity
-                .cmp(&a.last_activity)
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        containers.sort_by(|a, b| a.id.cmp(&b.id));
         let (mut pending_requests, mut recent_reviews) = self.reviews.view();
         let (pending_jobs, recent_jobs) = self.jobs.summaries();
         pending_requests.extend(pending_jobs);
@@ -1386,6 +1382,41 @@ mod tests {
         reloaded.remove_container("wide").unwrap();
         reloaded.add_container("wide").unwrap();
         assert_eq!(reloaded.cline_access("wide"), ClineAccess::Basic);
+    }
+
+    #[test]
+    fn guest_order_does_not_change_with_traffic() {
+        let state = AppState::default();
+        for name in ["zulu", "alpha", "middle"] {
+            state.add_container(name).unwrap();
+        }
+        let ids = || {
+            state
+                .view()
+                .containers
+                .into_iter()
+                .map(|guest| guest.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(), ["alpha", "middle", "zulu"]);
+        for name in ["middle", "alpha", "zulu", "middle"] {
+            state.authorize(name, "10.0.0.5".parse().unwrap());
+            state.record(
+                name.into(),
+                "GET".into(),
+                "https://example.test/".into(),
+                Verdict::Allowed,
+            );
+            assert_eq!(ids(), ["alpha", "middle", "zulu"]);
+            let guest = state
+                .view()
+                .containers
+                .into_iter()
+                .find(|guest| guest.id == name)
+                .unwrap();
+            assert!(guest.last_activity.is_some());
+            assert!(guest.request_count > 0);
+        }
     }
 
     #[test]

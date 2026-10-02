@@ -67,7 +67,11 @@ account basics on `api.cline.bot`: `POST /api/v1/chat/completions`,
 `/api/v1/images`, `/api/v1/search/*`, `GET /api/v1/ai/cline/recommended-models`,
 `GET /api/v1/users/me`, `/users/me/plan`, `/users/{id}/balance|usages|payments`,
 `PUT /api/v1/users/active-account` (organization switching), and
-`GET /api/v1/organizations/{id}`, `/balance`, `/members/{id}/usages`. In basic
+`GET /api/v1/organizations/{id}`, `/balance`, `/members/{id}/usages`. Basic also
+allows `GET /banners/v2/messages` with any query string,
+`GET /api/v1/users/me/remote-config`, and `HEAD /` for link content-type probes.
+Root `GET` and unrelated metadata paths remain denied. These are ordinary
+reads, not CORS preflight requests. In basic
 mode `GET /api/v1/session` is answered locally with an empty list, so cloud
 sessions appear to not exist; creating, attaching, driving or deleting them,
 the Hub WebSocket upgrade, integrations, connectors, plans and every other path
@@ -94,6 +98,9 @@ These describe network authorization, not whether an agent is working, idle,
 or online. Last observed guest traffic is shown separately; administrative
 actions do not count as traffic. The selected Inbox/Log/Settings tab is
 remembered in this browser for the same UI origin.
+Guests use alphabetical order unless you drag them into a saved order. Incoming
+traffic updates their counts and timestamps without moving cards or replacing
+their controls, so the Cline API access dropdown stays usable during requests.
 
 Approvals, IP pins, Cline API access, and kill state are saved atomically in `containers.json`
 in the broker data directory and restored on startup. Removal is persisted
@@ -269,6 +276,52 @@ SHA-256 object IDs, LFS, or arbitrary remotes/refspecs/options. The broker uses
 the configured host GitHub credential, rechecks the target, pushes once with an
 exact `--force-with-lease`, and reads the ref back. Restart never replays an
 interrupted publication. See the [complete contract and limits](ASYNC-GRAPHQL.md#git-branch-publication).
+
+### Upload files before posting descriptions or comments
+
+The managed guest plugin provides `friendzone_upload_file`. Pass an absolute
+guest `file_path` and `destination: "github"` or `"linear"`; GitHub also requires
+`repository: "owner/repository"`. No issue, PR or comment ID is required, so
+uploading works before creating one. An optional `content_type` overrides the
+type inferred from common filename extensions.
+
+1. Upload the file and approve its exact bytes/digest and destination in the
+   host Inbox. The tool waits for approval, then returns `url` and `markdown`.
+2. Use that URL in an issue/PR description, comment, or Linear document through
+   the normal create/update tool. Uploading alone does not publish any text.
+
+GitHub supports PNG, JPEG, GIF, SVG, MP4, MOV and WebM up to a conservative
+10 MB per file. The host token must be a PAT or OAuth token with repository
+write access; installation tokens cannot upload attachments. For an existing
+GitHub credential, add **uploads.github.com** to its pinned hosts while retaining
+**api.github.com**. New GitHub presets include both. The guest's fake
+`GITHUB_TOKEN` selects the credential; no real token goes to the guest.
+
+Linear accepts files up to 25 MiB. Add **Linear file uploads** under host
+Settings → Credentials with a writable Linear API key. Its only pinned host is
+**api.linear.app** and its guest variable is **LINEAR_API_KEY**. Rerun guest
+setup and restart guest Cline to receive the fake and new tool. This is separate
+from MCP OAuth: MCP credentials are not silently reused at another endpoint.
+Linear URLs are private to Linear; upload separately to GitHub when embedding
+in a GitHub description/comment.
+
+The binary path preserves exact bytes without decoding, stripping metadata or
+converting images. Raster images can be previewed in Inbox; SVG and other files
+are download-only. Review files for sensitive data before approval.
+Four concurrent transfers, a 60-second receive deadline and the existing
+120-second review deadline bound resource use. The plugin permits enough time
+for receiving, review and provider calls. No redirects or automatic retries
+occur. Linear preparation is followed by a raw PUT with its required signed
+headers, without the broker API credential.
+Direct Linear API text writes also require one-shot review; the upload
+credential does not turn the general proxy into an unreviewed mutation path.
+
+List/get requests can recover returned URLs within the current broker session;
+upload records and pending approvals are memory-only and are not replayed after
+restart. Cancel only while pending. Removing a result does not delete the
+uploaded remote file. If delivery is uncertain, inspect list/get and upstream
+before submitting again. General binary proxy writes remain blocked; this path
+does not add general binary, multipart or ordinary Git-push permission.
 
 ### Reads and manual review
 

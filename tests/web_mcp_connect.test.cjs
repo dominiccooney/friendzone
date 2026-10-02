@@ -21,6 +21,7 @@ function fixture({storage = new Map(), storageUnavailable = false, notificationP
     append(child) { this.child=child; },
     content: {cloneNode(){return {}; }},
     attributes: {}, setAttribute(name,value){this.attributes[name]=value;},
+    removeAttribute(name){delete this.attributes[name];delete this[name];},
   }]));
   const calls = [];
   const timers = [];
@@ -171,6 +172,19 @@ test("structured GraphQL warnings and non-GraphQL reviews clear previously displ
   assert.match(f.sandbox.document.querySelector("#request-graphql-warning").textContent,/fragment cycle.*No operation or target was inferred/);
   assert.equal(f.sandbox.document.querySelector("#request-graphql-warning").innerHTML,"");
   f.run('renderGraphqlReview(null)'); assert.equal(f.sandbox.document.querySelector("#request-graphql").hidden,true);
+});
+
+test("file review shows frozen metadata and only raster images render inline", () => {
+  const f=fixture(),upload={filename:'shot<script>.png',destination:'github',repository:'cline/cline',content_type:'image/png',bytes:100000,sha256:'digest',credential:'github'};
+  f.run(`renderFileUploadReview({id:'upload-id',status:'pending',file_upload:${JSON.stringify(upload)}})`);
+  const image=f.sandbox.document.querySelector('#request-file-upload-image');
+  assert.equal(image.hidden,false);assert.equal(image.src,'/api/requests/upload-id/file');
+  assert.match(f.sandbox.document.querySelector('#request-file-upload-metadata').textContent,/shot<script>.png/);
+  f.run(`renderFileUploadReview({id:'other-id',status:'pending',file_upload:${JSON.stringify({...upload,content_type:'image/svg+xml'})}})`);
+  assert.equal(image.hidden,true);assert.equal(image.src,undefined);
+  assert.equal(f.sandbox.document.querySelector('#request-file-upload-download').href,'/api/requests/other-id/file');
+  f.run(`renderFileUploadReview({id:'other-id',status:'response_received',file_upload:${JSON.stringify({...upload,url:'https://github.com/user-attachments/assets/file'})}})`);
+  assert.equal(image.hidden,true);assert.equal(f.sandbox.document.querySelector('#request-file-upload-download').hidden,true);
 });
 
 test("summaries prioritize every mutation and warn about gaps while reads and client labels remain secondary", () => {
@@ -667,6 +681,14 @@ test("container status reports permission, never guesses working or idle", () =>
   assert.equal(f.run('containerStatus({approved:true,state:"killed"})'), "Killed");
   assert.match(f.run('containerTraffic({last_activity:null})'), /No guest traffic observed/);
   assert.match(f.run('containerTraffic({last_activity:"2026-09-09T01:00:00Z"})'), /Last guest traffic:/);
+});
+
+test("guest display order ignores traffic and preserves saved drag order with alphabetical new guests", () => {
+  const f=fixture();
+  const guests=[{id:"zulu",last_activity:"2099-01-01"},{id:"alpha",last_activity:null},{id:"middle",last_activity:"2000-01-01"}];
+  assert.deepEqual(Array.from(f.run(`ordered(${JSON.stringify(guests)}).map(guest=>guest.id)`)),["alpha","middle","zulu"]);
+  const saved=fixture({storage:new Map([["fz-order",JSON.stringify(["zulu","missing","alpha"])]])});
+  assert.deepEqual(Array.from(saved.run(`ordered(${JSON.stringify([...guests,{id:"beta"}])}).map(guest=>guest.id)`)),["zulu","alpha","beta","middle"]);
 });
 
 test("failed policy API change is visible and not reported as saved", async () => {

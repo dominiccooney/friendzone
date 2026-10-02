@@ -6,7 +6,7 @@ const path=require('node:path');
 const http=require('node:http');
 const vm=require('node:vm');
 const source=fs.readFileSync(path.join(__dirname,'../src/plugin/friendzone.js'),'utf8');
-const toolNames=['friendzone_submit_graphql','friendzone_submit_git_bundle','friendzone_get_request','friendzone_list_requests','friendzone_cancel_request','friendzone_remove_result'];
+const toolNames=['friendzone_submit_graphql','friendzone_submit_git_bundle','friendzone_upload_file','friendzone_get_request','friendzone_list_requests','friendzone_cancel_request','friendzone_remove_result'];
 
 test('discovery without a session registers tools without config, timers, networking or steering',async()=>{
   for(const context of [undefined,{}, {workspaceInfo:{rootPath:'/workspace'}},{session:{}},{session:{sessionId:''}},{session:{sessionId:'   '}}]){
@@ -49,11 +49,15 @@ async function fixture(t){
   t.after(()=>fs.rmSync(home,{recursive:true,force:true}));
   const jobs=new Map(), calls=[], events=[];
   const server=http.createServer(async(req,res)=>{
-    let text='';for await(const chunk of req)text+=chunk;
-    calls.push({method:req.method,url:req.url,headers:req.headers,authorization:req.headers.authorization,body:text});
+    const chunks=[];for await(const chunk of req)chunks.push(chunk);const bytes=Buffer.concat(chunks),text=bytes.toString('utf8');
+    calls.push({method:req.method,url:req.url,headers:req.headers,authorization:req.headers.authorization,body:text,bytes});
     if(req.headers.authorization){res.writeHead(403);res.end();return;}
     res.setHeader('content-type','application/json');
     const url=new URL(req.url,'http://localhost');
+    if(req.method==='POST'&&url.pathname==='/guest/uploads'){
+      const result={url:'https://github.com/user-attachments/assets/fixture',markdown:'![shot.png](https://github.com/user-attachments/assets/fixture)'};
+      res.end(JSON.stringify(result));return;
+    }
     if(req.method==='POST'&&url.pathname==='/guest/git-push'){
       const job={id:require('node:crypto').randomUUID(),kind:'git_push',request_key:url.searchParams.get('request_key'),session_id:url.searchParams.get('session_id'),status:'preparing',updated_at:'one',terminal:false,result:null};jobs.set(job.id,job);res.writeHead(202);res.end(JSON.stringify(job));return;
     }
@@ -107,6 +111,27 @@ test('git bundle tool uploads exact bounded bytes and metadata without credentia
   const before=f.calls.length;
   await assert.rejects(()=>plugin.run('friendzone_submit_git_bundle',{request_key:'bad',bundle_file:'relative.bundle',repository:'cline/cline',branch:'feature',base_oid:'1'.repeat(40),expected_oid:'0'.repeat(40)}),/absolute/);
   assert.equal(f.calls.length,before);
+});
+
+test('file upload streams binary bytes first and returns a reusable URL without publishing a description or comment',async t=>{
+  const f=await fixture(t),plugin=f.load('upload-session',false,{GITHUB_TOKEN:'fake-github',LINEAR_API_KEY:'fake-linear'});
+  const file=path.join(f.home,'shot.png'),bytes=Buffer.from([0x89,0x50,0x4e,0x47,0,255,128,1]);fs.writeFileSync(file,bytes);
+  const tool=plugin.tools.get('friendzone_upload_file');
+  assert.match(tool.description,/Upload a local file FIRST/);assert.match(tool.description,/issue\/PR description or comment/);assert.match(tool.description,/No issue, PR or comment ID/);
+  for(const destination of ['github','linear']){
+    const result=await plugin.run('friendzone_upload_file',{file_path:file,destination,...(destination==='github'?{repository:'cline/cline'}:{})});
+    assert.match(result.url,/^https:/);assert.match(result.markdown,/shot.png/);
+    const call=f.calls.at(-1),url=new URL(call.url,'http://fixture');
+    assert.equal(url.pathname,'/guest/uploads');assert.equal(url.searchParams.get('content_type'),'image/png');assert.equal(url.searchParams.get('session_id'),'upload-session');
+    assert.equal(call.headers['x-friendzone-token'],destination==='github'?'fake-github':'fake-linear');assert.equal(call.authorization,undefined);
+    assert.deepEqual(call.bytes,bytes);assert.equal(url.searchParams.has('issue'),false);assert.equal(url.searchParams.has('file_path'),false);
+  }
+  const count=f.calls.length;
+  await assert.rejects(()=>plugin.run('friendzone_upload_file',{file_path:file,destination:'github'}),/repository required/);
+  await assert.rejects(()=>plugin.run('friendzone_upload_file',{file_path:'relative.png',destination:'linear'}),/absolute/);
+  await assert.rejects(()=>plugin.run('friendzone_upload_file',{file_path:file,destination:'linear',repository:'cline/cline'}),/only to GitHub/);
+  await assert.rejects(()=>f.load('missing',false).run('friendzone_upload_file',{file_path:file,destination:'linear'}),/LINEAR_API_KEY fake credential missing/);
+  assert.equal(f.calls.length,count);
 });
 
 test('plugin submits without waiting; terminal result steers only origin session once across reloads',async t=>{
@@ -198,13 +223,13 @@ test('discovery is independent of config validity; first execution reads config 
   const f=await fixture(t),configFile=path.join(f.home,'friendzone.json');
   const config=fs.readFileSync(configFile,'utf8');fs.unlinkSync(configFile);
   const plugin=f.load(undefined);
-  assert.equal(plugin.tools.size,6);assert.equal(plugin.timers.length,0);
+  assert.equal(plugin.tools.size,toolNames.length);assert.equal(plugin.timers.length,0);
   await assert.rejects(()=>plugin.run('friendzone_list_requests',{},'session-a'),/ENOENT/);
   fs.writeFileSync(configFile,'{bad json');
   await assert.rejects(()=>plugin.run('friendzone_list_requests',{},'session-a'));
   assert.equal(f.calls.length,0);assert.equal(plugin.timers.length,0);
   // Session-bound discovery must also keep its registered tools on bad config.
-  const bound=f.load('session-b');assert.equal(bound.tools.size,6);assert.equal(bound.timers.length,0);
+  const bound=f.load('session-b');assert.equal(bound.tools.size,toolNames.length);assert.equal(bound.timers.length,0);
   fs.writeFileSync(configFile,config);
   assert.equal((await plugin.run('friendzone_list_requests',{},'session-a')).length,0);
   assert.equal((await bound.run('friendzone_list_requests',{})).length,0);

@@ -9,6 +9,7 @@ const crypto = require('node:crypto');
 
 const MAX_UPLOAD = 10 * 1024 * 1024;
 const MAX_BUNDLE = 32 * 1024 * 1024;
+const MAX_FILE = 25 * 1024 * 1024;
 const MAX_RESPONSE = 32 * 1024 * 1024; // up to 4 MiB result, JSON escaped by broker
 const MAX_STEER_DETAILS = 4 * 1024;
 const observers = new Map();
@@ -46,26 +47,29 @@ function request(config, method, route, body) {
     req.end(payload);
   });
 }
-function uploadBundle(config, route, file) {
-  if(!path.isAbsolute(file))throw new Error('bundle_file must be absolute');
+function uploadFile(config, route, file, transfer) {
+  if(!path.isAbsolute(file))throw new Error('file path must be absolute');
   const fd=fs.openSync(file,fs.constants.O_RDONLY|fs.constants.O_NONBLOCK);
-  const stat=fs.fstatSync(fd);
-  if(!stat.isFile()||stat.size<=0||stat.size>MAX_BUNDLE){fs.closeSync(fd);throw new Error('bundle_file must be a regular file from 1 byte to 32 MiB');}
+  let stat;
+  try{stat=fs.fstatSync(fd);if(!stat.isFile()||stat.size<=0||stat.size>transfer.limit)throw new Error(`File must be a regular file from 1 byte to ${transfer.limit} bytes`);}catch(error){fs.closeSync(fd);throw error;}
   const url=new URL(route,config.broker);
   if(url.origin!==new URL(config.broker).origin){fs.closeSync(fd);throw new Error('Broker origin mismatch');}
   return new Promise((resolve,reject)=>{
-    let settled=false;
-    const finish=(error,value)=>{if(settled)return;settled=true;clearTimeout(timer);try{fs.closeSync(fd);}catch{};error?reject(error):resolve(value);};
-    const req=(url.protocol==='https:'?https:http).request(url,{method:'POST',agent:false,headers:{'content-type':'application/x-git-bundle','content-length':stat.size}},response=>{
+    let settled=false,stream,timer,req;
+    const finish=(error,value)=>{if(settled)return;settled=true;clearTimeout(timer);if(stream)stream.destroy();else{try{fs.closeSync(fd);}catch{}};error?reject(error):resolve(value);};
+    try {
+    req=(url.protocol==='https:'?https:http).request(url,{method:'POST',agent:false,headers:{'content-type':transfer.contentType,'content-length':stat.size,...(transfer.token?{'x-friendzone-token':transfer.token}:{})}},response=>{
       const chunks=[];let size=0;
       response.on('data',chunk=>{size+=chunk.length;if(size>MAX_RESPONSE){req.destroy(new Error('Broker response exceeds limit'));return;}chunks.push(chunk);});
       response.on('error',finish);
-      response.on('end',()=>{const text=Buffer.concat(chunks).toString('utf8');if(response.statusCode!==202){finish(new Error(`Friendzone HTTP ${response.statusCode}: ${text.slice(0,2000)}`));return;}try{finish(null,JSON.parse(text));}catch{finish(new Error('Invalid broker JSON response'));}});
+      response.on('end',()=>{const text=Buffer.concat(chunks).toString('utf8');if(response.statusCode!==transfer.status){finish(new Error(`Friendzone HTTP ${response.statusCode}: ${text.slice(0,2000)}`));return;}try{finish(null,JSON.parse(text));}catch{finish(new Error('Invalid broker JSON response'));}});
     });
-    const timer=setTimeout(()=>req.destroy(new Error('Git bundle upload timed out. List existing requests before submitting again.')),70000);
+    timer=setTimeout(()=>req.destroy(new Error('File upload timed out. List existing requests before submitting again; never retry automatically.')),transfer.timeout);
     req.on('error',finish);
-    const stream=fs.createReadStream(file,{fd,autoClose:false,start:0,end:stat.size-1});
+    // The stream owns the descriptor, including early rejection and timeout.
+    stream=fs.createReadStream(file,{fd,autoClose:true,start:0,end:stat.size-1});
     stream.on('error',error=>req.destroy(error));stream.pipe(req);
+    } catch(error) {req?.destroy();finish(error);}
   });
 }
 
@@ -123,6 +127,7 @@ function createSessionRuntime(session,ctx){
       let emitted=false;
       for(const job of jobs){
         if(job.session_id!==session)continue;
+        if(job.kind==='file_upload')continue; // Synchronous tool already returns its result; list/get provide recovery.
         if(!job.terminal){active.push(job);continue;}
         const version=job.status+':'+job.updated_at;next[job.id]=version;
         if(saved.terminal[job.id]===version){
@@ -224,8 +229,26 @@ const plugin={name:'friendzone',manifest:{capabilities:['tools','hooks']},setup(
     for(const name of ['request_key','bundle_file','repository','branch','base_oid','expected_oid'])if(typeof input[name]!=='string'||!input[name])throw new Error(`${name} required`);
     const route=new URL('/guest/git-push',config.broker);
     for(const name of ['request_key','repository','branch','base_oid','expected_oid'])route.searchParams.set(name,input[name]);route.searchParams.set('session_id',session);
-    return uploadBundle(config,route,input.bundle_file);
+    return uploadFile(config,route,input.bundle_file,{limit:MAX_BUNDLE,contentType:'application/x-git-bundle',timeout:70000,status:202});
   },90000);
+  tool('friendzone_upload_file','Upload a local file FIRST and get back url and markdown, then use the URL in a separate issue/PR description or comment create/update call. No issue, PR or comment ID is needed. Use destination github for GitHub descriptions/comments (repository owner/repo required), or linear for Linear descriptions/comments/documents (private Linear URL; do not use it to host images on GitHub). Screenshots are supported: pass the absolute file_path, not base64 or file contents. Wait for host Inbox approval, up to 120 seconds; the result returns only after upload succeeds. Uploads do not publish a comment or edit a description. Do not invent URLs or resubmit automatically after a timeout; list/get existing requests first. Host credentials stay on the host; guest setup supplies fake GITHUB_TOKEN or LINEAR_API_KEY.',{
+    file_path:{type:'string',description:'Absolute local guest path to the file. GitHub: PNG/JPEG/GIF/SVG/MP4/MOV/WebM up to 10 MB; Linear: files up to 25 MiB.'},
+    destination:{type:'string',enum:['github','linear']},
+    repository:{type:'string',description:'GitHub owner/repository; required only for destination github. Upload scope, not an issue/PR identifier.'},
+    content_type:{type:'string',description:'Optional MIME type without parameters. Inferred from common filename extensions; provide it for other files.'},
+  },['file_path','destination'],async(input,{config,session})=>{
+    if(typeof input.file_path!=='string'||!input.file_path)throw new Error('file_path required');
+    if(!['github','linear'].includes(input.destination))throw new Error('destination must be github or linear');
+    if(input.destination==='github' && (typeof input.repository!=='string'||!input.repository))throw new Error('repository required for GitHub');
+    if(input.destination==='linear' && input.repository!==undefined)throw new Error('repository applies only to GitHub');
+    const types={'.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.gif':'image/gif','.svg':'image/svg+xml','.webp':'image/webp','.mp4':'video/mp4','.mov':'video/quicktime','.webm':'video/webm','.pdf':'application/pdf','.txt':'text/plain','.md':'text/markdown','.json':'application/json','.zip':'application/zip'};
+    const contentType=input.content_type||types[path.extname(input.file_path).toLowerCase()]||'application/octet-stream';
+    const variable=input.destination==='github'?'GITHUB_TOKEN':'LINEAR_API_KEY',token=process.env[variable];
+    if(!token)throw new Error(`${variable} fake credential missing. Configure the host credential and rerun guest setup; never supply a real token.`);
+    const route=new URL('/guest/uploads',config.broker);
+    for(const [name,value] of Object.entries({destination:input.destination,filename:path.basename(input.file_path),content_type:contentType,session_id:session,...(input.repository?{repository:input.repository}:{})}))route.searchParams.set(name,value);
+    return uploadFile(config,route,input.file_path,{limit:input.destination==='github'?10000000:MAX_FILE,contentType:'application/octet-stream',timeout:390000,status:200,token});
+  },400000);
   tool('friendzone_get_request','Retrieve a submitted request result. Does not execute or retry it. Large results are saved to a guest file.',{id:{type:'string'}},['id'],async (input,{config,suffix,base,key})=>{
     const result=await request(config,'GET',idRoute(input.id)+suffix);
     if(typeof result.result==='string'&&result.result.length>48000){const resultFile=path.join(base,'friendzone',key+'-'+input.id+'-result.json');atomic(resultFile,{result:result.result});return {...result,result:result.result.slice(0,48000),result_truncated:true,result_file:resultFile};}
