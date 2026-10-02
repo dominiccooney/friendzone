@@ -193,7 +193,7 @@ function Invoke-FzGuestRegistration($Data) {
     }catch{throw}
 }
 function Start-FzGuestSetup($Data) {
-    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {throw 'Select the Linux script on non-Windows guests'}
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {throw 'Select the Linux or macOS script on non-Windows guests'}
     if (-not $Data.container) {$Data.container=[Environment]::MachineName}
     if (-not(Test-FzGuestName ([string]$Data.container))) {throw 'Invalid guest name'}
     $requested=[string]$Data.container

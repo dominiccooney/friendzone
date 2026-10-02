@@ -1,10 +1,11 @@
-"""Script-only Linux guest configuration; standard library, explicit test paths."""
+"""Script-only Linux and macOS guest configuration; standard library, explicit test paths."""
 import base64
 import datetime
 import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import shlex
 import socket
 import subprocess
@@ -16,6 +17,10 @@ import urllib.request
 MARKER = "# Friendzone guest environment (managed)"
 SYSTEM_CA = Path("/usr/local/share/ca-certificates/friendzone-local-ca.crt")
 SYSTEM_CA_STATE = "linux-system-ca.json"
+MACOS_KEYCHAIN = Path("/Library/Keychains/System.keychain")
+MACOS_CA_STATE = "macos-system-ca.json"
+MACOS_PROXY_STATE = "macos-system-proxy.json"
+MACOS_AGENT_LABEL = "friendzone.guest-environment"
 
 
 def atomic_write(path, text, mode=0o600):
@@ -34,8 +39,8 @@ def atomic_write(path, text, mode=0o600):
             os.unlink(temporary)
 
 
-def certificate_digest(pem):
-    """Validate one bounded PEM certificate and return its DER SHA-256."""
+def certificate_der(pem):
+    """Validate one bounded PEM certificate and return its DER bytes."""
     if not isinstance(pem, str) or len(pem.encode("utf-8")) > 128 * 1024:
         raise ValueError("Friendzone CA is missing or exceeds 128 KiB")
     begin = "-----BEGIN CERTIFICATE-----"
@@ -52,7 +57,12 @@ def certificate_digest(pem):
         raise ValueError("Friendzone CA contains invalid PEM base64") from error
     if not der:
         raise ValueError("Friendzone CA certificate is empty")
-    return hashlib.sha256(der).hexdigest()
+    return der
+
+
+def certificate_digest(pem):
+    """Validate one bounded PEM certificate and return its DER SHA-256."""
+    return hashlib.sha256(certificate_der(pem)).hexdigest()
 
 
 def _command_path(name, known):
@@ -63,6 +73,30 @@ def _command_path(name, known):
     return None
 
 
+def _load_ca_state(state_path, platform):
+    invalid = "Invalid Friendzone " + platform + " CA ownership state; repair or remove " + str(state_path)
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(invalid) from error
+    if (not isinstance(state, dict) or state.get("version") != 1 or
+            not isinstance(state.get("managed"), bool) or
+            not isinstance(state.get("sha256"), str) or
+            len(state["sha256"]) != 64 or
+            any(character not in "0123456789abcdef" for character in state["sha256"])):
+        raise ValueError(invalid)
+    return state
+
+
+def _sudo_prefix(missing):
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return []
+    sudo = _command_path("sudo", ("/usr/bin/sudo", "/bin/sudo"))
+    if not sudo:
+        raise ValueError(missing)
+    return [sudo]
+
+
 def install_linux_ca(cert, config, destination=SYSTEM_CA, run=None,
                      updater=None, installer=None, remover=None, privilege=None):
     """Install/rotate only Friendzone's owned Debian-family native trust anchor."""
@@ -71,18 +105,7 @@ def install_linux_ca(cert, config, destination=SYSTEM_CA, run=None,
     pem = cert.read_text(encoding="utf-8")
     digest = certificate_digest(pem)
     state_path = config / SYSTEM_CA_STATE
-    state = None
-    if state_path.exists():
-        try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as error:
-            raise ValueError("Invalid Friendzone Linux CA ownership state; repair or remove " + str(state_path)) from error
-        if (not isinstance(state, dict) or state.get("version") != 1 or
-                not isinstance(state.get("managed"), bool) or
-                not isinstance(state.get("sha256"), str) or
-                len(state["sha256"]) != 64 or
-                any(character not in "0123456789abcdef" for character in state["sha256"])):
-            raise ValueError("Invalid Friendzone Linux CA ownership state; repair or remove " + str(state_path))
+    state = _load_ca_state(state_path, "Linux") if state_path.exists() else None
     previous = destination.read_bytes() if destination.exists() else None
     previous_digest = certificate_digest(previous.decode("utf-8")) if previous is not None else None
     if state is None and previous is not None and previous_digest != digest:
@@ -109,13 +132,7 @@ def install_linux_ca(cert, config, destination=SYSTEM_CA, run=None,
     if not updater or not installer or not remover:
         raise ValueError("Linux native CA setup requires the ca-certificates package and install command")
     if privilege is None:
-        if hasattr(os, "geteuid") and os.geteuid() == 0:
-            privilege = []
-        else:
-            sudo = _command_path("sudo", ("/usr/bin/sudo", "/bin/sudo"))
-            if not sudo:
-                raise ValueError("Linux native CA setup requires sudo; install sudo or run from a root login")
-            privilege = [sudo]
+        privilege = _sudo_prefix("Linux native CA setup requires sudo; install sudo or run from a root login")
     privilege = list(privilege)
     config.mkdir(parents=True, exist_ok=True)
     rollback = config / ".friendzone-system-ca-rollback.crt"
@@ -150,6 +167,254 @@ def install_linux_ca(cert, config, destination=SYSTEM_CA, run=None,
             pass
     return dict(installed=True, managed=managed, sha256=digest, destination=str(destination))
 
+
+
+def _output_text(completed):
+    output = completed.stdout
+    return output.decode("utf-8", "replace") if isinstance(output, bytes) else output
+
+
+def _macos_fingerprint(pem):
+    """Trust settings are keyed by the certificate's SHA-1."""
+    return hashlib.sha1(certificate_der(pem)).hexdigest()
+
+
+def _macos_trust_state(run, security, keychain):
+    """Map DER SHA-256 to PEM for keychain roots; return admin-trusted SHA-1s."""
+    listing = _output_text(run([security, "find-certificate", "-a", "-p", str(keychain)],
+                               check=True, stdout=subprocess.PIPE))
+    certificates = {}
+    end = "-----END CERTIFICATE-----"
+    for block in listing.split(end)[:-1]:
+        start = block.find("-----BEGIN CERTIFICATE-----")
+        if start < 0:
+            continue
+        pem = block[start:] + end + "\n"
+        try:
+            certificates[certificate_digest(pem)] = pem
+        except ValueError:
+            continue
+    with tempfile.TemporaryDirectory(prefix="friendzone-trust-") as directory:
+        exported = Path(directory) / "admin-trust.plist"
+        arguments = [security, "trust-settings-export", "-d", str(exported)]
+        completed = run(arguments, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if completed.returncode != 0:
+            # Older macOS releases exit 1 for an empty admin domain instead of
+            # exporting an empty trustList; any other failure is still fatal.
+            stderr = completed.stderr.decode("utf-8", "replace") if isinstance(completed.stderr, bytes) else completed.stderr or ""
+            if "No Trust Settings were found" not in stderr:
+                raise subprocess.CalledProcessError(completed.returncode, arguments, stderr=completed.stderr)
+            return certificates, set()
+        with exported.open("rb") as stream:
+            settings = plistlib.load(stream)
+    trust = settings.get("trustList") if isinstance(settings, dict) else None
+    if not isinstance(trust, dict):
+        raise ValueError("Unexpected macOS admin trust settings export")
+    return certificates, {key.lower() for key in trust if isinstance(key, str)}
+
+
+def install_macos_ca(cert, config, keychain=MACOS_KEYCHAIN, run=None, security=None, privilege=None):
+    """Trust Friendzone's root in the System keychain; retire only a root it installed."""
+    cert, config, keychain = map(lambda path: Path(path).absolute(), (cert, config, keychain))
+    pem = cert.read_text(encoding="utf-8")
+    digest = certificate_digest(pem)
+    fingerprint = _macos_fingerprint(pem)
+    state_path = config / MACOS_CA_STATE
+    state = _load_ca_state(state_path, "macOS") if state_path.exists() else None
+    if state is not None:
+        try:
+            valid = isinstance(state.get("pem"), str) and certificate_digest(state["pem"]) == state["sha256"]
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("Invalid Friendzone macOS CA ownership state; repair or remove " + str(state_path))
+    run = run or subprocess.run
+    security = security or _command_path("security", ("/usr/bin/security",))
+    if not security:
+        raise ValueError("macOS CA setup requires /usr/bin/security")
+    certificates, trusted = _macos_trust_state(run, security, keychain)
+    present = digest in certificates and fingerprint in trusted
+    same = state is not None and state["sha256"] == digest
+    # A root that was already trusted is used but never claimed.
+    managed = state["managed"] if present and same else not present
+    retired = state if state is not None and not same and state["managed"] else None
+    record = json.dumps(dict(version=1, managed=managed, sha256=digest, pem=pem), indent=2) + "\n"
+    if present and retired is None:
+        if not same:
+            config.mkdir(parents=True, exist_ok=True)
+            atomic_write(state_path, record)
+        return dict(installed=False, managed=managed, sha256=digest, keychain=str(keychain))
+
+    if privilege is None:
+        privilege = _sudo_prefix("macOS CA setup requires sudo from an administrator account")
+    privilege = list(privilege)
+    def privileged(arguments):
+        return run(privilege + arguments, check=True)
+    def trust(path):
+        privileged([security, "add-trusted-cert", "-d", "-r", "trustRoot", "-k", str(keychain), str(path)])
+    config.mkdir(parents=True, exist_ok=True)
+    old_pem = config / ".friendzone-retired-ca.pem"
+    old_fingerprint = None
+    if retired is not None:
+        atomic_write(old_pem, retired["pem"])
+        old_fingerprint = _macos_fingerprint(retired["pem"])
+    def restore():
+        # Compare with the keychain before this run; never remove a root that predated it.
+        now, now_trusted = _macos_trust_state(run, security, keychain)
+        if fingerprint in now_trusted and fingerprint not in trusted:
+            privileged([security, "remove-trusted-cert", "-d", str(cert)])
+        if digest in now and digest not in certificates:
+            privileged([security, "delete-certificate", "-Z", digest.upper(), str(keychain)])
+        if retired is not None:
+            if old_fingerprint in trusted and old_fingerprint not in now_trusted:
+                trust(old_pem)
+            elif retired["sha256"] in certificates and retired["sha256"] not in now:
+                privileged([security, "add-certificates", "-k", str(keychain), str(old_pem)])
+    attempted = False
+    try:
+        if not present:
+            print("Trusting the Friendzone CA in the macOS System keychain; sudo and a macOS dialog may ask for your password.")
+            attempted = True
+            trust(cert)
+            now, now_trusted = _macos_trust_state(run, security, keychain)
+            if digest not in now or fingerprint not in now_trusted:
+                raise RuntimeError("Friendzone CA is not trusted in the System keychain after installation")
+        if retired is not None:
+            attempted = True
+            if old_fingerprint in trusted:
+                privileged([security, "remove-trusted-cert", "-d", str(old_pem)])
+            if retired["sha256"] in certificates:
+                privileged([security, "delete-certificate", "-Z", retired["sha256"].upper(), str(keychain)])
+        atomic_write(state_path, record)
+    except Exception as error:
+        try:
+            if attempted:
+                restore()
+        except Exception:
+            raise RuntimeError("macOS CA update failed and automatic rollback also failed; inspect the System keychain") from error
+        raise RuntimeError("macOS CA update failed and was rolled back; verify sudo and approve the macOS password dialog") from error
+    finally:
+        try:
+            old_pem.unlink()
+        except FileNotFoundError:
+            pass
+    return dict(installed=not present, managed=managed, sha256=digest, keychain=str(keychain))
+
+
+def _macos_proxy_value(text):
+    """Parse networksetup -getwebproxy / -getsecurewebproxy output."""
+    fields = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition(":")
+        if separator:
+            fields[key.strip()] = value.strip()
+    try:
+        port = int(fields.get("Port") or 0)
+    except ValueError:
+        port = None
+    if fields.get("Enabled") not in ("Yes", "No") or port is None:
+        raise ValueError("Unexpected networksetup proxy output")
+    return dict(enabled=fields["Enabled"] == "Yes", server=fields.get("Server", ""), port=port,
+                authenticated=fields.get("Authenticated Proxy Enabled", "0") not in ("", "0"))
+
+
+def configure_macos_proxy(host, port, config, run=None, networksetup=None, privilege=None):
+    """Point enabled network services' HTTP(S) proxies at Friendzone; keep originals."""
+    if (not isinstance(host, str) or not host or host.startswith("-") or
+            any(ord(character) <= 32 or ord(character) == 127 or character in "[]/\\@?#;,"
+                for character in host) or
+            isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536):
+        raise ValueError("Invalid Friendzone macOS proxy address")
+    config = Path(config).absolute()
+    state_path = config / MACOS_PROXY_STATE
+    run = run or subprocess.run
+    networksetup = networksetup or _command_path("networksetup", ("/usr/sbin/networksetup",))
+    if not networksetup:
+        raise ValueError("macOS proxy setup requires /usr/sbin/networksetup")
+    def read(*arguments):
+        return _output_text(run([networksetup] + list(arguments), check=True, stdout=subprocess.PIPE))
+    saved = None
+    state_before = state_path.read_text(encoding="utf-8") if state_path.exists() else None
+    if state_before is not None:
+        try:
+            saved = json.loads(state_before)
+            valid = saved.get("version") == 1 and all(
+                isinstance(entry, dict) and isinstance(entry.get("previous"), dict)
+                for entry in saved["services"].values())
+        except (ValueError, KeyError, TypeError, AttributeError):
+            valid = False
+        if not valid:
+            raise ValueError("Unsupported Friendzone macOS proxy state; repair or remove " + str(state_path))
+    lines = read("-listallnetworkservices").splitlines()
+    if not lines or "asterisk" not in lines[0]:
+        raise ValueError("Unexpected networksetup service list")
+    services = [line for line in lines[1:] if line and not line.startswith("*")]
+    if not services:
+        raise ValueError("No enabled macOS network service to configure")
+    before = {}
+    for service in services:
+        bypass = read("-getproxybypassdomains", service)
+        before[service] = dict(
+            web=_macos_proxy_value(read("-getwebproxy", service)),
+            secure=_macos_proxy_value(read("-getsecurewebproxy", service)),
+            bypass=[] if bypass.startswith("There aren't any bypass domains") else
+            [line.strip() for line in bypass.splitlines() if line.strip()])
+        if any(before[service][kind]["enabled"] and before[service][kind]["authenticated"] for kind in ("web", "secure")):
+            raise ValueError("Network service " + service + " uses an authenticated proxy; Friendzone will not replace it")
+    endpoint = dict(enabled=True, server=host, port=port, authenticated=False)
+    applied = {}
+    for service in services:
+        bypass = []
+        for item in before[service]["bypass"] + [host, "localhost", "127.0.0.1", "::1"]:
+            if item.lower() not in [existing.lower() for existing in bypass]:
+                bypass.append(item)
+        applied[service] = dict(web=endpoint, secure=endpoint, bypass=bypass)
+    # Reruns keep the first-run originals, including services disabled since then.
+    records = dict(saved["services"]) if saved is not None else {}
+    for service in services:
+        previous = records[service]["previous"] if service in records else before[service]
+        records[service] = dict(previous=previous, applied=applied[service])
+
+    if privilege is None:
+        privilege = _sudo_prefix("macOS proxy setup requires sudo from an administrator account")
+    privilege = list(privilege)
+    def privileged(arguments):
+        return run(privilege + arguments, check=True)
+    def equal(kind, left, right):
+        if kind == "bypass":
+            return left == right
+        return all(left[key] == right[key] for key in ("enabled", "server", "port"))
+    def write(service, kind, value):
+        if kind == "bypass":
+            privileged([networksetup, "-setproxybypassdomains", service] + (value or ["Empty"]))
+            return
+        option = "-setwebproxy" if kind == "web" else "-setsecurewebproxy"
+        if value["server"] and value["port"]:
+            privileged([networksetup, option, service, value["server"], str(value["port"]), "off"])
+        if not value["enabled"]:
+            privileged([networksetup, option + "state", service, "off"])
+    config.mkdir(parents=True, exist_ok=True)
+    # Recovery metadata is durable before the first network setting changes.
+    atomic_write(state_path, json.dumps(dict(version=1, services=records), indent=2) + "\n")
+    written = []
+    try:
+        for service in services:
+            for kind in ("web", "secure", "bypass"):
+                if not equal(kind, before[service][kind], applied[service][kind]):
+                    written.append((service, kind))
+                    write(service, kind, applied[service][kind])
+    except Exception as error:
+        try:
+            for service, kind in reversed(written):
+                write(service, kind, before[service][kind])
+            if state_before is None:
+                state_path.unlink()
+            else:
+                atomic_write(state_path, state_before)
+        except Exception:
+            raise RuntimeError("macOS proxy update failed and automatic rollback also failed; check System Settings > Network > Proxies") from error
+        raise RuntimeError("macOS proxy update failed and was rolled back; verify sudo and networksetup") from error
+    return dict(services=services, changed=bool(written))
 
 def provider_update(path, fake):
     """Merge the OAuth-shaped guest facade for the broker-owned Cline session.
@@ -211,7 +476,7 @@ def profile_update(old, activation, env, home):
     return hook + "\n" + old
 
 
-def configure(data, home, config, zdotdir, environ):
+def configure(data, home, config, zdotdir, environ, platform="linux"):
     """Only these explicit paths are written; caller owns network admission."""
     home, config, zdotdir = map(lambda p: Path(p).absolute(), (home, config, zdotdir))
     cert = config / "friendzone-ca.pem"
@@ -298,6 +563,31 @@ unset _fz_rest _fz_list _fz_item
     profiles = {home / ".profile", home / ".bashrc", zdotdir / ".zshenv"}
     profiles.update(home / name for name in (".bash_profile", ".bash_login") if (home / name).exists())
     backups = []
+    modes = {}
+    if platform == "darwin":
+        # GUI apps started by launchd do not read shell profiles. A LaunchAgent
+        # republishes the activated environment into the login session.
+        agent = home / "Library/LaunchAgents" / (MACOS_AGENT_LABEL + ".plist")
+        launchd_env = config / "launchd-env.sh"
+        if agent.exists():
+            try:
+                with agent.open("rb") as stream:
+                    existing = plistlib.load(stream)
+            except Exception as error:
+                raise ValueError("Unmanaged " + str(agent) + " exists; configuration unchanged") from error
+            if not isinstance(existing, dict) or existing.get("Label") != MACOS_AGENT_LABEL:
+                raise ValueError("Unmanaged " + str(agent) + " exists; configuration unchanged")
+        names = list(values) + ["NO_PROXY", "no_proxy", "BASH_ENV"]
+        if old_github_token is not None and "GITHUB_TOKEN" not in values:
+            names.append("GITHUB_TOKEN")
+        if remove_legacy_idle:
+            names.append("CLINE_PLUGIN_IDLE_TIMEOUT_MS")
+        edits.append((launchd_env, "# Friendzone launchd environment (managed)\n. " + shlex.quote(str(activation)) + "\n" + "".join(
+            'if [ -n "${{{0}+x}}" ]; then /bin/launchctl setenv {0} "${0}"; else /bin/launchctl unsetenv {0}; fi\n'.format(name)
+            for name in names)))
+        edits.append((agent, plistlib.dumps(dict(
+            Label=MACOS_AGENT_LABEL, ProgramArguments=["/bin/sh", str(launchd_env)], RunAtLoad=True)).decode("utf-8")))
+        modes[agent] = 0o644
     if git_config.exists() and not git_config.read_text(encoding="utf-8").startswith("# Friendzone managed Git configuration v1\n"):
         raise ValueError("Unmanaged friendzone.gitconfig exists; configuration unchanged")
     cline_home = Path(environ.get("CLINE_DIR", "").strip() or home / ".cline").absolute()
@@ -334,13 +624,14 @@ unset _fz_rest _fz_list _fz_item
         if not path.exists():
             atomic_write(path, text)
     for path, text in edits:
-        mode = path.stat().st_mode & 0o777 if path in profiles and path.exists() else 0o600
+        mode = path.stat().st_mode & 0o777 if path in profiles and path.exists() else modes.get(path, 0o600)
         atomic_write(path, text, mode)
     return activation
 
 
 def main(encoded):
-    if not sys.platform.startswith("linux"):
+    platform = "darwin" if sys.platform == "darwin" else "linux" if sys.platform.startswith("linux") else None
+    if platform is None:
         raise ValueError("Select the Windows script for a Windows guest")
     if os.environ.get("SUDO_USER"):
         raise ValueError("Run this script as the guest user without sudo")
@@ -362,9 +653,17 @@ def main(encoded):
     data["container"] = canonical
     home = Path.home()
     config = Path(os.environ.get("XDG_CONFIG_HOME", str(home / ".config"))) / "friendzone"
-    activation = configure(data, home, config, os.environ.get("ZDOTDIR", str(home)), os.environ)
-    trust = install_linux_ca(config / "friendzone-ca.pem", config)
-    print("Linux native trust ready at " + trust["destination"] + ".")
+    activation = configure(data, home, config, os.environ.get("ZDOTDIR", str(home)), os.environ, platform)
+    if platform == "darwin":
+        trust = install_macos_ca(config / "friendzone-ca.pem", config)
+        print("macOS System keychain trusts the Friendzone CA (SHA-256 " + trust["sha256"] + ").")
+        proxy = configure_macos_proxy(urllib.parse.urlsplit(data["broker"]).hostname, data["proxy_port"], config)
+        print("HTTP and HTTPS system proxy set for: " + ", ".join(proxy["services"]) + ".")
+        subprocess.run(["/bin/sh", str(config / "launchd-env.sh")], check=True)
+        print("Apps opened from the Dock, Finder or Spotlight now inherit the Friendzone environment; quit and reopen apps that are already running.")
+    else:
+        trust = install_linux_ca(config / "friendzone-ca.pem", config)
+        print("Linux native trust ready at " + trust["destination"] + ".")
     if canonical != requested:
         print("Requested guest name " + requested + " was replaced with " + canonical + " because this VM source IP is already pinned to that guest.")
     message = approval.get("message") or ("Approved and pinned." if approval.get("approved") else "Use Approve + pin IP in the host Inbox.")

@@ -139,9 +139,9 @@ changing the data directory also starts a separate policy store.
 
 ## Set up a guest
 
-Use **Settings → Guests → Set up guest**. Select Linux or Windows, copy the `curl` download
+Use **Settings → Guests → Set up guest**. Select Linux or macOS (one `sh` script) or Windows, copy the `curl` download
 command, and run the downloaded script in the guest account. No guest binary,
-compiler, or platform-specific build is needed. Linux requires Python 3;
+compiler, or platform-specific build is needed. Linux and macOS require Python 3;
 Windows requires curl.exe and PowerShell 5.1 or 7.
 
 The script saves the CA, credential-free proxy URL, loopback exclusions and fake credentials, merges
@@ -152,6 +152,10 @@ Windows Internet proxy used by many .NET clients (not machine-wide WinHTTP).
 It also installs the exact Friendzone CA into the guest user's Windows Trusted
 Root store (`CurrentUser\Root`), not the machine-wide store. Prior proxy settings
 and Friendzone-owned certificate bytes are recorded for ownership-aware rollback.
+macOS gets the same profile hooks, the exact Friendzone CA in the System keychain
+with admin trust (macOS may ask for an administrator password), the HTTP/HTTPS
+proxy of each enabled network service, and a LaunchAgent that publishes the
+environment to apps opened from the Dock or Finder.
 Close guest Cline
 before running the script because it updates that application's settings, then
 restart Cline from the activated environment.
