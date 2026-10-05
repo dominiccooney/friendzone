@@ -26,6 +26,56 @@ Open <http://127.0.0.1:8081>. The CA certificate and private key are created
 under the operating system's local application-data directory in
 `friendzone/`. The private key is never served by the bootstrap endpoint.
 
+### Local credential storage
+
+API keys and broker-owned Cline/MCP OAuth records use the current OS account's
+credential store by default: Windows Credential Manager (local-machine
+persistence, not roaming), macOS login Keychain, or Linux Secret Service
+(such as GNOME Keyring or KWallet). The broker caches them in memory; saves
+publish that cache only after the credential store commits. Unlock the store
+before running the broker. A missing, locked, or unavailable initialized store
+stops startup; there is no automatic plaintext fallback.
+
+Stop the old broker before upgrading. On first startup, an existing
+`secrets.json` is copied into the OS store, read back and checked, then removed
+before listeners start. Migration failures leave the file intact and stop
+startup. Conflicting OS/file values are never
+silently merged or overwritten. Removal is not secure erasure of old disk
+blocks, backups, or snapshots; rotate credentials if those copies are exposed.
+
+OS records are scoped to the canonical data-directory path and the current
+OS account. Keep that directory in place: copying it alone to another machine,
+user, or path does not move credentials. `os-secret-store.json` contains only a
+version marker, and `secret-store.lock` prevents multiple brokers from writing
+the same profile. Secret payloads are chunked to fit Windows' per-entry limit;
+one manifest selects the complete snapshot. If obsolete-record cleanup fails
+after a successful save, it warns and retries at the next save or startup.
+
+**Headless hosts, including a GCE VM without a login keyring, must explicitly
+select the existing plaintext backend until cloud storage is configured:**
+
+```sh
+fz broker --secret-store=file --data-dir /var/lib/friendzone
+```
+
+This mode warns at startup and retains `secrets.json`. It cannot reopen a data
+directory already initialized for OS storage; use a separate profile. Protect
+the filesystem and backups as before. The backend changes only on restart;
+there is no cloud-provider auto-detection.
+
+This storage change does **not** move `friendzone-ca-key.pem`, encrypt process
+memory, or change environment-variable/Cline-linked credential sources. The CA key
+still needs private filesystem permissions. An OS store does not protect
+against a compromised broker, administrator, or other applications authorized
+to access the current account's credentials. Management remains loopback-only
+and unauthenticated, so local shell access is still trusted-operator access.
+
+To test credential storage, run `cargo test --all-targets`. That uses isolated
+test stores, never your saved OS credentials. In a disposable OS account, run
+the opt-in native-store check with
+`cargo test --bin fz secret_store::tests::native_store_large_snapshot_and_cleanup -- --ignored --exact`.
+It creates only a temporary Friendzone namespace and deletes its records.
+
 The UI must bind to loopback on its own fixed port. Proxying to that port is
 denied (including CONNECT and hostname aliases); guests must never receive
 network access or an alternate relay to the management API. Outside the VM,
@@ -568,7 +618,7 @@ browser, display server, callback, or editor redirect. Tokens are registered
 with Cline's backend and auto-refresh from then on. Static Cline API keys
 (`app.cline.bot → Settings → API Keys`) are not supported: a Cline entry has no
 usable credential until it is signed in, a static key left in an older
-`secrets.json` is ignored, and the guest never receives the entry's fake while
+secret store is ignored, and the guest never receives the entry's fake while
 the entry is disconnected. Per-guest limits on what that account may do live on
 the guest, not the credential (see Containers above).
 
@@ -640,7 +690,7 @@ script-only guest setup with persistent Linux profiles or Windows user
 environment. Settings is organized into Guests, Credentials and MCP servers.
 
 Not yet: shared/NATed-address guest identity,
-general rulesets, transparent/direct `git push`, on-disk proxy logs, OS-secret-store
-credentials, stdio MCP forwarding, automatic Hyper-V/tart network provisioning,
+general rulesets, transparent/direct `git push`, on-disk proxy logs, stdio MCP
+forwarding, automatic Hyper-V/tart network provisioning,
 general DNS-rebinding/LAN protection, or termination of already-forwarded
 connections when Kill is pressed. Guest egress enforcement remains external.

@@ -1,7 +1,7 @@
 //! Escrow settings: generic (hosts, header) -> (fake key, real key)
 //! entries. Substitution replaces only an exact fake match; a fake seen
 //! toward any non-pinned host is a leak and blocks the request.
-//! Real values come from the secrets file (written by the UI or OAuth
+//! Real values come from the selected secret store (written by the UI or OAuth
 //! flow) or a named env var; fakes are worthless and live in plain JSON.
 
 use std::{
@@ -40,7 +40,19 @@ struct Inner {
     data_dir: PathBuf,
     entries: RwLock<Vec<EscrowEntry>>,
     /// name -> real value. Written by the UI and the OAuth flow.
-    secrets: RwLock<HashMap<String, String>>,
+    secrets: RwLock<Secrets>,
+}
+
+struct Secrets {
+    values: HashMap<String, String>,
+    persistence: Box<dyn crate::secret_store::Persistence>,
+}
+impl Secrets {
+    fn save(&mut self, values: HashMap<String, String>) -> Result<()> {
+        self.persistence.save(&values)?;
+        self.values = values;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -51,14 +63,19 @@ pub fn generate_fake(name: &str) -> String {
 }
 
 impl Settings {
+    #[cfg(test)]
     pub fn load(data_dir: &Path) -> Result<Self> {
+        Self::load_with_mode(data_dir, crate::secret_store::Mode::Os)
+    }
+
+    pub fn load_with_mode(data_dir: &Path, mode: crate::secret_store::Mode) -> Result<Self> {
         fs::create_dir_all(data_dir)?;
         let entries = read_json(&data_dir.join("escrow.json"))?.unwrap_or_default();
-        let secrets = read_json(&data_dir.join("secrets.json"))?.unwrap_or_default();
+        let (persistence, values) = crate::secret_store::open(data_dir, mode)?;
         Ok(Self(Arc::new(Inner {
             data_dir: data_dir.to_owned(),
             entries: RwLock::new(entries),
-            secrets: RwLock::new(secrets),
+            secrets: RwLock::new(Secrets { values, persistence }),
         })))
     }
 
@@ -107,29 +124,29 @@ impl Settings {
         Ok(updated)
     }
 
-    /// Deletes an escrow entry and its stored real value together, so
-    /// no orphaned secret outlives its entry.
+    /// Revoke saved credentials before removing their routing metadata, so
+    /// a failed metadata write cannot leave an orphaned usable credential.
     pub fn remove_entry(&self, name: &str) -> Result<()> {
         let mut entries = self.0.entries.write().expect("settings lock");
-        entries.retain(|entry| entry.name != name);
-        write_json(&self.0.data_dir.join("escrow.json"), &*entries)?;
-        drop(entries);
         let mut secrets = self.0.secrets.write().expect("settings lock");
-        let mut updated = secrets.clone();
+        let mut updated = secrets.values.clone();
         updated.remove(name);
         updated.remove(&crate::oauth::ClineSession::secret_name(name));
-        write_json_private(&self.0.data_dir.join("secrets.json"), &updated)?;
-        *secrets = updated;
+        // Revoke credentials before removing routing metadata. If metadata
+        // persistence fails, the entry remains visible but no secret is usable.
+        secrets.save(updated)?;
+        let mut updated = entries.clone();
+        updated.retain(|entry| entry.name != name);
+        write_json(&self.0.data_dir.join("escrow.json"), &updated)?;
+        *entries = updated;
         Ok(())
     }
 
     pub fn set_secret(&self, name: &str, value: &str) -> Result<()> {
         let mut secrets = self.0.secrets.write().expect("settings lock");
-        let mut updated = secrets.clone();
+        let mut updated = secrets.values.clone();
         updated.insert(name.to_owned(), value.to_owned());
-        write_json_private(&self.0.data_dir.join("secrets.json"), &updated)?;
-        *secrets = updated;
-        Ok(())
+        secrets.save(updated)
     }
 
     pub fn secret(&self, name: &str) -> Option<String> {
@@ -137,17 +154,16 @@ impl Settings {
             .secrets
             .read()
             .expect("settings lock")
+            .values
             .get(name)
             .cloned()
     }
 
     pub fn remove_secret(&self, name: &str) -> Result<()> {
         let mut secrets = self.0.secrets.write().expect("settings lock");
-        let mut updated = secrets.clone();
+        let mut updated = secrets.values.clone();
         updated.remove(name);
-        write_json_private(&self.0.data_dir.join("secrets.json"), &updated)?;
-        *secrets = updated;
-        Ok(())
+        secrets.save(updated)
     }
 
     /// Real value for an entry: secrets store first, then env fallback.
@@ -364,12 +380,6 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .with_context(|| format!("write {}", path.display()))
 }
 
-fn write_json_private<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    // Stage owner-only on Unix and rename atomically. Concurrent refreshes
-    // cannot expose a partial secrets file or publish failed disk writes.
-    crate::storage::atomic_write(path, &serde_json::to_vec_pretty(value)?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,7 +591,7 @@ mod tests {
     #[test]
     fn failed_secret_write_keeps_last_good_memory_value() {
         let dir = std::env::temp_dir().join(format!("fz-secret-failure-{}", Uuid::new_v4()));
-        let settings = Settings::load(&dir).unwrap();
+        let settings = Settings::load_with_mode(&dir, crate::secret_store::Mode::File).unwrap();
         settings.set_secret("test", "last-good").unwrap();
         let path = dir.join("secrets.json");
         fs::remove_file(&path).unwrap();

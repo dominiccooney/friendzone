@@ -18,6 +18,7 @@ mod proxy_server;
 mod pushes;
 mod review;
 mod routing;
+mod secret_store;
 mod settings;
 mod state;
 mod storage;
@@ -55,6 +56,9 @@ enum Command {
         bootstrap_addr: SocketAddr,
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// OS credential store by default; file is explicit plaintext storage for headless hosts.
+        #[arg(long, value_enum, default_value_t = secret_store::Mode::Os)]
+        secret_store: secret_store::Mode,
     },
     /// Check this guest's Friendzone network setup.
     Doctor {
@@ -100,12 +104,14 @@ async fn main() -> Result<()> {
             ui_addr,
             bootstrap_addr,
             data_dir,
+            secret_store,
         } => {
             run_broker(
                 proxy_addr,
                 ui_addr,
                 bootstrap_addr,
                 data_dir.unwrap_or_else(default_data_dir),
+                secret_store,
             )
             .await
         }
@@ -124,6 +130,7 @@ async fn run_broker(
     ui_addr: SocketAddr,
     bootstrap_addr: SocketAddr,
     data_dir: PathBuf,
+    secret_store: secret_store::Mode,
 ) -> Result<()> {
     validate_listeners(proxy_addr, ui_addr, bootstrap_addr)?;
     let data_dir = if data_dir.is_absolute() {
@@ -136,10 +143,10 @@ async fn run_broker(
     // Print this before loading any store so every startup failure is
     // actionable even when the UI never starts.
     println!("Friendzone data:      {}", data_dir.display());
+    let settings = settings::Settings::load_with_mode(&data_dir, secret_store)?;
     let files = AuthorityFiles::load_or_create(&data_dir)?;
     let issuer = files.issuer()?;
     let state = AppState::load(&data_dir)?;
-    let settings = settings::Settings::load(&data_dir)?;
     let registry = mcp::ForwardRegistry::load(&data_dir, settings.clone())?;
     let trace_relay = telemetry::TraceRelay::from_env()?;
     if trace_relay.is_some() {

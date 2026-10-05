@@ -40,6 +40,7 @@ impl Broker {
         command
             .args([
                 "broker",
+                "--secret-store=file",
                 "--proxy-addr",
                 &addresses[0],
                 "--ui-addr",

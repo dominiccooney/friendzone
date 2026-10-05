@@ -16,10 +16,12 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6", features = ["derive"] }
 dirs = "6.0"
 futures-util = "0.3"
+fs2 = "0.4"
 h2 = "=0.4.19"
 http-body-util = "0.1"
 hudsucker = { version = "0.25", features = ["http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "logging", "tls12", "webpki-tokio"] }
+keyring-core = "1.0"
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
@@ -34,6 +36,15 @@ tracing-opentelemetry = { version = "0.33", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = { version = "0.5", features = ["util"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { version = "1.1", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0", features = ["keychain"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-async-io-crypto-rust"] }
 
 [dev-dependencies]
 tokio-rustls = "0.26"

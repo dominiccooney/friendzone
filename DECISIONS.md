@@ -108,6 +108,9 @@ ships mechanism; rulesets supply judgment.
   container is harmless.
 - **Secrets rest in the OS secret store.** Rulesets reference secrets by
   name, never value.
+  The broker uses OS storage for API keys and OAuth records by default;
+  headless plaintext mode remains explicit. The CA private key remains a
+  filesystem secret until a separate key-storage change.
 
 ## 3. Visibility and attention
 
