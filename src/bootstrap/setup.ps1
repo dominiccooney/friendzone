@@ -135,7 +135,7 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     Write-FzFile $cert $Data.ca
     Write-FzFile $envFile ($lines -join "`n")
     Write-FzFile $retiredProxyPath (ConvertTo-Json -InputObject $retiredProxies)
-    $compatibility=@('. '+(Quote-FzPowerShell $envFile),'$env:HTTP_PROXY=$env:FZ_PROXY','$env:HTTPS_PROXY=$env:FZ_PROXY')
+    $compatibility=@(('. '+(Quote-FzPowerShell $envFile)),'$env:HTTP_PROXY=$env:FZ_PROXY','$env:HTTPS_PROXY=$env:FZ_PROXY')
     Write-FzFile (Join-Path $ConfigDirectory 'friendzone-proxy-env.ps1') ($compatibility -join "`n")
     if($providerJson){Write-FzFile $provider $providerJson}
     $valuesPath=$oldValuesPath

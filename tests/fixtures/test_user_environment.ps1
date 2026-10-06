@@ -238,6 +238,23 @@ try {Invoke-FzConfigure $data $homeDir $configDir;throw 'expected invalid provid
 if([IO.File]::ReadAllText($EnvironmentFile) -cne $beforeEnv){throw 'wrote configuration before validation'}
 Write-FzFile $provider (ConvertTo-Json -InputObject $root -Depth 100)
 . ([scriptblock]::Create([IO.File]::ReadAllText($EnvironmentFile).TrimStart([char]0xfeff)))
+# Execute the generated compatibility profile, including its environment loader.
+# An alias loads the real environment bytes without changing script-file policy.
+function Invoke-FzTestActivation { . ([scriptblock]::Create([IO.File]::ReadAllText($EnvironmentFile).TrimStart([char]0xfeff))) }
+Set-Alias -Name $EnvironmentFile -Value Invoke-FzTestActivation
+try {
+    $env:FZ_PROXY='http://stale-proxy:8000'
+    Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY -ErrorAction SilentlyContinue
+    $compatibilityFile=Join-Path $configDir 'friendzone-proxy-env.ps1'
+    . ([scriptblock]::Create([IO.File]::ReadAllText($compatibilityFile).TrimStart([char]0xfeff)))
+    if($env:FZ_PROXY -cne $script:fakeUser.FZ_PROXY){throw 'compatibility profile did not load the generated environment'}
+    if($env:HTTP_PROXY -cne $env:FZ_PROXY -or $env:HTTPS_PROXY -cne $env:FZ_PROXY){throw 'compatibility profile did not activate both proxy variables'}
+    $runtime=[Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    $inherited=@(& $runtime -NoProfile -NonInteractive -Command '$env:HTTP_PROXY; $env:HTTPS_PROXY')
+    if($LASTEXITCODE -ne 0 -or $inherited.Count -ne 2 -or $inherited[0] -cne $env:FZ_PROXY -or $inherited[1] -cne $env:FZ_PROXY){throw 'child process did not inherit compatibility proxy variables'}
+    Invoke-FzTestActivation
+    if($null-ne$env:HTTP_PROXY -or $null-ne$env:HTTPS_PROXY){throw 'normal activation did not clear compatibility proxy variables'}
+} finally { Remove-Item -LiteralPath ('Alias:'+ $EnvironmentFile) }
 if ($env:FZ_HOST -ne '192.0.2.1') { throw 'wrong broker host' }
 if ($env:CLINE_API_KEY -cne "fake'`$(not-a-command)") { throw 'fake changed or evaluated' }
 if ($env:NO_PROXY -notmatch 'localhost' -or $env:NO_PROXY -notmatch '127.0.0.1') { throw 'loopback exclusions missing' }
@@ -317,4 +334,4 @@ foreach ($path in @($BootstrapScript,$BootstrapCommand)) {
     $null=[Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors)
     if ($errors.Count) { throw ($errors | Out-String) }
 }
-Write-Output 'PASS: mocked user/proxy/root trust persistence, rotation, uninstall, rollback and failure; child-only activation; PowerShell syntax'
+Write-Output 'PASS: mocked user/proxy/root trust persistence, rotation, uninstall, rollback and failure; compatibility activation, inheritance and reset; PowerShell syntax'
