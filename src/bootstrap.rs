@@ -115,6 +115,7 @@ pub fn script(
                     "GIT_PROXY_SSL_CAINFO",
                     "CARGO_HTTP_CAINFO",
                     "CARGO_HTTP_CHECK_REVOKE",
+                    "CARGO_HTTP_PROXY",
                     "GIT_CONFIG_COUNT",
                     "CLINE_PLUGIN_IDLE_TIMEOUT_MS",
                 ]
@@ -335,6 +336,32 @@ mod tests {
             "http://0.0.0.0:8082",
         ] {
             assert!(broker_origin(raw).is_err());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cargo_proxy_environment_is_reserved_for_compatibility_activation() {
+        let dir = std::env::temp_dir().join(format!("fz-bootstrap-proxy-{}", uuid::Uuid::new_v4()));
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        for name in ["CARGO_HTTP_PROXY", "cargo_http_proxy"] {
+            settings
+                .add_entry(crate::settings::EscrowEntry {
+                    name: name.into(),
+                    hosts: vec!["api.example.com".into()],
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                    fake: "fake".into(),
+                    real_env: None,
+                    guest_env: Some(name.into()),
+                })
+                .unwrap();
+            for shell in [Shell::Sh, Shell::Powershell] {
+                assert!(
+                    script(shell, "http://192.0.2.1:9082", "guest", "", 9080, &settings).is_err()
+                );
+            }
+            settings.remove_entry(name).unwrap();
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

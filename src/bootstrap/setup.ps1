@@ -70,6 +70,8 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     # Friendzone's dynamic leaf certificates have no public CRL/OCSP endpoint.
     # Cargo/Schannel must skip revocation lookup while retaining CA/host checks.
     $values.CARGO_HTTP_CHECK_REVOKE='false'
+    $proxyVariables=@('HTTP_PROXY','HTTPS_PROXY','CARGO_HTTP_PROXY')
+    $resetProxyVariables=$proxyVariables+@('ALL_PROXY')
     foreach($property in $Data.fakes.PSObject.Properties) {$values[$property.Name]=[string]$property.Value}
     $values.NO_PROXY=(@($origin.DnsSafeHost,'localhost','127.0.0.1','::1','[::1]')+@($Data.infrastructure_no_proxy)) -join ','
     Add-FzGitConfiguration $values $gitConfig
@@ -92,7 +94,10 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     if(Test-Path -LiteralPath $oldValuesPath){
         try{$oldValues=Get-Content -Raw -LiteralPath $oldValuesPath|ConvertFrom-Json;$removeLegacyIdle=$removeLegacyIdle -or ($oldValues.CLINE_PLUGIN_IDLE_TIMEOUT_MS -ceq '90000000');if($null-ne$oldValues.PSObject.Properties['GITHUB_TOKEN']-and-not$values.ContainsKey('GITHUB_TOKEN')){$retiredGithubToken=[string]$oldValues.GITHUB_TOKEN}}catch{}
     }
-    foreach($key in @('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY')){
+    if($null-ne$oldValues -and -not [string]::IsNullOrEmpty([string]$oldValues.FZ_PROXY) -and [string]$oldValues.FZ_PROXY -cne $proxy){
+        $retiredProxies.CARGO_HTTP_PROXY=[string]$oldValues.FZ_PROXY
+    }
+    foreach($key in $resetProxyVariables){
         if($null-ne$oldValues -and $null-ne$oldValues.PSObject.Properties[$key]){$retiredProxies[$key]=[string]$oldValues.$key}
     }
     if($removeLegacyIdle -and (Test-Path -LiteralPath $legacyIdleMarker)){
@@ -103,7 +108,7 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     foreach($key in $values.Keys) {
         if ($key -ne 'NO_PROXY') {$lines += '[Environment]::SetEnvironmentVariable('+(Quote-FzPowerShell $key)+','+(Quote-FzPowerShell $values[$key])+",'Process')"}
     }
-    foreach($key in @('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY')){
+    foreach($key in $resetProxyVariables){
         $oldProxy=if($retiredProxies.ContainsKey($key)){$retiredProxies[$key]}else{$proxy}
         $lines += 'if ($env:'+ $key +' -ceq '+(Quote-FzPowerShell $oldProxy)+' -or $env:'+ $key +' -ceq '+(Quote-FzPowerShell $proxy)+') { Remove-Item Env:'+ $key +' }'
     }
@@ -135,7 +140,10 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     Write-FzFile $cert $Data.ca
     Write-FzFile $envFile ($lines -join "`n")
     Write-FzFile $retiredProxyPath (ConvertTo-Json -InputObject $retiredProxies)
-    $compatibility=@(('. '+(Quote-FzPowerShell $envFile)),'$env:HTTP_PROXY=$env:FZ_PROXY','$env:HTTPS_PROXY=$env:FZ_PROXY')
+    # Explicit activation selects one proxy for this process and future children.
+    # Cargo's native setting takes precedence over Cargo/Git config-file proxies.
+    $compatibility=@('. '+(Quote-FzPowerShell $envFile))
+    foreach($key in $proxyVariables){$compatibility += '$env:'+ $key +'=$env:FZ_PROXY'}
     Write-FzFile (Join-Path $ConfigDirectory 'friendzone-proxy-env.ps1') ($compatibility -join "`n")
     if($providerJson){Write-FzFile $provider $providerJson}
     $valuesPath=$oldValuesPath

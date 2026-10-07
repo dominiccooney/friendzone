@@ -88,9 +88,11 @@ from an explicit compatibility environment:
 cline
 ```
 
-This profile sets ordinary proxy variables for that process and its children;
-it is not selective. On Linux, source `activate.sh` to reset the inherited bash
-hook; on Windows, source `friendzone-env.ps1`, or start a fresh terminal on
+This profile sets ordinary proxy variables and `CARGO_HTTP_PROXY` for that process
+and its children; it is not selective. Cargo's native proxy setting takes precedence
+over Cargo/Git config-file proxy settings, keeping its routing consistent with the managed CA.
+It does not persist a global Cargo proxy. On Linux, source `activate.sh` to reset
+the inherited bash hook; on Windows, source `friendzone-env.ps1`, or start a fresh terminal on
 either platform to leave it. Setup removes old Friendzone-owned global proxy values
 but preserves unrelated user settings. Existing network-isolated deployments
 must keep using explicit proxy configuration for clients that cannot connect

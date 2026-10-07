@@ -16,6 +16,7 @@ import urllib.request
 MARKER = "# Friendzone guest environment (managed)"
 SYSTEM_CA = Path("/usr/local/share/ca-certificates/friendzone-local-ca.crt")
 SYSTEM_CA_STATE = "linux-system-ca.json"
+PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "CARGO_HTTP_PROXY")
 
 
 def atomic_write(path, text, mode=0o600):
@@ -224,6 +225,7 @@ def configure(data, home, config, zdotdir, environ):
         previous = ""
     old_environment = env.read_text(encoding="utf-8") if env.exists() else ""
     old_github_token = None
+    previous_proxy = None
     retired_proxy_path = config / "retired-proxy-values.json"
     old_proxy_values = json.loads(retired_proxy_path.read_text(encoding="utf-8")) if retired_proxy_path.exists() else {}
     if old_environment.startswith("# Friendzone guest environment\n"):
@@ -238,7 +240,9 @@ def configure(data, home, config, zdotdir, environ):
                 old_github_token = fields[1].split("=", 1)[1]
             if len(fields) == 2 and fields[0] == "export" and "=" in fields[1]:
                 key, value = fields[1].split("=", 1)
-                if key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                if key == "FZ_PROXY":
+                    previous_proxy = value
+                if key in PROXY_VARIABLES:
                     old_proxy_values[key] = value
     legacy_idle = "export CLINE_PLUGIN_IDLE_TIMEOUT_MS=90000000\n"
     legacy_idle_marker = config / "remove-legacy-cline-idle-timeout"
@@ -247,6 +251,8 @@ def configure(data, home, config, zdotdir, environ):
     origin = urllib.parse.urlsplit(data["broker"])
     proxy_host = "[" + origin.hostname + "]" if ":" in origin.hostname else origin.hostname
     proxy = "http://{}:{}".format(proxy_host, data["proxy_port"])
+    if previous_proxy and previous_proxy != proxy:
+        old_proxy_values["CARGO_HTTP_PROXY"] = previous_proxy
     values = dict(data["fakes"])
     values.update(FZ_HOST=origin.hostname, FZ_BROKER=data["broker"], FZ_PROXY=proxy,
                   FZ_PAC_URL=data["broker"] + "/bootstrap/proxy.pac",
@@ -265,7 +271,7 @@ def configure(data, home, config, zdotdir, environ):
         raise ValueError("Existing GIT_CONFIG_* environment entries conflict with Friendzone Git authentication")
     values.update(expected)
     content = "# Friendzone guest environment\n" + "".join(f"export {key}={shlex.quote(value)}\n" for key, value in values.items())
-    for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+    for key in PROXY_VARIABLES:
         old_value = old_proxy_values.get(key, proxy)
         content += 'if [ "${{{0}-}}" = {1} ] || [ "${{{0}-}}" = {2} ]; then unset {0}; fi\n'.format(key, shlex.quote(old_value), shlex.quote(proxy))
     if old_github_token is not None and "GITHUB_TOKEN" not in values:
@@ -287,8 +293,10 @@ export NO_PROXY="$_fz_list" no_proxy="$_fz_list"
 unset _fz_rest _fz_list _fz_item
 '''
     source = ". " + shlex.quote(str(env)) + "\n"
+    # Explicit activation selects one proxy for this process and future children.
+    # Cargo's native setting takes precedence over Cargo/Git config-file proxies.
     compatibility = source + ''.join('export {0}="$FZ_PROXY"\n'.format(key)
-        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"))
+        for key in PROXY_VARIABLES)
     compatibility += 'export BASH_ENV=' + shlex.quote(str(config / "friendzone-proxy-env.sh")) + '\n'
     edits = ([(legacy_idle_marker, "Friendzone previously managed the exact value 90000000; activation removes only that value.\n")] if remove_legacy_idle else []) + [(git_config, git_config_text), (cert, data["ca"]), (env, content), (old_hook, previous),
              (config / "friendzone-proxy-env.sh", compatibility),

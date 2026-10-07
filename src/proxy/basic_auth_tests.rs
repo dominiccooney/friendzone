@@ -504,17 +504,44 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
     );
     assert!(state.reviews.summaries().is_empty());
 
+    // Cargo's configured proxy takes precedence over generic proxy variables.
+    // A local rejecting proxy makes that choice observable without going online.
+    let other_proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let other_address = other_proxy.local_addr().unwrap();
+    let other_hits = Arc::new(AtomicUsize::new(0));
+    let other_received = other_hits.clone();
+    let _other_proxy = Task(tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        loop {
+            let (mut socket, _) = other_proxy.accept().await.unwrap();
+            other_received.fetch_add(1, Ordering::SeqCst);
+            let _ = socket
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        }
+    }));
+    let cargo_home = dir.0.join("cargo-home");
+    std::fs::create_dir_all(&cargo_home).unwrap();
+    std::fs::write(
+        cargo_home.join("config.toml"),
+        format!("[http]\nproxy = \"http://{other_address}\"\n"),
+    )
+    .unwrap();
     // Cargo's vendored libcurl uses Schannel on Windows. Its native CA setting
-    // must verify the same generated interception certificate. CARGO_HOME and
-    // the connector are isolated, so this cannot read user config or go online.
-    let cargo_executable = std::process::Command::new("rustup")
-        .args(["which", "cargo"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|path| PathBuf::from(path.trim()))
-        .unwrap_or_else(|| PathBuf::from("cargo"));
+    // verifies the generated interception certificate. CARGO_HOME and both
+    // proxies are isolated, so this cannot read user config or go online.
+    let cargo_executable = std::env::var_os("FZ_TEST_CARGO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::process::Command::new("rustup")
+                .args(["which", "cargo"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|path| PathBuf::from(path.trim()))
+                .unwrap_or_else(|| PathBuf::from("cargo"))
+        });
     let mut cargo = tokio::process::Command::new(cargo_executable);
     cargo.env_clear();
     for key in [
@@ -534,15 +561,25 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
         .current_dir(&dir.0)
         .env("HOME", &dir.0)
         .env("USERPROFILE", &dir.0)
-        .env("CARGO_HOME", dir.0.join("cargo-home"))
+        .env("CARGO_HOME", &cargo_home)
         .env("HTTP_PROXY", format!("http://{address}"))
         .env("HTTPS_PROXY", format!("http://{address}"))
         .env("NO_PROXY", "")
         .env("CARGO_HTTP_CAINFO", &ca)
         .env("CARGO_HTTP_CHECK_REVOKE", "false")
         .env("CARGO_HTTP_TIMEOUT", "10")
+        .env("CARGO_NET_RETRY", "0")
         .kill_on_drop(true)
         .args(["search", "friendzone-cargo-ca-fixture", "--limit", "1"]);
+    let output = tokio::time::timeout(Duration::from_secs(15), cargo.output())
+        .await
+        .unwrap()
+        .expect("Cargo must be installed for proxy precedence test");
+    assert!(!output.status.success());
+    assert!(other_hits.load(Ordering::SeqCst) > 0);
+    assert_eq!(cargo_hits.load(Ordering::SeqCst), 0);
+    let rejected = other_hits.load(Ordering::SeqCst);
+    cargo.env("CARGO_HTTP_PROXY", format!("http://{address}"));
     let output = tokio::time::timeout(Duration::from_secs(15), cargo.output())
         .await
         .unwrap()
@@ -554,6 +591,7 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("friendzone-cargo-ca-fixture"));
     assert_eq!(cargo_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(other_hits.load(Ordering::SeqCst), rejected);
 
     let before = seen.lock().unwrap().len();
     let blocked = client

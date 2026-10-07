@@ -159,7 +159,7 @@ $data.fakes | Add-Member -NotePropertyName GITHUB_TOKEN -NotePropertyValue ([str
 $legacyBackup=Join-Path $configDir 'user-environment-backup.json'
 [IO.Directory]::CreateDirectory($configDir)|Out-Null
 $script:fakeUser.CLINE_PLUGIN_IDLE_TIMEOUT_MS='90000000'
-[IO.File]::WriteAllText((Join-Path $configDir 'user-environment.json'),'{"CLINE_PLUGIN_IDLE_TIMEOUT_MS":"90000000"}')
+[IO.File]::WriteAllText((Join-Path $configDir 'user-environment.json'),'{"CLINE_PLUGIN_IDLE_TIMEOUT_MS":"90000000","FZ_PROXY":"http://old-broker:8080"}')
 [IO.File]::WriteAllText($legacyBackup,'{"CLINE_PLUGIN_IDLE_TIMEOUT_MS":{"previous":"user-original","applied":"90000000"}}')
 $env:CLINE_PLUGIN_IDLE_TIMEOUT_MS='90000000'
 $otherPlugin=Join-Path $homeDir '.cline/plugins/other.js'
@@ -171,7 +171,7 @@ foreach($bypass in @('metadata','metadata.google.internal','169.254.169.254','fd
 }
 if($script:fakeInternet.AutoConfigURL.value-cne$data.broker+'/bootstrap/proxy.pac'){throw 'generated installer PAC URL is wrong'}
 if($script:fakeUser.FZ_PROXY-cne'http://192.0.2.1:9080'){throw 'explicit proxy address missing'}
-if((Get-Content -Raw -LiteralPath (Join-Path $configDir 'user-environment.json')) -match '"HTTPS?_PROXY"'){throw 'default setup installed global proxy environment'}
+if((Get-Content -Raw -LiteralPath (Join-Path $configDir 'user-environment.json')) -match '"(?:HTTPS?_PROXY|CARGO_HTTP_PROXY)"'){throw 'default setup installed global proxy environment'}
 $caIdentity=Read-FzCertificateIdentity (Join-Path $configDir 'friendzone-ca.pem')
 if($script:fakeRoots.Count-ne 1 -or -not $script:fakeRoots.ContainsKey($caIdentity.thumbprint) -or $script:fakeRoots[$caIdentity.thumbprint]-cne$caIdentity.der){throw 'generated installer did not trust the exact Friendzone CA'}
 if(-not (Test-Path -LiteralPath (Join-Path $configDir 'certificate-trust-state.json'))){throw 'generated installer did not persist CA ownership state'}
@@ -243,17 +243,23 @@ Write-FzFile $provider (ConvertTo-Json -InputObject $root -Depth 100)
 function Invoke-FzTestActivation { . ([scriptblock]::Create([IO.File]::ReadAllText($EnvironmentFile).TrimStart([char]0xfeff))) }
 Set-Alias -Name $EnvironmentFile -Value Invoke-FzTestActivation
 try {
+    $env:CARGO_HTTP_PROXY='http://old-broker:8080'
+    Invoke-FzTestActivation
+    if($null-ne$env:CARGO_HTTP_PROXY){throw 'normal activation retained the previous Friendzone Cargo proxy'}
+    $env:CARGO_HTTP_PROXY='http://external-proxy:8000'
+    Invoke-FzTestActivation
+    if($env:CARGO_HTTP_PROXY -cne 'http://external-proxy:8000'){throw 'normal activation changed an unrelated Cargo proxy'}
     $env:FZ_PROXY='http://stale-proxy:8000'
     Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY -ErrorAction SilentlyContinue
     $compatibilityFile=Join-Path $configDir 'friendzone-proxy-env.ps1'
     . ([scriptblock]::Create([IO.File]::ReadAllText($compatibilityFile).TrimStart([char]0xfeff)))
     if($env:FZ_PROXY -cne $script:fakeUser.FZ_PROXY){throw 'compatibility profile did not load the generated environment'}
-    if($env:HTTP_PROXY -cne $env:FZ_PROXY -or $env:HTTPS_PROXY -cne $env:FZ_PROXY){throw 'compatibility profile did not activate both proxy variables'}
+    if($env:HTTP_PROXY -cne $env:FZ_PROXY -or $env:HTTPS_PROXY -cne $env:FZ_PROXY -or $env:CARGO_HTTP_PROXY -cne $env:FZ_PROXY){throw 'compatibility profile did not activate HTTP and Cargo proxy variables'}
     $runtime=[Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-    $inherited=@(& $runtime -NoProfile -NonInteractive -Command '$env:HTTP_PROXY; $env:HTTPS_PROXY')
-    if($LASTEXITCODE -ne 0 -or $inherited.Count -ne 2 -or $inherited[0] -cne $env:FZ_PROXY -or $inherited[1] -cne $env:FZ_PROXY){throw 'child process did not inherit compatibility proxy variables'}
+    $inherited=@(& $runtime -NoProfile -NonInteractive -Command '$env:HTTP_PROXY; $env:HTTPS_PROXY; $env:CARGO_HTTP_PROXY')
+    if($LASTEXITCODE -ne 0 -or $inherited.Count -ne 3 -or @($inherited|Where-Object{$_ -cne $env:FZ_PROXY}).Count){throw 'child process did not inherit compatibility proxy variables'}
     Invoke-FzTestActivation
-    if($null-ne$env:HTTP_PROXY -or $null-ne$env:HTTPS_PROXY){throw 'normal activation did not clear compatibility proxy variables'}
+    if($null-ne$env:HTTP_PROXY -or $null-ne$env:HTTPS_PROXY -or $null-ne$env:CARGO_HTTP_PROXY){throw 'normal activation did not clear compatibility proxy variables'}
 } finally { Remove-Item -LiteralPath ('Alias:'+ $EnvironmentFile) }
 if ($env:FZ_HOST -ne '192.0.2.1') { throw 'wrong broker host' }
 if ($env:CLINE_API_KEY -cne "fake'`$(not-a-command)") { throw 'fake changed or evaluated' }

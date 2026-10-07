@@ -306,22 +306,30 @@ case "$output" in *fz-test-github-token*|*username=x-access-token*) exit 12;; es
     def test_direct_defaults_retire_owned_proxy_and_compatibility_is_explicit(self):
         self.config.mkdir()
         old = "http://old-broker:8080"
-        (self.config / "friendzone-env.sh").write_text("# Friendzone guest environment\nexport HTTP_PROXY=" + old + "\nexport http_proxy=" + old + "\n")
+        (self.config / "friendzone-env.sh").write_text("# Friendzone guest environment\nexport FZ_PROXY=" + old + "\nexport HTTP_PROXY=" + old + "\nexport http_proxy=" + old + "\n")
         activation = self.apply()
         self.apply()
         bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "/bin/bash"
         command = r'''. "$1"
 test -z "${HTTP_PROXY-}" && test -z "${http_proxy-}"
 test "$HTTPS_PROXY" = http://external-proxy:8080
+test "$CARGO_HTTP_PROXY" = http://external-proxy:8080
 test "$FZ_PROXY_HOSTS" = api.cline.bot,api.github.com,github.com
 test "$FZ_PAC_URL" = http://192.0.2.1:9082/bootstrap/proxy.pac
 . "$2"
 test "$HTTP_PROXY" = "$FZ_PROXY" && test "$https_proxy" = "$FZ_PROXY"
-"$3" --noprofile --norc -c 'test "$HTTP_PROXY" = "$FZ_PROXY"'
+test "$CARGO_HTTP_PROXY" = "$FZ_PROXY"
+"$3" --noprofile --norc -c 'test "$HTTP_PROXY" = "$FZ_PROXY" && test "$CARGO_HTTP_PROXY" = "$FZ_PROXY"'
 . "$1"
-test -z "${HTTP_PROXY-}" && test -z "${HTTPS_PROXY-}"'''
+test -z "${HTTP_PROXY-}" && test -z "${HTTPS_PROXY-}" && test -z "${CARGO_HTTP_PROXY-}"
+export CARGO_HTTP_PROXY=http://old-broker:8080
+. "$1"
+test -z "${CARGO_HTTP_PROXY-}"
+export CARGO_HTTP_PROXY=http://external-proxy:8080
+. "$1"
+test "$CARGO_HTTP_PROXY" = http://external-proxy:8080'''
         result = subprocess.run([bash,"--noprofile","--norc","-ec",command,"test",str(activation),str(self.config / "friendzone-proxy-env.sh"),bash],
-            env=dict(os.environ, HTTP_PROXY=old, http_proxy=old, HTTPS_PROXY="http://external-proxy:8080"), capture_output=True, timeout=10)
+            env=dict(os.environ, HTTP_PROXY=old, http_proxy=old, HTTPS_PROXY="http://external-proxy:8080", CARGO_HTTP_PROXY="http://external-proxy:8080"), capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr.decode())
 
     def test_previous_binary_installation_hook_migrates_in_place(self):
