@@ -1004,7 +1004,7 @@ pub(crate) mod tests {
         let flows = OauthFlows::default();
         fixture.login(&flows, forward.oauth_session.clone()).await;
         let app = crate::state::AppState::default();
-        app.add_container("guest").unwrap();
+        app.add_container("guest", None).unwrap();
         let state = crate::mcp::McpState::new(app, registry.clone());
         fixture.reject_once.store(true, Ordering::SeqCst);
         let reply = crate::mcp::handle_message(

@@ -72,7 +72,7 @@ async fn real_git_basic_retry_and_receive_discovery_use_escrow_without_enabling_
         .unwrap();
     settings.set_secret("github", "fixture-real-token").unwrap();
     let state = AppState::default();
-    state.add_container("guest").unwrap();
+    state.add_container("guest", None).unwrap();
     state
         .set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
         .unwrap();

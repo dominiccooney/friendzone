@@ -253,7 +253,59 @@ turnkey path uses the existing bootstrap listener to relay approved guest trace
 batches to loopback Jaeger, so it requires no Docker or additional guest
 firewall port.
 
+## Automated test guests
+
+Use the management REST API on the broker host (`http://127.0.0.1:8081` by
+default). It shares the UI's privileged, unauthenticated loopback listener;
+do not expose it to guests or untrusted callers. Remote orchestrators can run
+these calls on the host through SSH rather than opening the management port.
+
+| Operation | Request | Success |
+| --- | --- | --- |
+| Register and approve a guest | `POST /api/containers` with `{"name":"test-42","ip":"192.0.2.42"}` | `201 Created` |
+| Remove a guest | `DELETE /api/containers/test-42` | `204 No Content` |
+| Remove all guests | `POST /api/reset` (no body required) | `204 No Content` |
+| Inspect guests and audit history | `GET /api/state` | `200 OK` |
+
+Registration approves and pins the guest in one durable transaction, before
+it boots. `ip` accepts an IPv4 or IPv6 address; omitted or `null` leaves an
+existing pin unchanged (a new guest has no pin). Credential-free proxy use
+requires a unique explicit pin. Duplicate registration preserves the guest's
+other settings, including Kill; use a new name or remove it before reusing it.
+Names are trimmed and must be nonempty without `:` or `@`. Malformed input
+returns `400`/`422`; policy conflicts or save failures return `500` without
+applying any registration or reset. Removal and reset are safe to repeat.
+
+Reset removes approved, killed, and pending guests, their IP pins, Cline access
+settings, and comment permissions. It cancels waiting proxy/upload reviews and
+invalidates queued jobs before upstream admission; workers record cancellation
+on their next pass. Credentials, CA files, MCP configuration, and audit/job
+history remain intact. A reconnecting guest is unapproved again. Reset does not
+stop instances or retract requests already sent upstream.
+
+For trusted test workloads that need unrestricted GitHub access, start the
+broker with:
+
+```sh
+fz broker --allow-all-github
+```
+
+This disables human review for all GitHub requests through the proxy, including
+REST writes, GraphQL mutations, direct Git pushes, and LFS uploads. Broker-owned
+GraphQL jobs, validated Git bundle publication, and GitHub attachments also run
+without human approval. Their format, size, credential, and publication checks
+still apply. Guest approval, IP pins, Kill, destination restrictions, credential
+substitution/leak prevention, Cline access, and Linear review remain enforced.
+GitHub still enforces the credential's scopes and repository permissions.
+
+The mode is off by default, is not saved in the data directory, and changes only
+on broker restart. It grants approved guests the host credential's GitHub power;
+do not use it for untrusted agents. On headless hosts without a keyring, explicitly
+add `--secret-store=file` as described above.
+
 ## GitHub policy
+
+The following review rules apply without `--allow-all-github`.
 
 For operations that need human review or large GraphQL payloads, use the
 [async Cline plugin](ASYNC-GRAPHQL.md), installed by the guest setup script.

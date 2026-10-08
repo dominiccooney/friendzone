@@ -775,7 +775,7 @@ impl EventHandler {
             // requests. Do not bury the useful log under these rows.
             return req.into();
         }
-        let decision = crate::policy::classify(&req);
+        let decision = crate::policy::classify(&req, self.state.github_policy);
         let needs_review = decision == crate::policy::Decision::RequireReview;
         // The per-guest Cline gate is evaluated before anything is forwarded or
         // substituted; a denied request never carries a real credential anywhere.
@@ -1516,7 +1516,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("fz-otel-{}", uuid::Uuid::new_v4()));
         let state = AppState::default();
-        state.add_container("guest").unwrap();
+        state.add_container("guest", None).unwrap();
         state
             .set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
             .unwrap();
@@ -1820,7 +1820,7 @@ mod tests {
         assert!(!forwarded.headers().contains_key(PROXY_AUTHORIZATION));
         assert!(state.reviews.summaries().is_empty());
         for action in ["kill", "pin", "remove"] {
-            state.add_container("guest").unwrap();
+            state.add_container("guest", None).unwrap();
             state.set_killed("guest".into(), false).unwrap();
             state.set_pinned_ip("guest", None).unwrap();
             let changed = state.clone();
@@ -1836,7 +1836,7 @@ mod tests {
                         .unwrap(),
                     _ => {
                         changed.remove_container("guest").unwrap();
-                        changed.add_container("guest").unwrap();
+                        changed.add_container("guest", None).unwrap();
                     }
                 }
                 Ok::<_, std::io::Error>(query)
@@ -1855,7 +1855,7 @@ mod tests {
     async fn lfs_download_is_a_buffered_read_but_upload_and_policy_races_fail_closed() {
         let dir = std::env::temp_dir().join(format!("fz-lfs-gates-{}", uuid::Uuid::new_v4()));
         let state = AppState::default();
-        state.add_container("guest").unwrap();
+        state.add_container("guest", None).unwrap();
         let settings = crate::settings::Settings::load(&dir).unwrap();
         let peer: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let oid = "a".repeat(64);
@@ -1931,8 +1931,8 @@ mod tests {
         let state = AppState::default();
         let settings = crate::settings::Settings::load(&dir).unwrap();
         let peer: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        for action in ["kill", "pin", "remove", "cancel"] {
-            state.add_container("guest").unwrap();
+        for action in ["kill", "pin", "remove", "reset", "cancel"] {
+            state.add_container("guest", None).unwrap();
             state.set_killed("guest".into(), false).unwrap();
             state.set_pinned_ip("guest", None).unwrap();
             let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081, 8082);
@@ -1955,7 +1955,11 @@ mod tests {
                     .unwrap(),
                 "remove" => {
                     state.remove_container("guest").unwrap();
-                    state.add_container("guest").unwrap();
+                    state.add_container("guest", None).unwrap();
+                }
+                "reset" => {
+                    state.reset_containers().unwrap();
+                    state.add_container("guest", None).unwrap();
                 }
                 _ => {
                     task.abort();
@@ -1993,10 +1997,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allow_all_github_streams_writes_and_retains_identity_and_credential_gates() {
+        use http_body_util::BodyExt;
+        let dir = std::env::temp_dir().join(format!("fz-allow-all-{}", uuid::Uuid::new_v4()));
+        let state = AppState::default().with_github_policy(crate::policy::GithubPolicy::AllowAll);
+        let peer: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        state.add_container("guest", Some(peer.ip())).unwrap();
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        settings
+            .add_entry(crate::settings::EscrowEntry {
+                name: "github".into(),
+                hosts: vec!["github.com".into(), "api.github.com".into()],
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                fake: "fake-github".into(),
+                guest_env: None,
+                real_env: None,
+            })
+            .unwrap();
+        settings.set_secret("github", "host-secret").unwrap();
+        let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081, 8082);
+        for (method, url) in [
+            ("POST", "https://api.github.com/graphql"),
+            ("DELETE", "https://api.github.com/repos/x/y"),
+            ("POST", "https://github.com/x/y.git/git-receive-pack"),
+            ("POST", "https://github.com/x/y.git/info/lfs/objects/batch"),
+        ] {
+            let content = vec![255; crate::review::MAX_BODY + 1];
+            let mut req = request(method, url, Some("guest"));
+            req.headers_mut()
+                .insert("authorization", "Bearer fake-github".parse().unwrap());
+            req.headers_mut()
+                .insert("content-encoding", "gzip".parse().unwrap());
+            *req.body_mut() = Body::from(content.clone());
+            let RequestOrResponse::Request(forwarded) = handler.handle_from_peer(peer, req).await
+            else {
+                panic!("allow-all blocked {method} {url}");
+            };
+            assert_eq!(forwarded.headers()["authorization"], "Bearer host-secret");
+            assert!(!forwarded.headers().contains_key(PROXY_AUTHORIZATION));
+            assert_eq!(
+                forwarded
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .as_ref(),
+                content
+            );
+            assert!(state.reviews.summaries().is_empty());
+        }
+        for (method, url, user) in [
+            ("POST", "https://api.github.com/graphql", "unknown"),
+            ("POST", "https://api.linear.app/unsupported", "guest"),
+            ("POST", "https://api.cline.bot/api/v1/api-keys", "guest"),
+            ("GET", "https://example.test:8081/api/state", "guest"),
+        ] {
+            let mut req = request(method, url, Some(user));
+            if url.contains("api.linear.app") {
+                req.headers_mut()
+                    .insert("content-encoding", "gzip".parse().unwrap());
+            }
+            assert_eq!(
+                status(
+                    handler
+                        .handle_from_peer(peer, req)
+                        .await
+                ),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            status(handler.handle_from_peer(
+                "127.0.0.2:12345".parse().unwrap(),
+                request("POST", "https://api.github.com/graphql", Some("guest")),
+            ).await),
+            StatusCode::FORBIDDEN,
+        );
+        let mut leak = request("POST", "https://uploads.github.com/assets", Some("guest"));
+        leak.headers_mut()
+            .insert("authorization", "Bearer fake-github".parse().unwrap());
+        assert_eq!(
+            status(handler.handle_from_peer(peer, leak).await),
+            StatusCode::FORBIDDEN
+        );
+        settings.remove_secret("github").unwrap();
+        let mut missing = request("POST", "https://api.github.com/graphql", Some("guest"));
+        missing
+            .headers_mut()
+            .insert("authorization", "Bearer fake-github".parse().unwrap());
+        assert_eq!(
+            status(handler.handle_from_peer(peer, missing).await),
+            StatusCode::FORBIDDEN
+        );
+        state.set_killed("guest".into(), true).unwrap();
+        assert_eq!(
+            status(
+                handler
+                    .handle_from_peer(
+                        peer,
+                        request("POST", "https://api.github.com/graphql", Some("guest"))
+                    )
+                    .await
+            ),
+            StatusCode::FORBIDDEN
+        );
+        state.reset_containers().unwrap();
+        assert_eq!(
+            status(
+                handler
+                    .handle_from_peer(
+                        peer,
+                        request("POST", "https://api.github.com/graphql", Some("guest"))
+                    )
+                    .await
+            ),
+            StatusCode::FORBIDDEN
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn oversized_encoded_binary_and_escrow_denials_never_enter_inbox() {
         let dir = std::env::temp_dir().join(format!("fz-review-body-{}", uuid::Uuid::new_v4()));
         let state = AppState::default();
-        state.add_container("guest").unwrap();
+        state.add_container("guest", None).unwrap();
         let settings = crate::settings::Settings::load(&dir).unwrap();
         let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081, 8082);
         for (body, encoding) in [
@@ -2078,7 +2204,7 @@ mod tests {
     async fn infrastructure_denial_precedes_escrow_review_and_tunnel_setup() {
         let dir = std::env::temp_dir().join(format!("fz-infrastructure-{}", uuid::Uuid::new_v4()));
         let state = AppState::default();
-        state.add_container("guest").unwrap();
+        state.add_container("guest", None).unwrap();
         let settings = crate::settings::Settings::load(&dir).unwrap();
         let mut handler = EventHandler::new(state.clone(), settings, 8081, 9082);
         let peer = "10.0.0.2:12345".parse().unwrap();
@@ -2207,7 +2333,7 @@ mod tests {
     async fn loopback_guard_precedes_review_and_applies_inside_tunnels() {
         let dir = std::env::temp_dir().join(format!("fz-loopback-{}", uuid::Uuid::new_v4()));
         let state = AppState::default();
-        state.add_container("guest").unwrap();
+        state.add_container("guest", None).unwrap();
         let settings = crate::settings::Settings::load(&dir).unwrap();
         let mut handler = EventHandler::new(state.clone(), settings, 8081, 9082);
         let peer = "10.0.0.2:12345".parse().unwrap();
@@ -2311,7 +2437,7 @@ mod tests {
     async fn management_port_is_denied_before_http_forwarding_or_connect() {
         let dir = std::env::temp_dir().join(format!("fz-ui-gate-{}", uuid::Uuid::new_v4()));
         let state = AppState::default();
-        state.add_container("guest").unwrap();
+        state.add_container("guest", None).unwrap();
         let settings = crate::settings::Settings::load(&dir).unwrap();
         let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081, 8082);
         let peer = "10.0.0.2:12345".parse().unwrap();
@@ -2383,7 +2509,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fz-ui-isolation-{}", uuid::Uuid::new_v4()));
         let files = crate::ca::AuthorityFiles::load_or_create(&dir).unwrap();
         let state = AppState::default();
-        state.add_container("guest").unwrap();
+        state.add_container("guest", None).unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
         let observed = hits.clone();
         let ui_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2477,7 +2603,7 @@ mod tests {
     async fn cline_oauth_facade_flows_through_proxy_but_guest_refresh_is_denied() {
         let dir = std::env::temp_dir().join(format!("fz-proxy-cline-{}", uuid::Uuid::new_v4()));
         let state = AppState::default();
-        state.add_container("guest").unwrap();
+        state.add_container("guest", None).unwrap();
         state
             .set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
             .unwrap();
@@ -2563,7 +2689,7 @@ mod tests {
     ) {
         let dir = std::env::temp_dir().join(format!("fz-proxy-cline-{name}-{}", uuid::Uuid::new_v4()));
         let state = AppState::default();
-        state.add_container("guest").unwrap();
+        state.add_container("guest", None).unwrap();
         state
             .set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
             .unwrap();
@@ -2984,7 +3110,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fz-mitm-{}", uuid::Uuid::new_v4()));
         let files = crate::ca::AuthorityFiles::load_or_create(&dir).unwrap();
         let state = AppState::default();
-        state.add_container("guest").unwrap();
+        state.add_container("guest", None).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let proxy = Proxy::builder()

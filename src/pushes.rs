@@ -875,7 +875,14 @@ impl Pushes {
                                         );
                                     } else {
                                         current.review = Some(review);
-                                        current.set(Status::Pending, "Awaiting host approval");
+                                        if app.github_policy.allows_all() {
+                                            current.set(
+                                                Status::Approved,
+                                                "GitHub allow-all policy; queued for Git push",
+                                            );
+                                        } else {
+                                            current.set(Status::Pending, "Awaiting host approval");
+                                        }
                                     }
                                 }
                                 Err(error) => current
@@ -2518,6 +2525,15 @@ mod tests {
 
     #[tokio::test]
     async fn durable_job_reviews_approves_publishes_once_and_never_replays_after_restart() {
+        durable_publication(crate::policy::GithubPolicy::Review).await;
+    }
+
+    #[tokio::test]
+    async fn allow_all_validates_and_publishes_git_bundles_without_review() {
+        durable_publication(crate::policy::GithubPolicy::AllowAll).await;
+    }
+
+    async fn durable_publication(policy: crate::policy::GithubPolicy) {
         let (temp, remote, bundle, base, head) = publication_fixture();
         let data = temp.0.join("broker");
         std::fs::create_dir(&data).unwrap();
@@ -2534,7 +2550,7 @@ mod tests {
             })
             .unwrap();
         settings.set_secret("github", "fixture-real-token").unwrap();
-        let app = AppState::load(&data).unwrap();
+        let app = AppState::load(&data).unwrap().with_github_policy(policy);
         let peer: IpAddr = "127.0.0.1".parse().unwrap();
         assert_eq!(
             app.authorize("guest", peer),
@@ -2592,7 +2608,14 @@ mod tests {
             .await
             .unwrap();
         let reviewed = app.pushes.inspect(id).unwrap();
-        assert_eq!(reviewed.summary.status, Status::Pending);
+        assert_eq!(
+            reviewed.summary.status,
+            if policy.allows_all() {
+                Status::Approved
+            } else {
+                Status::Pending
+            }
+        );
         let review = reviewed.git_push.as_ref().unwrap();
         assert_eq!(review.base_oid, base);
         assert_eq!(review.head_oid, head);
@@ -2611,13 +2634,15 @@ mod tests {
                 .decide(id, "wrong-fingerprint", crate::review::Decision::Approve)
                 .is_err()
         );
-        app.pushes
-            .decide(
-                id,
-                &reviewed.summary.fingerprint,
-                crate::review::Decision::Approve,
-            )
-            .unwrap();
+        if !policy.allows_all() {
+            app.pushes
+                .decide(
+                    id,
+                    &reviewed.summary.fingerprint,
+                    crate::review::Decision::Approve,
+                )
+                .unwrap();
+        }
         app.pushes
             .tick_remote(&app, &settings, Some(&remote_text))
             .await

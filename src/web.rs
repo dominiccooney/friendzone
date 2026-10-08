@@ -151,6 +151,7 @@ fn ui_router(state: UiState) -> Router {
             axum::routing::delete(revoke_comment_permission),
         )
         .route("/api/containers", post(add_container))
+        .route("/api/reset", post(reset_containers))
         .route(
             "/api/containers/{id}",
             axum::routing::delete(remove_container),
@@ -1936,6 +1937,8 @@ where
 #[derive(Deserialize)]
 struct AddContainerRequest {
     name: String,
+    /// An optional explicit pin lets automation approve and pin in one commit.
+    ip: Option<std::net::IpAddr>,
 }
 
 /// Registers a human-readable policy label before the guest boots. An explicit
@@ -1952,7 +1955,14 @@ async fn add_container(
         )
             .into_response();
     }
-    container_policy_response(state.app.add_container(&name), StatusCode::CREATED)
+    container_policy_response(
+        state.app.add_container(&name, request.ip),
+        StatusCode::CREATED,
+    )
+}
+
+async fn reset_containers(State(state): State<UiState>) -> impl IntoResponse {
+    container_policy_response(state.app.reset_containers(), StatusCode::NO_CONTENT)
 }
 
 /// Unregisters a container. Log rows remain for audit; a reconnecting
@@ -2227,6 +2237,15 @@ mod tests {
 
     #[tokio::test]
     async fn file_uploads_review_exact_binary_bytes_then_return_urls_without_posting_content() {
+        file_uploads(crate::policy::GithubPolicy::Review).await;
+    }
+
+    #[tokio::test]
+    async fn allow_all_github_uploads_skip_review_but_linear_uploads_still_wait() {
+        file_uploads(crate::policy::GithubPolicy::AllowAll).await;
+    }
+
+    async fn file_uploads(policy: crate::policy::GithubPolicy) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
@@ -2290,8 +2309,8 @@ mod tests {
                 .unwrap();
             settings.set_secret(name, token).unwrap();
         }
-        let app = AppState::default();
-        app.add_container("guest").unwrap();
+        let app = AppState::default().with_github_policy(policy);
+        app.add_container("guest", None).unwrap();
         app.set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
             .unwrap();
         let registry =
@@ -2384,8 +2403,15 @@ mod tests {
                 bytes.clone(),
             );
             let task = tokio::spawn(bootstrap.clone().oneshot(request));
+            let auto_approve = policy.allows_all() && destination == "github";
             let summary = tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 loop {
+                    if auto_approve {
+                        let (_, recent) = app.reviews.view();
+                        if let Some(summary) = recent.first() {
+                            break summary.clone();
+                        }
+                    }
                     if let Some(summary) = app.reviews.summaries().first() {
                         break summary.clone();
                     }
@@ -2394,57 +2420,59 @@ mod tests {
             })
             .await
             .unwrap();
-            let detail = app.reviews.detail(summary.id).unwrap();
-            let upload = detail.file_upload.as_ref().unwrap();
-            assert_eq!(upload.content.as_ref().unwrap(), &bytes);
-            assert!(
-                !serde_json::to_string(&detail)
-                    .unwrap()
-                    .contains("fixture-secret")
-            );
-            assert_eq!(detail.summary.body_bytes, bytes.len());
-            assert!(
-                detail.body.len() < bytes.len(),
-                "review metadata contains digest rather than binary/base64"
-            );
-            assert!(
-                received.try_recv().is_err(),
-                "no upstream calls before approval"
-            );
-            let response = ui
-                .clone()
-                .oneshot(
-                    Request::get(format!("/api/requests/{}/file", summary.id))
-                        .header("host", "localhost:8081")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-            assert_eq!(
-                axum::body::to_bytes(response.into_body(), 100001)
+            if !auto_approve {
+                let detail = app.reviews.detail(summary.id).unwrap();
+                let upload = detail.file_upload.as_ref().unwrap();
+                assert_eq!(upload.content.as_ref().unwrap(), &bytes);
+                assert!(
+                    !serde_json::to_string(&detail)
+                        .unwrap()
+                        .contains("fixture-secret")
+                );
+                assert_eq!(detail.summary.body_bytes, bytes.len());
+                assert!(
+                    detail.body.len() < bytes.len(),
+                    "review metadata contains digest rather than binary/base64"
+                );
+                assert!(
+                    received.try_recv().is_err(),
+                    "no upstream calls before approval"
+                );
+                let response = ui
+                    .clone()
+                    .oneshot(
+                        Request::get(format!("/api/requests/{}/file", summary.id))
+                            .header("host", "localhost:8081")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
                     .await
-                    .unwrap(),
-                bytes
-            );
-            assert!(
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), 100001)
+                        .await
+                        .unwrap(),
+                    bytes
+                );
+                assert!(
+                    app.reviews
+                        .decide(
+                            summary.id,
+                            "wrong-fingerprint",
+                            crate::review::Decision::Approve
+                        )
+                        .is_err()
+                );
                 app.reviews
                     .decide(
                         summary.id,
-                        "wrong-fingerprint",
-                        crate::review::Decision::Approve
+                        &summary.fingerprint,
+                        crate::review::Decision::Approve,
                     )
-                    .is_err()
-            );
-            app.reviews
-                .decide(
-                    summary.id,
-                    &summary.fingerprint,
-                    crate::review::Decision::Approve,
-                )
-                .unwrap();
+                    .unwrap();
+            }
             let response = task.await.unwrap().unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             let value: serde_json::Value = serde_json::from_slice(
@@ -2534,6 +2562,11 @@ mod tests {
                 .is_none()
             );
         }
+        if policy.allows_all() {
+            assert!(app.reviews.summaries().is_empty());
+            receiver_task.abort();
+            return;
+        }
         let task = tokio::spawn(bootstrap.clone().oneshot(guest_request(
             "github",
             "127.0.0.1:1234",
@@ -2605,7 +2638,7 @@ mod tests {
 
         let settings = test_settings();
         let app = AppState::default();
-        app.add_container("guest").unwrap();
+        app.add_container("guest", None).unwrap();
         app.set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
             .unwrap();
         let registry =
@@ -2764,7 +2797,7 @@ mod tests {
         });
         let mut app = AppState::load(&dir).unwrap();
         app.github = crate::github::Client::for_test(&format!("http://{addr}/graphql"));
-        app.add_container("guest").unwrap();
+        app.add_container("guest", None).unwrap();
         let request = hudsucker::hyper::Request::builder()
             .method("POST")
             .uri(crate::github::ENDPOINT)
@@ -2935,8 +2968,8 @@ mod tests {
             .unwrap();
         settings.set_secret("github", "test-host-secret").unwrap();
         let app = AppState::load(&dir).unwrap();
-        app.add_container("guest").unwrap();
-        app.add_container("other").unwrap();
+        app.add_container("guest", None).unwrap();
+        app.add_container("other", None).unwrap();
         app.set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
             .unwrap();
         app.set_pinned_ip("other", Some("127.0.0.2".parse().unwrap()))
@@ -3108,7 +3141,7 @@ mod tests {
             .unwrap();
         settings.set_secret("github", "host-secret").unwrap();
         let state = AppState::default();
-        state.add_container("guest").unwrap();
+        state.add_container("guest", None).unwrap();
         let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
         let received = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -3522,8 +3555,8 @@ mod tests {
         });
         let mut state = AppState::load(&dir).unwrap();
         state.github = crate::github::Client::for_test(&format!("http://{upstream_addr}/graphql"));
-        state.add_container("guest").unwrap();
-        state.add_container("other").unwrap();
+        state.add_container("guest", None).unwrap();
+        state.add_container("other", None).unwrap();
         let registry = crate::mcp::ForwardRegistry::load(&dir, settings.clone()).unwrap();
         let ui_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ui_addr = ui_listener.local_addr().unwrap();
@@ -3798,7 +3831,7 @@ mod tests {
         settings.set_secret("github", "host-secret").unwrap();
         let registry = crate::mcp::ForwardRegistry::load(&dir, settings.clone()).unwrap();
         let state = AppState::default();
-        state.add_container("guest").unwrap();
+        state.add_container("guest", None).unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
         let observed = hits.clone();
         let payload = r#"{"query":"mutation Add($target: ID!, $text: String!) { harmless: addComment(input: {subjectId: $target, body: $text}) { clientMutationId } }","variables":{"target":"opaque-target","text":"<script>not HTML</script>"}}"#;
@@ -4034,7 +4067,7 @@ mod tests {
             )
             .unwrap();
         let app = AppState::default();
-        app.add_container("scratch-kali").unwrap();
+        app.add_container("scratch-kali", None).unwrap();
         app.set_pinned_ip("scratch-kali", Some("127.0.0.1".parse().unwrap()))
             .unwrap();
         let oauth = crate::mcp_oauth::OauthFlows::default();
@@ -4454,8 +4487,8 @@ mod tests {
         let app = AppState::default();
         app.authorize("scratch-kali", "10.0.0.2".parse().unwrap());
         app.set_killed("scratch-kali".into(), true).unwrap();
-        app.add_container("guest-ü").unwrap();
-        app.add_container("bad:name").unwrap();
+        app.add_container("guest-ü", None).unwrap();
+        app.add_container("bad:name", None).unwrap();
         let config: Vec<crate::mcp::ForwardConfig> = serde_json::from_value(serde_json::json!([
             {"name":"linear", "url":"https://upstream.invalid/mcp", "tools":["read"], "guests":[]},
             {"name":"github", "url":"https://other.invalid/mcp", "tools":[], "guests":null}
@@ -4582,7 +4615,7 @@ mod tests {
         let settings = test_settings();
         let dir = settings.data_dir().to_path_buf();
         let app = AppState::load(&dir).unwrap();
-        app.add_container("guest").unwrap();
+        app.add_container("guest", None).unwrap();
         let registry = crate::mcp::ForwardRegistry::load(&dir, settings.clone()).unwrap();
         let ui = ui_router(UiState {
             app: app.clone(),
@@ -4857,7 +4890,7 @@ mod tests {
         let registry =
             crate::mcp::ForwardRegistry::load(settings.data_dir(), settings.clone()).unwrap();
         let app = AppState::default();
-        app.add_container("guest").unwrap();
+        app.add_container("guest", None).unwrap();
         let state = BootstrapState {
             cert: Arc::new(String::new()),
             binary: Arc::new(vec![]),
@@ -5109,6 +5142,9 @@ mod tests {
     async fn bootstrap_does_not_expose_management_api() {
         for uri in [
             "/api/state",
+            "/api/containers",
+            "/api/containers/guest",
+            "/api/reset",
             "/api/requests/00000000-0000-0000-0000-000000000001/github-target",
             "/api/requests/00000000-0000-0000-0000-000000000001/comment-permission",
             "/api/containers/guest/comment-permissions/00000000-0000-0000-0000-000000000001",

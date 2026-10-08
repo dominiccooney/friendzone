@@ -5,6 +5,8 @@
 //! GraphQL queries and strict LFS `operation: download` envelopes flow
 //! automatically; mutations queue for one-shot review unless an explicitly
 //! saved comment permission admits a reconstructed addComment.
+//! Explicit allow-all mode streams GitHub operations without body inspection
+//! or review; identity, destination, and credential gates remain in the proxy.
 //! Unknown origins remain unpoliced while policy grows.
 
 use hudsucker::{Body, hyper::Request};
@@ -23,8 +25,24 @@ pub enum Decision {
     Unpoliced,
     /// Policed origin, read-class: flows.
     AllowRead,
+    /// GitHub review is explicitly disabled for this broker session.
+    AllowAll,
     /// Policed origin, potential write: explicit one-shot host review.
     RequireReview,
+}
+
+/// Fixed at broker startup and shared by every GitHub admission path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GithubPolicy {
+    #[default]
+    Review,
+    AllowAll,
+}
+
+impl GithubPolicy {
+    pub fn allows_all(self) -> bool {
+        self == Self::AllowAll
+    }
 }
 
 const GITHUB_HOSTS: &[&str] = &[
@@ -36,7 +54,7 @@ const GITHUB_HOSTS: &[&str] = &[
     "uploads.github.com",
 ];
 
-pub fn classify(req: &Request<Body>) -> Decision {
+pub fn classify(req: &Request<Body>, github_policy: GithubPolicy) -> Decision {
     // CONNECT admits interception, not an upstream operation. The proxy
     // still applies identity/approval/IP/kill gates before this, and this
     // classifier runs again on every decrypted request inside the tunnel.
@@ -60,6 +78,9 @@ pub fn classify(req: &Request<Body>) -> Decision {
         .any(|github| crate::settings::host_matches(host, github))
     {
         return Decision::Unpoliced;
+    }
+    if github_policy.allows_all() {
+        return Decision::AllowAll;
     }
     match github_access(req) {
         Access::Read => Decision::AllowRead,
@@ -231,6 +252,41 @@ fn github_access(req: &Request<Body>) -> Access {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn classify(req: &Request<Body>) -> Decision {
+        super::classify(req, GithubPolicy::Review)
+    }
+
+    #[test]
+    fn allow_all_covers_every_github_method_but_not_other_policy_hosts() {
+        for host in GITHUB_HOSTS.iter().copied().chain(["API.GITHUB.COM."]) {
+            for method in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
+                let request = req(method, &format!("https://{host}/arbitrary/path"));
+                assert_eq!(
+                    super::classify(&request, GithubPolicy::AllowAll),
+                    Decision::AllowAll
+                );
+            }
+        }
+        assert_eq!(
+            super::classify(
+                &req("POST", "https://api.linear.app/graphql"),
+                GithubPolicy::AllowAll
+            ),
+            Decision::RequireReview
+        );
+        assert_eq!(
+            super::classify(
+                &req("POST", "https://api.github.com.evil.test/graphql"),
+                GithubPolicy::AllowAll
+            ),
+            Decision::Unpoliced
+        );
+        assert_eq!(
+            super::classify(&req("CONNECT", "github.com:443"), GithubPolicy::AllowAll),
+            Decision::Unpoliced
+        );
+    }
 
     fn req(method: &str, uri: &str) -> Request<Body> {
         Request::builder()

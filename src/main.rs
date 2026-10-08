@@ -59,6 +59,9 @@ enum Command {
         /// OS credential store by default; file is explicit plaintext storage for headless hosts.
         #[arg(long, value_enum, default_value_t = secret_store::Mode::Os)]
         secret_store: secret_store::Mode,
+        /// Allow all GitHub operations without review. Only use for trusted test guests.
+        #[arg(long)]
+        allow_all_github: bool,
     },
     /// Check this guest's Friendzone network setup.
     Doctor {
@@ -105,6 +108,7 @@ async fn main() -> Result<()> {
             bootstrap_addr,
             data_dir,
             secret_store,
+            allow_all_github,
         } => {
             run_broker(
                 proxy_addr,
@@ -112,6 +116,11 @@ async fn main() -> Result<()> {
                 bootstrap_addr,
                 data_dir.unwrap_or_else(default_data_dir),
                 secret_store,
+                if allow_all_github {
+                    policy::GithubPolicy::AllowAll
+                } else {
+                    policy::GithubPolicy::Review
+                },
             )
             .await
         }
@@ -131,6 +140,7 @@ async fn run_broker(
     bootstrap_addr: SocketAddr,
     data_dir: PathBuf,
     secret_store: secret_store::Mode,
+    github_policy: policy::GithubPolicy,
 ) -> Result<()> {
     validate_listeners(proxy_addr, ui_addr, bootstrap_addr)?;
     let data_dir = if data_dir.is_absolute() {
@@ -146,7 +156,12 @@ async fn run_broker(
     let settings = settings::Settings::load_with_mode(&data_dir, secret_store)?;
     let files = AuthorityFiles::load_or_create(&data_dir)?;
     let issuer = files.issuer()?;
-    let state = AppState::load(&data_dir)?;
+    let state = AppState::load(&data_dir)?.with_github_policy(github_policy);
+    if github_policy.allows_all() {
+        tracing::warn!(
+            "GitHub allow-all policy enabled: approved guests can perform any GitHub operation without review"
+        );
+    }
     let registry = mcp::ForwardRegistry::load(&data_dir, settings.clone())?;
     let trace_relay = telemetry::TraceRelay::from_env()?;
     if trace_relay.is_some() {
@@ -239,6 +254,26 @@ fn validate_listeners(proxy: SocketAddr, ui: SocketAddr, bootstrap: SocketAddr) 
 #[cfg(test)]
 mod listener_tests {
     use super::*;
+
+    #[test]
+    fn github_allow_all_requires_explicit_startup_flag() {
+        assert!(matches!(
+            Cli::try_parse_from(["fz", "broker"]).unwrap().command,
+            Command::Broker {
+                allow_all_github: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["fz", "broker", "--allow-all-github"])
+                .unwrap()
+                .command,
+            Command::Broker {
+                allow_all_github: true,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn management_listener_cannot_be_exposed_or_share_guest_ports() {

@@ -717,7 +717,7 @@ mod tests {
             }])
             .unwrap();
         let app = AppState::default();
-        app.add_container("guest").unwrap();
+        app.add_container("guest", None).unwrap();
         let state = McpState::new(app, registry);
         let list = json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"});
         let response = handle_message(

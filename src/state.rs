@@ -211,6 +211,7 @@ impl StateData {
 pub struct AppState {
     data: Arc<RwLock<StateData>>,
     policy_path: Option<Arc<PathBuf>>,
+    pub github_policy: crate::policy::GithubPolicy,
     /// Bumped on every mutation; SSE subscribers wake on change and
     /// fetch a fresh view. watch coalesces bursts automatically.
     changes: tokio::sync::watch::Sender<u64>,
@@ -226,6 +227,7 @@ impl Default for AppState {
         Self {
             data: Arc::new(RwLock::new(StateData::default())),
             policy_path: None,
+            github_policy: crate::policy::GithubPolicy::default(),
             reviews: crate::review::Queue::new(changes.clone()),
             github: crate::github::Client::default(),
             jobs: crate::jobs::Jobs::new(changes.clone()),
@@ -236,6 +238,12 @@ impl Default for AppState {
 }
 
 impl AppState {
+    /// GitHub policy changes only on restart; all broker paths share this value.
+    pub fn with_github_policy(mut self, policy: crate::policy::GithubPolicy) -> Self {
+        self.github_policy = policy;
+        self
+    }
+
     /// Restore only durable host decisions. Unknown/malformed formats stop
     /// startup; request logs and traffic observations remain session-local.
     pub fn load(data_dir: &Path) -> Result<Self> {
@@ -296,6 +304,7 @@ impl AppState {
         Ok(Self {
             data: Arc::new(RwLock::new(data)),
             policy_path: Some(Arc::new(path)),
+            github_policy: crate::policy::GithubPolicy::default(),
             reviews: crate::review::Queue::new(changes.clone()),
             github: crate::github::Client::default(),
             jobs: crate::jobs::Jobs::load(data_dir, changes.clone())?,
@@ -447,20 +456,25 @@ impl AppState {
     /// Admission is the consistency boundary: policy changes before this
     /// check cancel the review. Already-admitted upstream work is not undone.
     pub fn admit_review(&self, id: Uuid, container: &str, peer: IpAddr, epoch: Uuid) -> bool {
-        let admitted = self.admit_request(
-            id,
-            container,
-            peer,
-            epoch,
-            "approved once by host; forwarding original request",
-        );
-        if admitted {
-            self.reviews.observe(
-                id,
-                crate::review::Status::Sending,
-                None,
+        let auto_approve = self
+            .reviews
+            .inspect(id)
+            .is_some_and(|detail| self.auto_approves_upload(&detail));
+        let (reason, outcome) = if auto_approve {
+            (
+                "GitHub allow-all policy; forwarding request",
+                "GitHub allow-all policy. Waiting for upstream response.",
+            )
+        } else {
+            (
+                "approved once by host; forwarding original request",
                 "Approved once. Waiting for upstream response.",
-            );
+            )
+        };
+        let admitted = self.admit_request(id, container, peer, epoch, reason);
+        if admitted {
+            self.reviews
+                .observe(id, crate::review::Status::Sending, None, outcome);
         }
         admitted
     }
@@ -737,7 +751,28 @@ impl AppState {
         {
             anyhow::bail!("container policy changed before review");
         }
-        self.reviews.enqueue(detail)
+        let auto_approve = self.auto_approves_upload(&detail);
+        let id = detail.summary.id;
+        let fingerprint = detail.summary.fingerprint.clone();
+        let ticket = self.reviews.enqueue(detail)?;
+        if auto_approve {
+            self.reviews
+                .decide(id, &fingerprint, crate::review::Decision::Approve)?;
+            self.reviews.observe(
+                id,
+                crate::review::Status::Approved,
+                None,
+                "GitHub allow-all policy; checking current guest policy before sending.",
+            );
+        }
+        Ok(ticket)
+    }
+
+    fn auto_approves_upload(&self, detail: &crate::review::Detail) -> bool {
+        self.github_policy.allows_all()
+            && detail.file_upload.as_ref().is_some_and(|upload| {
+                upload.submission.destination == crate::uploads::Destination::Github
+            })
     }
 
     /// Search the retained history before paginating, not just the live
@@ -897,15 +932,34 @@ impl AppState {
         Ok((name, verdict))
     }
 
-    /// Registers a pre-approved container from the UI (wildcard IP
-    /// until pinned).
-    pub fn add_container(&self, name: &str) -> Result<()> {
+    /// Approves and optionally pins a guest in one durable commit. An omitted
+    /// pin preserves an existing pin; a new guest remains wildcard.
+    pub fn add_container(&self, name: &str, ip: Option<IpAddr>) -> Result<()> {
         self.update_policy(|containers, _| {
+            Self::check_unique_pin(containers, name, ip)?;
             let record = containers.entry(name.to_owned()).or_default();
             record.approved = true;
             record.managed = true;
+            if ip.is_some() {
+                record.pinned_ip = ip;
+            }
             Ok(())
         })
+    }
+
+    fn check_unique_pin(
+        containers: &HashMap<String, ContainerRecord>,
+        name: &str,
+        ip: Option<IpAddr>,
+    ) -> Result<()> {
+        if let Some(ip) = ip
+            && let Some((other, _)) = containers
+                .iter()
+                .find(|(other, record)| other.as_str() != name && record.pinned_ip == Some(ip))
+        {
+            anyhow::bail!("source address {ip} is already pinned to guest {other}");
+        }
+        Ok(())
     }
 
     /// Approves a join request, optionally pinning it to the address it
@@ -923,13 +977,7 @@ impl AppState {
             } else {
                 None
             };
-            if let Some(pin) = pin
-                && let Some((other, _)) = containers
-                    .iter()
-                    .find(|(other, record)| other.as_str() != name && record.pinned_ip == Some(pin))
-            {
-                anyhow::bail!("source address {pin} is already pinned to guest {other}");
-            }
+            Self::check_unique_pin(containers, name, pin)?;
             let record = containers
                 .get_mut(name)
                 .context("unknown container; no approval changed")?;
@@ -945,13 +993,7 @@ impl AppState {
     /// Sets or clears (None = wildcard) a container's pinned IP.
     pub fn set_pinned_ip(&self, name: &str, ip: Option<IpAddr>) -> Result<()> {
         self.update_policy(|containers, _| {
-            if let Some(ip) = ip
-                && let Some((other, _)) = containers
-                    .iter()
-                    .find(|(other, record)| other.as_str() != name && record.pinned_ip == Some(ip))
-            {
-                anyhow::bail!("source address {ip} is already pinned to guest {other}");
-            }
+            Self::check_unique_pin(containers, name, ip)?;
             let record = containers
                 .get_mut(name)
                 .context("unknown container; no IP pin changed")?;
@@ -968,6 +1010,16 @@ impl AppState {
         self.update_policy(|containers, killed| {
             containers.remove(name);
             killed.remove(name);
+            Ok(())
+        })
+    }
+
+    /// Reset takes effect at the policy commit, invalidating every guest identity
+    /// and waiting review together. Already-admitted upstream work is not revoked.
+    pub fn reset_containers(&self) -> Result<()> {
+        self.update_policy(|containers, killed| {
+            containers.clear();
+            killed.clear();
             Ok(())
         })
     }
@@ -1169,7 +1221,7 @@ mod tests {
                 .is_err()
         );
         loaded.remove_container("guest").unwrap();
-        loaded.add_container("guest").unwrap();
+        loaded.add_container("guest", None).unwrap();
         assert!(
             AppState::load(&dir.0)
                 .unwrap()
@@ -1182,7 +1234,7 @@ mod tests {
     async fn restart_restores_guest_permission_but_never_pending_request_or_grant() {
         let dir = TestDir::new();
         let state = AppState::load(&dir.0).unwrap();
-        state.add_container("guest").unwrap();
+        state.add_container("guest", None).unwrap();
         let peer = "127.0.0.1".parse().unwrap();
         let epoch = state.review_epoch("guest", peer).unwrap();
         let detail = crate::review::Detail::from_request(
@@ -1236,7 +1288,7 @@ mod tests {
         state.authorize("guest", ip);
         state.approve_container("guest", true).unwrap();
         state.set_killed("guest".into(), true).unwrap();
-        state.add_container("preapproved").unwrap();
+        state.add_container("preapproved", None).unwrap();
         assert!(
             state
                 .view()
@@ -1296,7 +1348,8 @@ mod tests {
         assert!(state.set_cline_access("guest", ClineAccess::Full).is_err());
         assert_eq!(state.cline_access("guest"), ClineAccess::Basic);
         assert!(state.remove_container("guest").is_err());
-        assert!(state.add_container("new").is_err());
+        assert!(state.reset_containers().is_err());
+        assert!(state.add_container("new", None).is_err());
         assert!(state.approve_container("pending", false).is_err());
         assert_eq!(serde_json::to_value(state.view()).unwrap(), before);
         assert!(!changes.has_changed().unwrap());
@@ -1329,8 +1382,8 @@ mod tests {
         let dir = TestDir::new();
         let state = AppState::load(&dir.0).unwrap();
         assert_eq!(state.cline_access("never-seen"), ClineAccess::Basic);
-        state.add_container("guest").unwrap();
-        state.add_container("wide").unwrap();
+        state.add_container("guest", None).unwrap();
+        state.add_container("wide", None).unwrap();
         assert_eq!(state.cline_access("guest"), ClineAccess::Basic);
         assert_eq!(state.view().containers[0].cline_access, ClineAccess::Basic);
         assert!(
@@ -1380,7 +1433,7 @@ mod tests {
 
         // Removing and re-adding a name does not inherit its widened access.
         reloaded.remove_container("wide").unwrap();
-        reloaded.add_container("wide").unwrap();
+        reloaded.add_container("wide", None).unwrap();
         assert_eq!(reloaded.cline_access("wide"), ClineAccess::Basic);
     }
 
@@ -1388,7 +1441,7 @@ mod tests {
     fn guest_order_does_not_change_with_traffic() {
         let state = AppState::default();
         for name in ["zulu", "alpha", "middle"] {
-            state.add_container(name).unwrap();
+            state.add_container(name, None).unwrap();
         }
         let ids = || {
             state
@@ -1422,7 +1475,7 @@ mod tests {
     #[test]
     fn approvals_do_not_claim_work_or_synthesize_guest_traffic() {
         let state = AppState::default();
-        state.add_container("guest").unwrap();
+        state.add_container("guest", None).unwrap();
         assert_eq!(state.view().containers[0].state, "approved");
         assert!(state.view().containers[0].last_activity.is_none());
         assert!(
@@ -1506,7 +1559,7 @@ mod tests {
         state.set_pinned_ip("stranger", None).unwrap();
         assert_eq!(state.authorize("stranger", ip2), Authorization::Allowed);
         // UI-added containers are pre-approved with wildcard IP.
-        state.add_container("reviewer").unwrap();
+        state.add_container("reviewer", None).unwrap();
         assert_eq!(state.authorize("reviewer", ip2), Authorization::Allowed);
     }
 
@@ -1532,7 +1585,7 @@ mod tests {
         assert!(state.authorize_proxy_peer(ip1, Some("other")).is_err());
         assert!(state.authorize_proxy_peer(ip2, None).is_err());
 
-        state.add_container("wildcard").unwrap();
+        state.add_container("wildcard", None).unwrap();
         assert!(state.authorize_proxy_peer(ip2, None).is_err());
         assert!(state.set_pinned_ip("wildcard", Some(ip1)).is_err());
         state.authorize("second-pending", ip1);
@@ -1540,10 +1593,62 @@ mod tests {
     }
 
     #[test]
+    fn registration_and_reset_commit_all_guest_policy_together() {
+        let dir = TestDir::new();
+        let state = AppState::load(&dir.0).unwrap();
+        let peer: IpAddr = "10.0.0.5".parse().unwrap();
+        state.add_container("guest", Some(peer)).unwrap();
+        assert!(state.add_container("conflict", Some(peer)).is_err());
+        assert_eq!(state.view().containers.len(), 1);
+        state.add_container("guest", None).unwrap();
+        assert_eq!(
+            state.authorize("guest", "10.0.0.6".parse().unwrap()),
+            Authorization::IpMismatch
+        );
+        let identity = state.async_identity("guest", peer).unwrap();
+        let context = crate::github::CommentContext {
+            binding: crate::github::Binding {
+                entry: "github".into(),
+                digest: "a".repeat(64),
+            },
+            subject_id: "legacy".into(),
+            epoch: identity.1,
+            revision: state.comment_revision("guest").unwrap(),
+        };
+        state
+            .add_comment_permission("guest", &context, crate::github::tests::target())
+            .unwrap();
+        state.set_cline_access("guest", ClineAccess::Full).unwrap();
+        state.set_killed("guest".into(), true).unwrap();
+        state.authorize("pending", peer);
+        state.record(
+            "guest".into(),
+            "GET".into(),
+            "https://example.test".into(),
+            Verdict::Allowed,
+        );
+        let changes = state.subscribe();
+        let requests_before = serde_json::to_value(state.view().requests).unwrap();
+        state.reset_containers().unwrap();
+        assert!(changes.has_changed().unwrap());
+        let view = state.view();
+        assert!(view.containers.is_empty());
+        assert!(view.comment_permissions.is_empty());
+        assert_eq!(serde_json::to_value(view.requests).unwrap(), requests_before);
+        assert!(!state.is_killed("guest"));
+        assert_eq!(state.cline_access("guest"), ClineAccess::Basic);
+        assert!(AppState::load(&dir.0).unwrap().view().containers.is_empty());
+        state.reset_containers().unwrap();
+        state.add_container("guest", Some(peer)).unwrap();
+        assert_ne!(state.async_identity("guest", peer).unwrap(), identity);
+        assert!(!state.admit_review(Uuid::new_v4(), "guest", peer, identity.1));
+    }
+
+    #[test]
     fn containers_add_and_remove_dynamically() {
         let state = AppState::default();
         // Appear via explicit add and via traffic, independently.
-        state.add_container("reviewer").unwrap();
+        state.add_container("reviewer", None).unwrap();
         state.record(
             "triager".into(),
             "GET".into(),

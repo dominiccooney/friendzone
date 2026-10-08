@@ -106,7 +106,7 @@ mod tests {
                 })
                 .unwrap();
             settings.set_secret("github", "host-secret").unwrap();
-            app.add_container("guest").unwrap();
+            app.add_container("guest", None).unwrap();
             Self {
                 dir,
                 app,
@@ -274,7 +274,7 @@ mod tests {
             "response_received"
         );
         f.app.remove_container("guest").unwrap();
-        f.app.add_container("guest").unwrap();
+        f.app.add_container("guest", None).unwrap();
         assert!(
             f.app
                 .jobs
@@ -286,6 +286,75 @@ mod tests {
                 )
                 .is_err()
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn allow_all_mutations_execute_without_review_and_reset_invalidates_queued_work() {
+        let mut f = Fixture::new();
+        f.app = f
+            .app
+            .clone()
+            .with_github_policy(crate::policy::GithubPolicy::AllowAll);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/graphql", listener.local_addr().unwrap());
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/graphql",
+                    axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+                        assert_eq!(headers["authorization"], "Bearer host-secret");
+                        sent.send(body).unwrap();
+                        async { axum::Json(serde_json::json!({"data":{"id":"result"}})) }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let query =
+            "mutation { addComment(input:{subjectId:\"id\",body:\"test\"}) { clientMutationId } }";
+        let accepted = f.submit("mutation", query);
+        assert_eq!(accepted["status"], "approved");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        f.app
+            .jobs
+            .tick(&f.app, &f.settings, &client, &endpoint)
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&received.recv().await.unwrap()).unwrap();
+        assert_eq!(body["query"], query);
+        assert_eq!(
+            f.app
+                .jobs
+                .inspect(Fixture::id(&accepted))
+                .unwrap()
+                .summary
+                .status,
+            Status::ResponseReceived
+        );
+        let queued = f.submit("reset", query);
+        f.app.reset_containers().unwrap();
+        f.app.add_container("guest", None).unwrap();
+        f.app
+            .jobs
+            .tick(&f.app, &f.settings, &client, &endpoint)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.app
+                .jobs
+                .inspect(Fixture::id(&queued))
+                .unwrap()
+                .summary
+                .status,
+            Status::Cancelled
+        );
+        assert!(received.try_recv().is_err());
+        assert!(!AppState::load(&f.dir).unwrap().github_policy.allows_all());
         server.abort();
     }
 
@@ -1217,6 +1286,16 @@ impl Jobs {
             .body(hudsucker::Body::empty())?;
         let detail =
             Detail::from_request_with_limit(container, &request, body.as_bytes(), MAX_PAYLOAD)?;
+        let (status, outcome) = if detail.graphql_read {
+            (Status::Approved, "Read-only query queued")
+        } else if app.github_policy.allows_all() {
+            (
+                Status::Approved,
+                "GitHub allow-all policy; queued for execution",
+            )
+        } else {
+            (Status::Pending, "Awaiting host approval")
+        };
         let now = Utc::now();
         let job = Job {
             id: detail.summary.id,
@@ -1228,21 +1307,12 @@ impl Jobs {
             body,
             fingerprint: detail.summary.fingerprint,
             binding,
-            status: if detail.graphql_read {
-                Status::Approved
-            } else {
-                Status::Pending
-            },
+            status,
             created_at: now,
             updated_at: now,
             expires_at: now + chrono::Duration::hours(REVIEW_HOURS),
             http_status: None,
-            outcome: if detail.graphql_read {
-                "Read-only query queued"
-            } else {
-                "Awaiting host approval"
-            }
-            .into(),
+            outcome: outcome.into(),
             result: None,
             facts: detail.summary.facts,
             upstream: None,

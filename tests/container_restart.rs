@@ -27,6 +27,10 @@ struct Broker {
 }
 impl Broker {
     async fn start(dir: &TempDir) -> Self {
+        Self::start_with_args(dir, &[]).await
+    }
+
+    async fn start_with_args(dir: &TempDir, args: &[&str]) -> Self {
         let mut listeners = Vec::new();
         for _ in 0..3 {
             listeners.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
@@ -50,6 +54,7 @@ impl Broker {
                 "--data-dir",
             ])
             .arg(&dir.0)
+            .args(args)
             .kill_on_drop(true)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -150,6 +155,146 @@ impl Broker {
             .await
             .unwrap()
     }
+}
+
+#[tokio::test]
+async fn automated_guest_registration_removal_and_reset_are_durable_and_transactional() {
+    let dir = TempDir::new();
+    let broker = Broker::start_with_args(&dir, &["--allow-all-github"]).await;
+    broker.announce("pending").await;
+    let registered = broker
+        .post(
+            "/api/containers",
+            json!({"name":"test-run", "ip":"127.0.0.1"}),
+        )
+        .await;
+    assert_eq!(registered.status(), reqwest::StatusCode::CREATED);
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(&broker.proxy).unwrap())
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    assert_eq!(
+        client
+            .get(format!("{}/health", broker.bootstrap))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        broker
+            .post(
+                "/api/containers",
+                json!({"name":"conflict", "ip":"127.0.0.1"})
+            )
+            .await
+            .status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        broker
+            .post("/api/containers", json!({"name":"bad", "ip":"not-an-ip"}))
+            .await
+            .status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        broker
+            .post("/api/containers", json!({"name":"   "}))
+            .await
+            .status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let policy = dir.0.join("containers.json");
+    let saved = std::fs::read(&policy).unwrap();
+    std::fs::remove_file(&policy).unwrap();
+    std::fs::create_dir(&policy).unwrap();
+    assert_eq!(
+        broker.post("/api/reset", json!({})).await.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        broker.snapshot().await["containers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        broker
+            .post(
+                "/api/containers",
+                json!({"name":"not-committed", "ip":"192.0.2.1"})
+            )
+            .await
+            .status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        broker.snapshot().await["containers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    std::fs::remove_dir(&policy).unwrap();
+    std::fs::write(&policy, saved).unwrap();
+    assert_eq!(
+        broker
+            .client
+            .delete(format!("{}/api/containers/test-run", broker.ui))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        broker
+            .post(
+                "/api/containers",
+                json!({"name":"replacement", "ip":"127.0.0.1"})
+            )
+            .await
+            .status(),
+        reqwest::StatusCode::CREATED
+    );
+    assert_eq!(
+        broker.client.post(format!("{}/api/reset", broker.ui))
+            .send().await.unwrap().status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    let view = broker.snapshot().await;
+    assert!(view["containers"].as_array().unwrap().is_empty());
+    assert!(!view["requests"].as_array().unwrap().is_empty());
+    assert_eq!(
+        broker.post("/api/reset", json!({})).await.status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    broker.stop().await;
+    let broker = Broker::start(&dir).await;
+    assert!(
+        broker.snapshot().await["containers"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(&broker.proxy).unwrap())
+        .build()
+        .unwrap();
+    assert_eq!(
+        client
+            .get(format!("{}/health", broker.bootstrap))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED
+    );
+    broker.stop().await;
 }
 
 #[tokio::test]

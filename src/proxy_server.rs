@@ -411,7 +411,7 @@ mod tests {
         let connector = ProtocolRoutingConnector::new(cline_http1, automatic);
 
         let app = crate::state::AppState::default();
-        app.add_container("guest").unwrap();
+        app.add_container("guest", None).unwrap();
         app.set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
             .unwrap();
         // This test exercises transport routing, not the per-guest Cline API
@@ -603,7 +603,7 @@ mod tests {
             .wrap_connector(fixed);
 
         let app = crate::state::AppState::default();
-        app.add_container("guest").unwrap();
+        app.add_container("guest", None).unwrap();
         app.set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
             .unwrap();
         app.set_cline_access("guest", crate::state::ClineAccess::Full)
@@ -713,7 +713,7 @@ mod tests {
             .wrap_connector(fixed);
 
         let app = crate::state::AppState::default();
-        app.add_container("guest").unwrap();
+        app.add_container("guest", None).unwrap();
         app.set_pinned_ip("guest", Some("127.0.0.1".parse().unwrap()))
             .unwrap();
         app.set_cline_access("guest", crate::state::ClineAccess::Full)
