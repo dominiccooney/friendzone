@@ -109,9 +109,11 @@ network isolation guide for client compatibility and DNS limitations.
 
 Guest setup uses selective routing: Windows receives a live PAC URL and Git
 receives URL-scoped proxy settings from configured escrow hosts. Other hosts
-go direct. Setup does not install global HTTP_PROXY/HTTPS_PROXY; Cline CLI,
-curl, and other non-PAC clients need explicit proxy settings or the generated
-compatibility profile when using escrow. See [guest routing](GUEST-BOOTSTRAP.md#selective-routing).
+go direct outside the compatibility environment. Setup does not persist global
+HTTP_PROXY/HTTPS_PROXY values. Windows PowerShell profile hooks activate the
+generated compatibility environment for new shells; other non-PAC clients need
+explicit proxy settings or activation when using escrow.
+See [guest routing](GUEST-BOOTSTRAP.md#selective-routing).
 Direct networking is not governed by Friendzone's Kill or request policies.
 
 Containers are dynamic. Setup supplies a human-readable guest name, while
@@ -200,11 +202,19 @@ gets idempotent profile hooks plus a narrowly elevated native-root installation;
 Windows gets user-scoped environment values plus the current-user
 Windows Internet proxy used by many .NET clients (not machine-wide WinHTTP).
 It also installs the exact Friendzone CA into the guest user's Windows Trusted
-Root store (`CurrentUser\Root`), not the machine-wide store. Prior proxy settings
+Root store (`CurrentUser\Root`) unless that exact certificate is already trusted.
+For unattended LocalSystem provisioning, use the separate
+[`/bootstrap/windows-ca.ps1` certificate-only script](GUEST-BOOTSTRAP.md#unattended-windows-certificate-provisioning)
+to install machine-wide trust before normal user setup. Prior proxy settings
 and Friendzone-owned certificate bytes are recorded for ownership-aware rollback.
 Close guest Cline
 before running the script because it updates that application's settings, then
 restart Cline from the activated environment.
+
+Windows setup also adds managed all-hosts PowerShell profile hooks that load
+`%APPDATA%\friendzone\friendzone-proxy-env.ps1` for new Windows PowerShell and
+PowerShell 7 sessions. Use `-SkipPowerShellProfile` to keep PAC-only startup.
+Setup still prints the activation script path; execution policy is unchanged.
 
 The former setup subcommand is removed. Existing guest environment files and
 profile hooks are reused. See [GUEST-BOOTSTRAP.md](GUEST-BOOTSTRAP.md) for the
@@ -708,9 +718,9 @@ correctly block that direct WebSocket connection. Both need the guest's Cline
 API access set to Full; in Basic mode the cloud-session list is empty and the
 Hub upgrade is denied.
 
-Non-PAC Cline clients must be launched with the explicit compatibility profile
-described in the guest guide; normal direct-by-default activation is not enough
-to use their fake credentials.
+Non-PAC Cline clients need the compatibility environment described in the guest
+guide. Windows setup activates it in new profile-enabled PowerShell sessions;
+other launchers and `-NoProfile` sessions need explicit activation.
 
 The environment includes `FZ_HOST`, `FZ_BROKER`, and both `NO_PROXY`/`no_proxy`
 with the broker host, loopback addresses, and the GCE metadata/link-local
@@ -729,7 +739,8 @@ native roots or accept an explicit custom CA; the OS cannot replace roots
 embedded in a binary. Windows setup also makes Git's Schannel backend honor that
 PEM using the scoped `http.schannelUseSSLCAInfo=true` environment config; it does
 not disable TLS verification or edit user Git config files. It installs the CA
-in the current user's Trusted Root store, not the machine-wide store.
+in the current user's Trusted Root store unless already trusted. The separate
+machine certificate bootstrap supports unattended privileged provisioning.
 Cargo receives the same PEM through its native `CARGO_HTTP_CAINFO` setting. On
 Windows, Cargo revocation lookup is disabled because Friendzone's dynamic leaf
 certificates have no public CRL/OCSP responder; all other TLS verification stays

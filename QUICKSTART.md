@@ -343,8 +343,8 @@ firewall. Runtime CA variables are configured on both platforms. On
 Kali/Debian/Ubuntu, setup invokes `sudo` only to install the Friendzone root in
 the native system trust store and run `update-ca-certificates`; run the setup
 script itself as the guest user. On Windows it
-also installs the exact Friendzone CA in the guest user's Trusted Root store
-(`CurrentUser\Root`, not `LocalMachine\Root`) and makes Git's Schannel backend honor `GIT_SSL_CAINFO` without
+installs the exact Friendzone CA in the guest user's Trusted Root store unless
+it is already trusted, and makes Git's Schannel backend honor `GIT_SSL_CAINFO` without
 disabling certificate verification or changing Git configuration files, and
 sets Cargo's native `CARGO_HTTP_CAINFO` to the same managed CA bundle. Cargo's
 Windows-only revocation lookup is disabled because dynamically issued
@@ -357,6 +357,12 @@ WinHTTP configuration. Setup tracks roots it installed, rotates only those roots
 and removes only those exact roots during rollback. Restart applications that
 cache proxy or trust settings.
 
+For unattended Windows provisioning, run the certificate-only
+[`/bootstrap/windows-ca.ps1` script](GUEST-BOOTSTRAP.md#unattended-windows-certificate-provisioning)
+as LocalSystem or an already-elevated administrator, then run normal setup as
+the account that runs Cline. Normal setup reports and skips the preinstalled
+CA; it never claims or removes provisioning-managed machine trust.
+
 ## 4. Guest: activate and approve
 
 Linux prints an activation command; source it in the current terminal or open
@@ -366,15 +372,21 @@ BASH_ENV inherited from an activated parent. Plain sh and service launchers
 need explicit environment inheritance.
 
 Windows activates its PowerShell process, saves user environment variables, sets
-the current-user Windows PAC URL, and trusts the CA in `CurrentUser\Root`.
+the current-user Windows PAC URL, and trusts the CA unless already installed.
+It also adds a managed block to the current-user all-hosts Windows PowerShell
+and PowerShell 7 profiles to load `friendzone-proxy-env.ps1` in new shells.
+Use `& .\friendzone-setup.ps1 -SkipPowerShellProfile` to opt out or remove those
+blocks. Setup still prints the activation script's full path.
 Restart guest applications; sign out/in for other Windows launchers to acquire
 a fresh environment. Machine environment, WinHTTP, and execution policy are unchanged.
 
 Approve/pin the guest in the host Inbox, then restart guest Cline. The generated
 environment includes broker and loopback NO_PROXY entries, explicit FZ_PROXY
 and FZ_PAC_URL values, fake provider keys and runtime CA paths. Global proxy
-variables are not installed. **Cline CLI requires the generated compatibility
-profile to use escrow;** see [selective routing](GUEST-BOOTSTRAP.md#selective-routing).
+variables are not persisted globally. **Cline CLI requires the compatibility
+environment to use escrow;** new Windows profile-enabled shells activate it
+automatically, while `-NoProfile` sessions and other launchers need explicit
+activation. See [selective routing](GUEST-BOOTSTRAP.md#selective-routing).
 Git is configured per escrow host. Linux setup also installs the
 native root. A Rust binary compiled with WebPKI-only roots must still be rebuilt
 with native-root support; system configuration cannot alter roots embedded in a

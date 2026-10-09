@@ -153,7 +153,7 @@ pub fn script(
         "proxy_hosts":proxy_hosts,
         "infrastructure_no_proxy":crate::infrastructure::no_proxy(),
         "plugin":STANDARD.encode(include_bytes!("plugin/friendzone.js")),
-        "persistence":STANDARD.encode(include_bytes!("bootstrap/persist-environment.ps1"))});
+        "persistence":STANDARD.encode(powershell_persistence())});
     let encoded = STANDARD.encode(serde_json::to_vec(&payload)?);
     Ok(match shell {
         Shell::Sh => format!(
@@ -161,10 +161,10 @@ pub fn script(
             quote(&encoded),
             include_str!("bootstrap/configure.py").replace("\r\n", "\n")
         ),
-        Shell::Powershell => format!(
-            "\u{feff}# Configure this Windows guest; dot-sourcing only defines testable functions.\n$ErrorActionPreference='Stop'\n{}\n{}\nif ($MyInvocation.InvocationName -ne '.') {{\n    $data=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String({})) | ConvertFrom-Json\n    Start-FzGuestSetup $data\n}}\n",
+        Shell::Powershell => crlf(&format!(
+            "\u{feff}param([switch]$SkipPowerShellProfile)\n# Configure this Windows guest; dot-sourcing only defines testable functions.\n$ErrorActionPreference='Stop'\n{}\n{}\nif ($MyInvocation.InvocationName -ne '.') {{\n    $data=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String({})) | ConvertFrom-Json\n    Start-FzGuestSetup $data ([bool]$SkipPowerShellProfile)\n}}\n",
             // Do not execute the persistence helper's command-line entry point.
-            include_str!("bootstrap/persist-environment.ps1")
+            powershell_persistence()
                 .split("if ($MyInvocation.InvocationName -ne '.')")
                 .next()
                 .unwrap()
@@ -174,8 +174,34 @@ pub fn script(
                 .join("\n"),
             include_str!("bootstrap/setup.ps1"),
             ps_quote(&encoded)
-        ),
+        )),
     })
+}
+
+/// PowerShell artifacts use CRLF even when source files were saved with LF.
+fn crlf(source: &str) -> String {
+    source.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+fn powershell_persistence() -> String {
+    let source = include_str!("bootstrap/persist-environment.ps1");
+    let (parameters, implementation) = source.split_once('\n').unwrap();
+    crlf(&format!(
+        "{}\n{}\n{}\n{}",
+        parameters.trim_end_matches('\r'),
+        include_str!("bootstrap/certificate.ps1"),
+        include_str!("bootstrap/powershell-profile.ps1"),
+        implementation
+    ))
+}
+
+pub fn machine_certificate_script(ca: &str) -> String {
+    crlf(&format!(
+        "\u{feff}# Certificate-only machine provisioning; no user configuration.\n$ErrorActionPreference='Stop'\n{}\n{}\nif ($MyInvocation.InvocationName -ne '.') {{\n    $pem=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String({}))\n    Install-FzMachineCertificate $pem\n}}\n",
+        include_str!("bootstrap/certificate.ps1"),
+        include_str!("bootstrap/machine-certificate.ps1"),
+        ps_quote(&STANDARD.encode(ca.as_bytes()))
+    ))
 }
 
 pub fn commands(broker: &str, container: &str) -> Result<serde_json::Value> {
@@ -252,6 +278,10 @@ mod tests {
                 &settings,
             )
             .unwrap();
+            if powershell {
+                assert!(text.contains("\r\n"));
+                assert!(!text.replace("\r\n", "").contains(['\r', '\n']));
+            }
             assert!(!text.contains("bootstrap/fz"));
             assert!(!text.contains("fz setup"));
             assert!(!text.contains("guest'$(bad)"));
@@ -274,6 +304,12 @@ mod tests {
             };
             let payload: serde_json::Value =
                 serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+            let persistence = STANDARD
+                .decode(payload["persistence"].as_str().unwrap())
+                .unwrap();
+            let persistence = std::str::from_utf8(&persistence).unwrap();
+            assert!(persistence.contains("\r\n"));
+            assert!(!persistence.replace("\r\n", "").contains(['\r', '\n']));
             let plugin = STANDARD
                 .decode(payload["plugin"].as_str().unwrap())
                 .unwrap();
@@ -472,6 +508,14 @@ mod tests {
         )
         .unwrap();
         let command = dir.join("command.ps1");
+        let machine_script = dir.join("machine-ca.ps1");
+        std::fs::write(
+            &machine_script,
+            machine_certificate_script(&authority.cert_pem),
+        )
+        .unwrap();
+        let persistence = dir.join("persist-environment.ps1");
+        std::fs::write(&persistence, powershell_persistence()).unwrap();
         std::fs::write(
             &command,
             commands("http://host:9082", "guest").unwrap()["powershell"]
@@ -499,17 +543,35 @@ mod tests {
                         .join("tests/fixtures/test_user_environment.ps1")
                         .to_string_lossy()
                 ),
-                ps_quote(
-                    &root
-                        .join("src/bootstrap/persist-environment.ps1")
-                        .to_string_lossy()
-                ),
+                ps_quote(&persistence.to_string_lossy()),
                 ps_quote(&home.to_string_lossy()),
                 ps_quote(&script_path.to_string_lossy()),
                 ps_quote(&command.to_string_lossy()),
                 ps_quote(&rotated_path.to_string_lossy())
             );
-            let output = std::process::Command::new(executable)
+            let output = std::process::Command::new(&executable)
+                .args(["-NoProfile", "-NonInteractive", "-Command", &inline])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{runtime}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let inline = format!(
+                "& ([scriptblock]::Create([IO.File]::ReadAllText({}))) -BootstrapScript {} -MachineCertificateScript {} -TemporaryDirectory {}",
+                ps_quote(
+                    &root
+                        .join("tests/fixtures/test_windows_bootstrap.ps1")
+                        .to_string_lossy()
+                ),
+                ps_quote(&script_path.to_string_lossy()),
+                ps_quote(&machine_script.to_string_lossy()),
+                ps_quote(&home.join("machine-and-profile").to_string_lossy()),
+            );
+            std::fs::create_dir_all(home.join("machine-and-profile")).unwrap();
+            let output = std::process::Command::new(&executable)
                 .args(["-NoProfile", "-NonInteractive", "-Command", &inline])
                 .output()
                 .unwrap();

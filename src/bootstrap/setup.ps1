@@ -1,13 +1,12 @@
 # Function parameters keep test writes inside a temporary home. Tests replace
 # Get/Set-FzUserValue before calling this function; main is not run by tests.
-function Quote-FzPowerShell([string]$Value) {
-    "'" + [regex]::Replace($Value, "['\u2018\u2019\u201a\u201b]", '$0$0') + "'"
-}
 function Write-FzFile([string]$Path, [string]$Text) {
+    $powershell=$Path.EndsWith('.ps1',[StringComparison]::OrdinalIgnoreCase)
+    if($powershell){$Text=$Text.Replace("`r`n","`n").Replace("`n","`r`n")}
     [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path)) | Out-Null
     $temporary=$Path+'.'+[Guid]::NewGuid().ToString('N')+'.tmp'
     try {
-        [IO.File]::WriteAllText($temporary,$Text,(New-Object Text.UTF8Encoding($Path.EndsWith('.ps1'))))
+        [IO.File]::WriteAllText($temporary,$Text,(New-Object Text.UTF8Encoding($powershell)))
         if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temporary,$Path,[NullString]::Value) }
         else { [IO.File]::Move($temporary,$Path) }
     } finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
@@ -55,7 +54,7 @@ function Get-FzProviderJson([string]$Path, [string]$Fake) {
     if ($null -eq $root.lastUsedProvider) {Set-FzProperty $root lastUsedProvider 'cline'}
     ConvertTo-Json -InputObject $root -Depth 100
 }
-function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirectory, [string]$ClineDirectory) {
+function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirectory, [string]$ClineDirectory, [string[]]$ProfilePaths=@()) {
     $cert=Join-Path $ConfigDirectory 'friendzone-ca.pem'
     $gitConfig=Join-Path $ConfigDirectory 'friendzone.gitconfig'
     $gitConfigText=[string]$Data.git_credential_config
@@ -148,7 +147,7 @@ function Invoke-FzConfigure($Data, [string]$HomeDirectory, [string]$ConfigDirect
     if($providerJson){Write-FzFile $provider $providerJson}
     $valuesPath=$oldValuesPath
     Write-FzFile $valuesPath (ConvertTo-Json -InputObject $values)
-    Invoke-FzWindowsPersistence ([pscustomobject]$values) $backupPath $systemProxyBackupPath $cert $certificateTrustStatePath $false
+    Invoke-FzWindowsPersistence ([pscustomobject]$values) $backupPath $systemProxyBackupPath $cert $certificateTrustStatePath $false $ProfilePaths
     if($null-ne$retiredGithubToken){Remove-FzManagedUserValue 'GITHUB_TOKEN' $retiredGithubToken $backupPath}
     if($removeLegacyIdle){Remove-FzManagedUserValue 'CLINE_PLUGIN_IDLE_TIMEOUT_MS' '90000000' $backupPath}
     return $envFile
@@ -200,7 +199,7 @@ function Invoke-FzGuestRegistration($Data) {
         return $approval
     }catch{throw}
 }
-function Start-FzGuestSetup($Data) {
+function Start-FzGuestSetup($Data, [bool]$SkipPowerShellProfile=$false) {
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {throw 'Select the Linux script on non-Windows guests'}
     if (-not $Data.container) {$Data.container=[Environment]::MachineName}
     if (-not(Test-FzGuestName ([string]$Data.container))) {throw 'Invalid guest name'}
@@ -212,7 +211,8 @@ function Start-FzGuestSetup($Data) {
     }
     $config=Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'friendzone'
     Write-FzFile (Join-Path $config 'persist-environment.ps1') ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Data.persistence)))
-    $envFile=Invoke-FzConfigure $Data ([Environment]::GetFolderPath('UserProfile')) $config $env:CLINE_DIR
+    $profilePaths=if($SkipPowerShellProfile){@()}else{Get-FzPowerShellProfilePaths ([Environment]::GetFolderPath('MyDocuments'))}
+    $envFile=Invoke-FzConfigure $Data ([Environment]::GetFolderPath('UserProfile')) $config $env:CLINE_DIR $profilePaths
     . $envFile
     $registrationMessage=[string]$approval.message
     if([string]::IsNullOrWhiteSpace($registrationMessage)){$registrationMessage=if($approval.approved){'Approved and pinned.'}else{'Use Approve + pin IP in the host Inbox.'}}
@@ -220,5 +220,6 @@ function Start-FzGuestSetup($Data) {
     Write-Host 'Installed the Friendzone Cline plugin for async GraphQL, reviewed Git publication, and session updates.'
     Write-Host 'Trusted the Friendzone CA and configured selective current-user Windows PAC. Restart applications that cache proxy or TLS settings.'
     Write-Host ('Cline CLI and other non-PAC clients need the explicit compatibility profile when using escrow: . '+(Quote-FzPowerShell (Join-Path $config 'friendzone-proxy-env.ps1')))
-    Write-Host 'Sign out/in to refresh other Windows launchers. Normal setup does not set global HTTP_PROXY/HTTPS_PROXY.'
+    if(-not$SkipPowerShellProfile){Write-Host 'New Windows PowerShell and PowerShell 7 sessions load that proxy environment automatically through your current-user all-hosts profiles.'}
+    Write-Host 'Sign out/in to refresh other Windows launchers. Proxy variables are activated by the PowerShell hook, not installed as global User/Machine HTTP_PROXY/HTTPS_PROXY values.'
 }

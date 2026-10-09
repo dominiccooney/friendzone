@@ -809,6 +809,10 @@ fn bootstrap_router(state: BootstrapState) -> Router {
         .route("/bootstrap/hello", get(bootstrap_hello))
         .route("/bootstrap/env", get(bootstrap_env))
         .route("/bootstrap/setup", get(bootstrap_script))
+        .route(
+            "/bootstrap/windows-ca.ps1",
+            get(bootstrap_machine_certificate),
+        )
         .route("/bootstrap/proxy.pac", get(bootstrap_pac))
         .route(
             "/bootstrap/friendzone.js",
@@ -1417,6 +1421,20 @@ async fn bootstrap_script(
             .into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
+}
+
+async fn bootstrap_machine_certificate(State(state): State<BootstrapState>) -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=friendzone-machine-ca.ps1",
+            ),
+        ],
+        crate::bootstrap::machine_certificate_script(&state.cert),
+    )
 }
 
 #[derive(Deserialize)]
@@ -4979,6 +4997,43 @@ mod tests {
             response.headers()[header::CONTENT_DISPOSITION],
             "attachment; filename=fz-linux-x86_64"
         );
+    }
+
+    #[tokio::test]
+    async fn machine_certificate_bootstrap_contains_only_public_trust_and_never_registers_a_guest()
+    {
+        let response = bootstrap_app()
+            .oneshot(
+                Request::get("/bootstrap/windows-ca.ps1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("\r\n"));
+        assert!(!text.replace("\r\n", "").contains(['\r', '\n']));
+        assert!(text.contains("Install-FzMachineCertificate"));
+        assert!(text.contains("LocalMachine"));
+        assert!(text.contains(&STANDARD.encode("CERTIFICATE")));
+        for excluded in [
+            "Start-FzGuestSetup",
+            "bootstrap/hello",
+            "Set-FzUserValue",
+            "Invoke-FzSystemProxy",
+            "friendzone.js",
+            "HTTP_PROXY",
+        ] {
+            assert!(
+                !text.contains(excluded),
+                "machine bootstrap includes {excluded}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1,38 +1,7 @@
 param([string]$ValuesPath, [string]$BackupPath, [string]$SystemProxyBackupPath, [string]$CertificateTrustStatePath, [switch]$Restore)
 # Dot-source only defines functions. Tests replace environment, Internet Settings,
 # and certificate-store adapters; they never touch real HKCU or machine state.
-function Get-FzUserValue([string]$Name) { [Environment]::GetEnvironmentVariable($Name, 'User') }
-function Set-FzUserValue([string]$Name, $Value) { [Environment]::SetEnvironmentVariable($Name, $Value, 'User') }
-function Read-FzCertificateIdentity([string]$Path) {
-    $text=[IO.File]::ReadAllText($Path)
-    $match=[regex]::Match($text,'\A\s*-----BEGIN CERTIFICATE-----\s*(?<body>[A-Za-z0-9+/=\s]+?)\s*-----END CERTIFICATE-----\s*\z')
-    if(-not $match.Success){throw 'Friendzone CA file must contain exactly one PEM certificate'}
-    try{$der=[Convert]::FromBase64String(($match.Groups['body'].Value -replace '\s',''))}catch{throw 'Friendzone CA file contains invalid base64'}
-    $certificate=New-Object Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList (,$der)
-    try{
-        $basic=$certificate.Extensions|Where-Object{$_.Oid.Value -eq '2.5.29.19'}|Select-Object -First 1
-        if($null -eq $basic){throw 'Friendzone certificate is not a CA'}
-        $constraints=New-Object Security.Cryptography.X509Certificates.X509BasicConstraintsExtension -ArgumentList $basic,$basic.Critical
-        if(-not $constraints.CertificateAuthority){throw 'Friendzone certificate is not a CA'}
-        if([DateTime]::UtcNow -lt $certificate.NotBefore.ToUniversalTime() -or [DateTime]::UtcNow -gt $certificate.NotAfter.ToUniversalTime()){throw 'Friendzone CA is not currently valid'}
-        return @{thumbprint=$certificate.Thumbprint.ToUpperInvariant();der=[Convert]::ToBase64String($der)}
-    }finally{$certificate.Dispose()}
-}
-function Get-FzTrustedCertificate([string]$Thumbprint) {
-    $store=New-Object Security.Cryptography.X509Certificates.X509Store -ArgumentList 'Root','CurrentUser'
-    try{
-        $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
-        $matches=@($store.Certificates|Where-Object{$_.Thumbprint -ieq $Thumbprint})
-        if($matches.Count -gt 1){throw "Multiple current-user root certificates have thumbprint $Thumbprint"}
-        if($matches.Count -eq 0){return @{present=$false;der=$null}}
-        return @{present=$true;der=[Convert]::ToBase64String($matches[0].RawData)}
-    }finally{$store.Dispose()}
-}
-function Add-FzTrustedCertificate([string]$Der) {
-    $certificate=New-Object Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList (,[Convert]::FromBase64String($Der))
-    $store=New-Object Security.Cryptography.X509Certificates.X509Store -ArgumentList 'Root','CurrentUser'
-    try{$store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite);$store.Add($certificate)}finally{$store.Dispose();$certificate.Dispose()}
-}
+function Read-FzCertificateIdentity([string]$Path) { ConvertTo-FzCertificateIdentity ([IO.File]::ReadAllText($Path)) }
 function Remove-FzTrustedCertificate([string]$Thumbprint, [string]$ExpectedDer) {
     $store=New-Object Security.Cryptography.X509Certificates.X509Store -ArgumentList 'Root','CurrentUser'
     try{
@@ -44,6 +13,8 @@ function Remove-FzTrustedCertificate([string]$Thumbprint, [string]$ExpectedDer) 
         }
     }finally{$store.Dispose()}
 }
+function Get-FzUserValue([string]$Name) { [Environment]::GetEnvironmentVariable($Name, 'User') }
+function Set-FzUserValue([string]$Name, $Value) { [Environment]::SetEnvironmentVariable($Name, $Value, 'User') }
 function Get-FzInternetSetting([string]$Name) {
     $key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Internet Settings',$false)
     try {
@@ -178,6 +149,7 @@ function Invoke-FzCertificateTrust([string]$CertificatePath, [string]$StateFile,
     $identity=Read-FzCertificateIdentity $CertificatePath
     $current=Get-FzTrustedCertificate $identity.thumbprint
     if([bool]$current.present -and [string]$current.der -cne [string]$identity.der){throw 'Current-user root store contains a different certificate with the Friendzone CA thumbprint'}
+    if([bool]$current.present){Write-Host 'Friendzone CA is already installed; skipping root certificate installation.'}
     $alreadyOwned=@($owned|Where-Object{$_.thumbprint -ceq $identity.thumbprint -and $_.der -ceq $identity.der}).Count -eq 1
     $added=@();$removed=@()
     $stateBefore=@{exists=(Test-Path -LiteralPath $StateFile);base64=$null}
@@ -338,15 +310,25 @@ function Invoke-FzUserEnvironment($Values, [string]$BackupFile, [bool]$Undo) {
         throw
     }
 }
-function Invoke-FzWindowsPersistence($Values, [string]$EnvironmentBackupFile, [string]$SystemProxyBackupFile, [string]$CertificatePath, [string]$CertificateTrustStateFile, [bool]$Undo) {
+function Invoke-FzWindowsPersistence($Values, [string]$EnvironmentBackupFile, [string]$SystemProxyBackupFile, [string]$CertificatePath, [string]$CertificateTrustStateFile, [bool]$Undo, [string[]]$ProfilePaths=@()) {
+    # Setup and rollback serialize their trust/proxy/environment/profile writes
+    # across processes. A failed attempt keeps recovery ownership for retry.
+    $lockPath=Join-Path ([IO.Path]::GetDirectoryName($EnvironmentBackupFile)) 'windows-setup.lock'
+    try{$lock=[IO.File]::Open($lockPath,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch{throw "Windows setup is already running or its directory is not writable: $lockPath"}
+    try{
+    $profileStateFile=Join-Path ([IO.Path]::GetDirectoryName($EnvironmentBackupFile)) 'powershell-profile-state.json'
     if($Undo){
         $firstError=$null
-        try{Invoke-FzCertificateTrust $null $CertificateTrustStateFile $true}catch{$firstError=$_}
+        try{$null=Invoke-FzPowerShellProfiles @() $null $profileStateFile $true}catch{$firstError=$_}
+        try{Invoke-FzCertificateTrust $null $CertificateTrustStateFile $true}catch{if($null-eq$firstError){$firstError=$_}}
         try{Invoke-FzSystemProxy $null $SystemProxyBackupFile $true}catch{if($null -eq $firstError){$firstError=$_}}
         try{Invoke-FzUserEnvironment $null $EnvironmentBackupFile $true}catch{if($null -eq $firstError){$firstError=$_}}
         if($null -ne $firstError){throw $firstError}
         return
     }
+    $environmentScript=Join-Path ([IO.Path]::GetDirectoryName($EnvironmentBackupFile)) 'friendzone-proxy-env.ps1'
+    $profileTransaction=Invoke-FzPowerShellProfiles $ProfilePaths $environmentScript $profileStateFile $false
+    try{
     $certificateTransaction=Invoke-FzCertificateTrust $CertificatePath $CertificateTrustStateFile $false
     try{$systemTransaction=Invoke-FzSystemProxy ([string]$Values.FZ_PAC_URL) $SystemProxyBackupFile $false}catch{Undo-FzCertificateTrustTransaction $certificateTransaction;throw}
     try{Invoke-FzUserEnvironment $Values $EnvironmentBackupFile $false}catch{
@@ -356,6 +338,8 @@ function Invoke-FzWindowsPersistence($Values, [string]$EnvironmentBackupFile, [s
         if($null-ne$rollbackError){throw "Windows setup failed and rollback was incomplete: $($rollbackError.Exception.Message)"}
         throw $failure
     }
+    }catch{$failure=$_;Undo-FzProfileTransaction $profileTransaction;throw $failure}
+    }finally{$lock.Dispose()}
 }
 if ($MyInvocation.InvocationName -ne '.') {
     $ErrorActionPreference = 'Stop'

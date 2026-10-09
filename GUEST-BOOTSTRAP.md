@@ -23,6 +23,30 @@ redirect-following flag. Windows execution policy still applies; this feature
 does not weaken or bypass it. Use a trusted host/network: initial HTTP is
 trust-on-first-use, not an authenticated software distribution channel.
 
+### Unattended Windows certificate provisioning
+
+Run this separate certificate-only script as **LocalSystem or an already-elevated
+administrator inside the guest** before running normal user setup:
+
+```powershell
+curl.exe --noproxy "*" -fsS 'http://HOST_IP:8082/bootstrap/windows-ca.ps1' -o friendzone-machine-ca.ps1
+if ($LASTEXITCODE -ne 0) { throw 'Certificate bootstrap download failed' }
+& .\friendzone-machine-ca.ps1
+```
+
+It validates the embedded public CA, installs it into `LocalMachine\Root`, and
+verifies the exact installed bytes. It does not request elevation, register a
+guest, or change environment variables, proxy settings, profiles, or Cline files.
+Machine-wide trust applies to all accounts in this guest. Use a trusted delivery
+channel and inspect the certificate/script before granting that trust.
+
+Then run normal setup as the account that runs Cline. If the exact CA is already
+trusted, setup prints that it is already installed and skips insertion without
+claiming it. User rollback never removes a root preinstalled by provisioning.
+Machine roots are provisioning-managed: this certificate-only script does not
+remove old roots on CA rotation or provide uninstall. Remove obsolete machine
+roots explicitly during trusted provisioning, or discard the disposable VM.
+
 ## What changes
 
 Setup also installs the [Friendzone Cline plugin](ASYNC-GRAPHQL.md) for async
@@ -58,8 +82,11 @@ Real credentials and OAuth refresh tokens never enter the script.
 
 ### Selective routing
 
-Setup is direct by default: it does not install global `HTTP_PROXY` or
-`HTTPS_PROXY`. Windows Internet Settings uses the live PAC URL
+Setup does not persist global `HTTP_PROXY` or `HTTPS_PROXY` values. Windows
+setup adds a PowerShell startup hook that activates those variables for new
+PowerShell sessions and their children; use `-SkipPowerShellProfile` to opt out.
+Outside that compatibility environment, routing is direct by default.
+Windows Internet Settings uses the live PAC URL
 `$FZ_BROKER/bootstrap/proxy.pac`; configure that URL manually in PAC-capable
 Linux applications. The PAC selects Friendzone only for exact hosts pinned
 by configured escrow entries, even when their credentials are disconnected.
@@ -92,8 +119,9 @@ This profile sets ordinary proxy variables and `CARGO_HTTP_PROXY` for that proce
 and its children; it is not selective. Cargo's native proxy setting takes precedence
 over Cargo/Git config-file proxy settings, keeping its routing consistent with the managed CA.
 It does not persist a global Cargo proxy. On Linux, source `activate.sh` to reset
-the inherited bash hook; on Windows, source `friendzone-env.ps1`, or start a fresh terminal on
-either platform to leave it. Setup removes old Friendzone-owned global proxy values
+the inherited bash hook; on Windows, source `friendzone-env.ps1` to leave it in
+the current session. A new profile-enabled PowerShell activates it again; use
+`-SkipPowerShellProfile` on setup to remove the startup hook. Setup removes old Friendzone-owned global proxy values
 but preserves unrelated user settings. Existing network-isolated deployments
 must keep using explicit proxy configuration for clients that cannot connect
 directly. No guest routing daemon or machine-wide network policy is installed.
@@ -148,8 +176,8 @@ or the Windows **LocalMachine** CA store. On Kali/Debian/Ubuntu, Linux setup use
 rotates only a Friendzone-owned root, refuses to overwrite external content, and
 rolls back a failed trust refresh. This covers native-root TLS clients; programs
 compiled with a private WebPKI-only root set must enable native roots or accept an
-explicit CA bundle. On Windows it installs the exact
-Friendzone CA into the guest user's Trusted Root Certification Authorities store
+explicit CA bundle. On Windows, unless the exact CA is already trusted, normal
+setup installs it into the guest user's Trusted Root Certification Authorities store
 (`CurrentUser\Root`), so same-user .NET/Schannel applications trust intercepted
 HTTPS without disabling verification. Runtime CA variables remain configured for
 clients that use explicit PEM bundles. Setup also supplies
@@ -284,15 +312,36 @@ settings. Original PAC and static settings are restored by ownership-aware
 rollback. Its children inherit the new environment;
 existing applications do not. Sign out
 and back in for GUI launchers, and restart guest agents/hubs and existing
-`HttpClient` owners. PowerShell
-profiles are not required, so non-interactive and `-NoProfile` processes still
-inherit values from a fresh launcher.
+`HttpClient` owners. User environment values do not require a PowerShell profile.
+The HTTP/Cargo proxy environment is separate: normal setup adds one managed
+block to each current-user all-hosts `profile.ps1` under the Windows
+`Documents\WindowsPowerShell` and `Documents\PowerShell` folders, respecting
+Windows' redirected Documents location. The block loads the current
+`%APPDATA%\friendzone\friendzone-proxy-env.ps1`; other profile content and
+encoding are preserved. Reruns replace only the exact owned block.
+UTF-8 profiles receive a BOM when rewritten so Windows PowerShell 5.1 reads
+Unicode paths correctly; existing UTF-16 or legacy code-page profiles retain
+their encoding.
+
+To keep PAC-only startup and remove Friendzone's profile blocks, run:
+
+```powershell
+& .\friendzone-setup.ps1 -SkipPowerShellProfile
+```
+
+New profile-enabled shells activate `HTTP_PROXY`, `HTTPS_PROXY`, and
+`CARGO_HTTP_PROXY`, and child processes inherit them. `-NoProfile` and remote
+sessions do not run the hook; activate the printed script path explicitly when
+needed. Execution policy remains unchanged. This is process-scoped proxy routing,
+not a global User/Machine proxy environment change.
 
 Before writes, `user-environment-backup.json`, `system-proxy-backup.json`, and
 `certificate-trust-state.json` record original/applied settings and exact
 Friendzone-owned certificate bytes. Reruns retain originals, skip unchanged
 writes, and rotate only a root previously installed by Friendzone. A matching
-root that predated setup is used but never claimed. Environment, proxy, and CA
+root that predated setup is used but never claimed. `powershell-profile-state.json`
+records each owned profile block before writes. Edited or malformed managed
+blocks are preserved and reported instead of overwritten. Environment, proxy, profile, and CA
 updates form one transaction. To undo in the guest:
 
 ```powershell
@@ -303,11 +352,13 @@ updates form one transaction. To undo in the guest:
 Rollback removes only the exact current-user root recorded as installed by
 Friendzone and restores environment/proxy values that still equal Friendzone's
 applied values. Pre-existing roots and externally changed values are preserved.
+It removes only the exact owned PowerShell profile blocks, preserving other edits.
 Start a fresh session/restart applications afterward;
 already-inherited environment values and cached proxy decisions do not disappear.
 
-The trust change is current-user only and requires no elevation. It is not a
-machine-wide `LocalMachine\Root` installation. Applications may cache trust and
+Normal setup's trust change is current-user only and requires no elevation,
+but Windows can show a root-trust confirmation dialog. Machine-only provisioning
+avoids that dialog and is separate from user setup. Applications may cache trust and
 proxy state, so restart them after setup or rollback.
 
 ## First Windows guest acceptance
@@ -378,6 +429,8 @@ validated and encoded as data, never interpolated into code. An explicit
 `broker=` origin is supported for alternate routing. Forwarded headers are not
 trusted. Scripts are no-store and only contain the public configuration snapshot.
 Management routes remain unavailable on this listener.
+`GET /bootstrap/windows-ca.ps1` serves the public certificate-only Windows machine
+bootstrap without guest registration or fake credentials.
 
 ## Validation boundary
 
