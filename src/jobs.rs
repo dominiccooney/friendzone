@@ -336,24 +336,31 @@ mod tests {
                 .status,
             Status::ResponseReceived
         );
-        let queued = f.submit("reset", query);
-        f.app.reset_containers().unwrap();
-        f.app.add_container("guest", None).unwrap();
-        f.app
-            .jobs
-            .tick(&f.app, &f.settings, &client, &endpoint)
-            .await
-            .unwrap();
-        assert_eq!(
+        for transition in ["handoff", "reset"] {
+            f.app.add_container("guest", Some(f.peer)).unwrap();
+            let queued = f.submit(transition, query);
+            if transition == "handoff" {
+                f.app.add_container("replacement", Some(f.peer)).unwrap();
+            } else {
+                f.app.reset_containers().unwrap();
+            }
+            f.app.add_container("guest", None).unwrap();
             f.app
                 .jobs
-                .inspect(Fixture::id(&queued))
-                .unwrap()
-                .summary
-                .status,
-            Status::Cancelled
-        );
-        assert!(received.try_recv().is_err());
+                .tick(&f.app, &f.settings, &client, &endpoint)
+                .await
+                .unwrap();
+            assert_eq!(
+                f.app
+                    .jobs
+                    .inspect(Fixture::id(&queued))
+                    .unwrap()
+                    .summary
+                    .status,
+                Status::Cancelled
+            );
+            assert!(received.try_recv().is_err());
+        }
         assert!(!AppState::load(&f.dir).unwrap().github_policy.allows_all());
         server.abort();
     }

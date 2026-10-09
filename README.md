@@ -272,6 +272,20 @@ it boots. `ip` accepts an IPv4 or IPv6 address; omitted or `null` leaves an
 existing pin unchanged (a new guest has no pin). Credential-free proxy use
 requires a unique explicit pin. Duplicate registration preserves the guest's
 other settings, including Kill; use a new name or remove it before reusing it.
+Registering a different name with an already-pinned IP transfers the address:
+the previous owner loses its pin and approval in the same durable commit.
+Its waiting reviews and queued work are invalidated; its record and audit
+history remain until you remove it. Clearing a pin manually still means
+"any address" and does not revoke approval. Manual pin/approval actions reject
+IP conflicts rather than transferring ownership.
+
+Terminate the old instance before reusing its IP. Friendzone identifies fresh
+credential-free connections by source IP and cannot distinguish two live
+instances sharing it. Existing tunnels keep their original guest identity and
+are denied after a handoff; already-admitted upstream work is not revoked.
+Use distinct guest names so late removal of an old registration cannot remove
+its replacement.
+
 Names are trimmed and must be nonempty without `:` or `@`. Malformed input
 returns `400`/`422`; policy conflicts or save failures return `500` without
 applying any registration or reset. Removal and reset are safe to repeat.

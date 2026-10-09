@@ -1997,6 +1997,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ip_handoff_cancels_waiting_reviews_and_cannot_relabel_existing_tunnels() {
+        let dir = std::env::temp_dir().join(format!("fz-ip-handoff-{}", uuid::Uuid::new_v4()));
+        let state = AppState::default();
+        let settings = crate::settings::Settings::load(&dir).unwrap();
+        let peer: std::net::SocketAddr = "10.0.0.5:12345".parse().unwrap();
+        state.add_container("old", Some(peer.ip())).unwrap();
+        let mut tunnels = Vec::new();
+        for presented in [None, Some("old")] {
+            let mut handler = EventHandler::new(state.clone(), settings.clone(), 8081, 8082);
+            assert!(matches!(
+                handler
+                    .handle_from_peer(peer, request("CONNECT", "api.github.com:443", presented))
+                    .await,
+                RequestOrResponse::Request(_)
+            ));
+            tunnels.push(handler);
+        }
+        let mut handler = tunnels[0].clone();
+        let waiting = tokio::spawn(async move {
+            handler
+                .handle_from_peer(
+                    peer,
+                    request("POST", "https://api.github.com/graphql", None),
+                )
+                .await
+        });
+        let summary = wait_for_review(&state).await;
+        state.add_container("new", Some(peer.ip())).unwrap();
+        assert_eq!(status(waiting.await.unwrap()), StatusCode::FORBIDDEN);
+        assert_eq!(
+            state.reviews.inspect(summary.id).unwrap().summary.status,
+            crate::review::Status::Cancelled
+        );
+        for mut tunnel in tunnels {
+            assert_eq!(
+                status(
+                    tunnel
+                        .handle_from_peer(peer, request("GET", "https://api.github.com/user", None))
+                        .await
+                ),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let mut fresh = EventHandler::new(state.clone(), settings, 8081, 8082);
+        assert!(matches!(
+            fresh
+                .handle_from_peer(peer, request("GET", "https://api.github.com/user", None))
+                .await,
+            RequestOrResponse::Request(_)
+        ));
+        assert_eq!(state.view().requests[0].container, "new");
+        assert_eq!(
+            status(
+                fresh
+                    .handle_from_peer(
+                        "10.0.0.6:12345".parse().unwrap(),
+                        request("GET", "https://api.github.com/user", Some("old"))
+                    )
+                    .await
+            ),
+            StatusCode::FORBIDDEN
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn allow_all_github_streams_writes_and_retains_identity_and_credential_gates() {
         use http_body_util::BodyExt;
         let dir = std::env::temp_dir().join(format!("fz-allow-all-{}", uuid::Uuid::new_v4()));

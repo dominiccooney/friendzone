@@ -185,10 +185,7 @@ async fn automated_guest_registration_removal_and_reset_are_durable_and_transact
     );
     assert_eq!(
         broker
-            .post(
-                "/api/containers",
-                json!({"name":"conflict", "ip":"127.0.0.1"})
-            )
+            .post("/api/containers/pending/pin", json!({"ip":"127.0.0.1"}))
             .await
             .status(),
         reqwest::StatusCode::INTERNAL_SERVER_ERROR
@@ -293,6 +290,113 @@ async fn automated_guest_registration_removal_and_reset_are_durable_and_transact
             .unwrap()
             .status(),
         reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED
+    );
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn registration_reuses_an_ip_atomically_and_late_cleanup_does_not_remove_its_new_owner() {
+    let dir = TempDir::new();
+    let broker = Broker::start(&dir).await;
+    assert_eq!(
+        broker
+            .post("/api/containers", json!({"name":"old", "ip":"127.0.0.1"}))
+            .await
+            .status(),
+        reqwest::StatusCode::CREATED
+    );
+    assert_eq!(
+        broker.proxy_request("old").await.status(),
+        reqwest::StatusCode::OK
+    );
+    let policy = dir.0.join("containers.json");
+    let saved = std::fs::read(&policy).unwrap();
+    std::fs::remove_file(&policy).unwrap();
+    std::fs::create_dir(&policy).unwrap();
+    assert_eq!(
+        broker
+            .post("/api/containers", json!({"name":"new", "ip":"127.0.0.1"}))
+            .await
+            .status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        broker.snapshot().await["containers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        broker.proxy_request("old").await.status(),
+        reqwest::StatusCode::OK
+    );
+    std::fs::remove_dir(&policy).unwrap();
+    std::fs::write(&policy, saved).unwrap();
+
+    assert_eq!(
+        broker
+            .post("/api/containers", json!({"name":"new", "ip":"127.0.0.1"}))
+            .await
+            .status(),
+        reqwest::StatusCode::CREATED
+    );
+    let view = broker.snapshot().await;
+    let old = view["containers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|guest| guest["id"] == "old")
+        .unwrap();
+    assert_eq!(old["approved"], false);
+    assert!(old["pinned_ip"].is_null());
+    assert_eq!(
+        broker.proxy_request("old").await.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        broker.proxy_request("new").await.status(),
+        reqwest::StatusCode::OK
+    );
+    broker.stop().await;
+
+    let broker = Broker::start(&dir).await;
+    assert_eq!(
+        broker.proxy_request("old").await.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        broker.proxy_request("new").await.status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        broker
+            .client
+            .delete(format!("{}/api/containers/old", broker.ui))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        broker.proxy_request("new").await.status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        broker
+            .post("/api/containers", json!({"name":"third", "ip":"127.0.0.1"}))
+            .await
+            .status(),
+        reqwest::StatusCode::CREATED
+    );
+    assert_eq!(
+        broker.proxy_request("new").await.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        broker.proxy_request("third").await.status(),
+        reqwest::StatusCode::OK
     );
     broker.stop().await;
 }

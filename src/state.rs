@@ -932,11 +932,23 @@ impl AppState {
         Ok((name, verdict))
     }
 
-    /// Approves and optionally pins a guest in one durable commit. An omitted
-    /// pin preserves an existing pin; a new guest remains wildcard.
+    /// Registration transfers an explicit IP and revokes its previous owner's
+    /// approval at the same policy commit. An omitted pin preserves an existing
+    /// pin; a new guest remains wildcard.
     pub fn add_container(&self, name: &str, ip: Option<IpAddr>) -> Result<()> {
         self.update_policy(|containers, _| {
-            Self::check_unique_pin(containers, name, ip)?;
+            if let Some(ip) = ip {
+                for (other, record) in containers.iter_mut() {
+                    if other != name && record.pinned_ip == Some(ip) {
+                        // No pin means wildcard, so relinquishing the address
+                        // must also revoke approval rather than widen access.
+                        record.pinned_ip = None;
+                        record.last_ip = None;
+                        record.approved = false;
+                        record.managed = true;
+                    }
+                }
+            }
             let record = containers.entry(name.to_owned()).or_default();
             record.approved = true;
             record.managed = true;
@@ -1598,7 +1610,7 @@ mod tests {
         let state = AppState::load(&dir.0).unwrap();
         let peer: IpAddr = "10.0.0.5".parse().unwrap();
         state.add_container("guest", Some(peer)).unwrap();
-        assert!(state.add_container("conflict", Some(peer)).is_err());
+        assert!(state.set_pinned_ip("conflict", Some(peer)).is_err());
         assert_eq!(state.view().containers.len(), 1);
         state.add_container("guest", None).unwrap();
         assert_eq!(
@@ -1642,6 +1654,95 @@ mod tests {
         state.add_container("guest", Some(peer)).unwrap();
         assert_ne!(state.async_identity("guest", peer).unwrap(), identity);
         assert!(!state.admit_review(Uuid::new_v4(), "guest", peer, identity.1));
+    }
+
+    #[test]
+    fn registration_transfers_ip_without_granting_the_old_guest_wildcard_access() {
+        for address in ["10.0.0.5", "2001:db8::5"] {
+            let dir = TestDir::new();
+            let state = AppState::load(&dir.0).unwrap();
+            let ip: IpAddr = address.parse().unwrap();
+            state.add_container("old", Some(ip)).unwrap();
+            state.authorize("old", ip);
+            let old_identity = state.async_identity("old", ip).unwrap();
+            state.set_cline_access("old", ClineAccess::Full).unwrap();
+            state.record(
+                "old".into(),
+                "GET".into(),
+                "https://example.test/".into(),
+                Verdict::Allowed,
+            );
+
+            state.add_container("new", Some(ip)).unwrap();
+            let view = state.view();
+            let old = view
+                .containers
+                .iter()
+                .find(|guest| guest.id == "old")
+                .unwrap();
+            assert!(!old.approved);
+            assert!(old.pinned_ip.is_none());
+            assert_eq!(old.cline_access, ClineAccess::Full);
+            assert_eq!(view.requests.len(), 1);
+            assert_eq!(state.authorize("old", ip), Authorization::Pending);
+            assert_eq!(
+                state.authorize("old", "10.0.0.6".parse().unwrap()),
+                Authorization::Pending
+            );
+            assert!(state.async_identity("old", ip).is_none());
+            assert!(!state.admit_review(Uuid::new_v4(), "old", ip, old_identity.1));
+            assert_eq!(
+                state.authorize_proxy_peer(ip, None).unwrap(),
+                ("new".into(), Authorization::Allowed)
+            );
+            assert!(state.authorize_proxy_peer(ip, Some("old")).is_err());
+            assert_eq!(state.announce_guest("old", ip).unwrap().0, "new");
+            let new_identity = state.async_identity("new", ip).unwrap();
+            assert_ne!(new_identity.0, old_identity.0);
+            state.add_container("new", Some(ip)).unwrap();
+            state.add_container("new", None).unwrap();
+            assert_eq!(state.async_identity("new", ip).unwrap(), new_identity);
+
+            let reloaded = AppState::load(&dir.0).unwrap();
+            assert_eq!(reloaded.authorize("old", ip), Authorization::Pending);
+            assert_eq!(reloaded.authorize_proxy_peer(ip, None).unwrap().0, "new");
+            reloaded.remove_container("old").unwrap();
+            assert_eq!(reloaded.authorize_proxy_peer(ip, None).unwrap().0, "new");
+            reloaded.add_container("third", Some(ip)).unwrap();
+            assert!(reloaded.async_identity("new", ip).is_none());
+            assert_eq!(reloaded.authorize_proxy_peer(ip, None).unwrap().0, "third");
+        }
+    }
+
+    #[test]
+    fn failed_ip_transfer_preserves_the_owner_and_replacement_policy() {
+        let dir = TestDir::new();
+        let state = AppState::load(&dir.0).unwrap();
+        let old_ip: IpAddr = "10.0.0.5".parse().unwrap();
+        let new_ip: IpAddr = "10.0.0.6".parse().unwrap();
+        state.add_container("old", Some(old_ip)).unwrap();
+        state.add_container("new", Some(new_ip)).unwrap();
+        let old_identity = state.async_identity("old", old_ip).unwrap();
+        let new_identity = state.async_identity("new", new_ip).unwrap();
+        let changes = state.subscribe();
+        let path = dir.0.join("containers.json");
+        let saved = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(state.add_container("new", Some(old_ip)).is_err());
+        assert_eq!(state.async_identity("old", old_ip).unwrap(), old_identity);
+        assert_eq!(state.async_identity("new", new_ip).unwrap(), new_identity);
+        assert!(!changes.has_changed().unwrap());
+        assert_eq!(state.authorize_proxy_peer(old_ip, None).unwrap().0, "old");
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, saved).unwrap();
+        state.set_killed("new".into(), true).unwrap();
+        state.add_container("new", Some(old_ip)).unwrap();
+        assert!(
+            state.is_killed("new"),
+            "registration cannot resume a killed replacement"
+        );
+        assert!(state.async_identity("old", old_ip).is_none());
     }
 
     #[test]
