@@ -82,13 +82,14 @@ impl Submission {
                     "image/png"
                         | "image/jpeg"
                         | "image/gif"
+                        | "image/webp"
                         | "image/svg+xml"
                         | "video/mp4"
                         | "video/quicktime"
                         | "video/webm"
                 ) {
                     bail!(
-                        "GitHub attachments support PNG, JPEG, GIF, SVG, MP4, MOV and WebM; use Linear for other files"
+                        "Friendzone GitHub uploads support PNG, JPEG, GIF, WebP, SVG, MP4, MOV and WebM; use Linear for other files"
                     );
                 }
             }

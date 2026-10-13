@@ -180,6 +180,8 @@ test("file review shows frozen metadata and only raster images render inline", (
   const image=f.sandbox.document.querySelector('#request-file-upload-image');
   assert.equal(image.hidden,false);assert.equal(image.src,'/api/requests/upload-id/file');
   assert.match(f.sandbox.document.querySelector('#request-file-upload-metadata').textContent,/shot<script>.png/);
+  f.run(`renderFileUploadReview({id:'webp-id',status:'pending',file_upload:${JSON.stringify({...upload,filename:'shot.webp',content_type:'image/webp'})}})`);
+  assert.equal(image.hidden,false);assert.equal(image.src,'/api/requests/webp-id/file');assert.equal(image.alt,'shot.webp');
   f.run(`renderFileUploadReview({id:'other-id',status:'pending',file_upload:${JSON.stringify({...upload,content_type:'image/svg+xml'})}})`);
   assert.equal(image.hidden,true);assert.equal(image.src,undefined);
   assert.equal(f.sandbox.document.querySelector('#request-file-upload-download').href,'/api/requests/other-id/file');

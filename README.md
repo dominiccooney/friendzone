@@ -434,11 +434,12 @@ type inferred from common filename extensions.
 2. Use that URL in an issue/PR description, comment, or Linear document through
    the normal create/update tool. Uploading alone does not publish any text.
 
-GitHub supports PNG, JPEG, GIF, SVG, MP4, MOV and WebM up to a conservative
-10 MB per file. The host token must be a PAT or OAuth token with repository
-write access; installation tokens cannot upload attachments. For an existing
-GitHub credential, add **uploads.github.com** to its pinned hosts while retaining
-**api.github.com**. New GitHub presets include both. The guest's fake
+Friendzone accepts PNG, JPEG, GIF, WebP, SVG, MP4, MOV and WebM for GitHub
+uploads, up to a conservative 10 MB per file. The host token must be a PAT or
+OAuth token with repository write access; installation tokens cannot upload
+attachments. For an existing GitHub credential, add **uploads.github.com** to
+its pinned hosts while retaining **api.github.com**. New GitHub presets include
+both. The guest's fake
 `GITHUB_TOKEN` selects the credential; no real token goes to the guest.
 
 Linear accepts files up to 25 MiB. Add **Linear file uploads** under host

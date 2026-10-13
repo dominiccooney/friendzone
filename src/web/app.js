@@ -610,7 +610,7 @@ function renderFileUploadReview(detail) {
   if(!upload || !["pending","approved","sending"].includes(detail.status))return;
   const path=`/api/requests/${encodeURIComponent(detail.id)}/file`;
   link.href=path;link.hidden=false;
-  if(["image/png","image/jpeg","image/gif"].includes(upload.content_type)){image.src=path;image.alt=upload.filename;image.hidden=false;}
+  if(["image/png","image/jpeg","image/gif","image/webp"].includes(upload.content_type)){image.src=path;image.alt=upload.filename;image.hidden=false;}
 }
 
 async function decideRequest(decision) {

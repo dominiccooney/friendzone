@@ -55,7 +55,8 @@ async function fixture(t){
     res.setHeader('content-type','application/json');
     const url=new URL(req.url,'http://localhost');
     if(req.method==='POST'&&url.pathname==='/guest/uploads'){
-      const result={url:'https://github.com/user-attachments/assets/fixture',markdown:'![shot.png](https://github.com/user-attachments/assets/fixture)'};
+      const filename=url.searchParams.get('filename');
+      const result={url:'https://github.com/user-attachments/assets/fixture',markdown:`![${filename}](https://github.com/user-attachments/assets/fixture)`};
       res.end(JSON.stringify(result));return;
     }
     if(req.method==='POST'&&url.pathname==='/guest/git-push'){
@@ -115,14 +116,14 @@ test('git bundle tool uploads exact bounded bytes and metadata without credentia
 
 test('file upload streams binary bytes first and returns a reusable URL without publishing a description or comment',async t=>{
   const f=await fixture(t),plugin=f.load('upload-session',false,{GITHUB_TOKEN:'fake-github',LINEAR_API_KEY:'fake-linear'});
-  const file=path.join(f.home,'shot.png'),bytes=Buffer.from([0x89,0x50,0x4e,0x47,0,255,128,1]);fs.writeFileSync(file,bytes);
+  const file=path.join(f.home,'shot.webp'),bytes=Buffer.from('RIFF\x04\x00\x00\x00WEBP','binary');fs.writeFileSync(file,bytes);
   const tool=plugin.tools.get('friendzone_upload_file');
   assert.match(tool.description,/Upload a local file FIRST/);assert.match(tool.description,/issue\/PR description or comment/);assert.match(tool.description,/No issue, PR or comment ID/);
   for(const destination of ['github','linear']){
     const result=await plugin.run('friendzone_upload_file',{file_path:file,destination,...(destination==='github'?{repository:'cline/cline'}:{})});
-    assert.match(result.url,/^https:/);assert.match(result.markdown,/shot.png/);
+    assert.match(result.url,/^https:/);assert.match(result.markdown,/shot.webp/);
     const call=f.calls.at(-1),url=new URL(call.url,'http://fixture');
-    assert.equal(url.pathname,'/guest/uploads');assert.equal(url.searchParams.get('content_type'),'image/png');assert.equal(url.searchParams.get('session_id'),'upload-session');
+    assert.equal(url.pathname,'/guest/uploads');assert.equal(url.searchParams.get('content_type'),'image/webp');assert.equal(url.searchParams.get('session_id'),'upload-session');
     assert.equal(call.headers['x-friendzone-token'],destination==='github'?'fake-github':'fake-linear');assert.equal(call.authorization,undefined);
     assert.deepEqual(call.bytes,bytes);assert.equal(url.searchParams.has('issue'),false);assert.equal(url.searchParams.has('file_path'),false);
   }

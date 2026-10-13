@@ -1680,7 +1680,7 @@ async fn review_upload_file(
     };
     let inline = matches!(
         upload.submission.content_type.as_str(),
-        "image/png" | "image/jpeg" | "image/gif"
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
     );
     let mut response = content.into_response();
     response.headers_mut().insert(
@@ -2283,8 +2283,8 @@ mod tests {
                 let sent = assets.clone();
                 async move {
                     assert_eq!(query["repository_id"], "42");
-                    assert_eq!(query["name"], "shot.png");
-                    assert_eq!(query["content_type"], "image/png");
+                    assert_eq!(query["name"], "shot.webp");
+                    assert_eq!(query["content_type"], "image/webp");
                     sent.send(("asset", headers, body)).unwrap();
                     Json(serde_json::json!({"url":"https://github.com/user-attachments/assets/fixture"}))
                 }
@@ -2296,7 +2296,7 @@ mod tests {
                     Json(serde_json::json!({"data":{"fileUpload":{"success":true,"uploadFile":{
                         "uploadUrl":"https://storage.googleapis.com/linear-test/shot?X-Goog-Signature=test",
                         "assetUrl":"https://uploads.linear.app/workspace/fixture",
-                        "headers":[{"key":"content-type","value":"image/png"},{"key":"cache-control","value":"public, max-age=31536000"},{"key":"x-goog-content-length-range","value":"100000,100000"},{"key":"Content-Disposition","value":"attachment; filename=\"shot.png\""}]
+                        "headers":[{"key":"content-type","value":"image/webp"},{"key":"cache-control","value":"public, max-age=31536000"},{"key":"x-goog-content-length-range","value":"100000,100000"},{"key":"Content-Disposition","value":"attachment; filename=\"shot.webp\""}]
                     }}}}))
                 }
             }))
@@ -2366,7 +2366,7 @@ mod tests {
                              fake: &str,
                              content: axum::body::Bytes| {
             let uri = format!(
-                "/guest/uploads?destination={destination}&filename=shot.png&content_type=image/png&session_id=session{}",
+                "/guest/uploads?destination={destination}&filename=shot.webp&content_type=image/webp&session_id=session{}",
                 if destination == "github" {
                     "&repository=cline/cline"
                 } else {
@@ -2467,6 +2467,8 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()["content-type"], "image/webp");
+                assert_eq!(response.headers()["content-disposition"], "inline");
                 assert_eq!(response.headers()["x-content-type-options"], "nosniff");
                 assert_eq!(
                     axum::body::to_bytes(response.into_body(), 100001)
@@ -2503,7 +2505,7 @@ mod tests {
                 value["markdown"]
                     .as_str()
                     .unwrap()
-                    .starts_with("![shot.png]")
+                    .starts_with("![shot.webp]")
             );
             assert_eq!(
                 app.reviews.inspect(summary.id).unwrap().summary.status,
@@ -2546,11 +2548,11 @@ mod tests {
                 let (kind, headers, body) = received.recv().await.unwrap();
                 assert_eq!(kind, "storage");
                 assert!(!headers.contains_key("authorization"));
-                assert_eq!(headers["content-type"], "image/png");
+                assert_eq!(headers["content-type"], "image/webp");
                 assert_eq!(headers["x-goog-content-length-range"], "100000,100000");
                 assert_eq!(
                     headers["content-disposition"],
-                    "attachment; filename=\"shot.png\""
+                    "attachment; filename=\"shot.webp\""
                 );
                 assert_eq!(body, bytes);
             }
