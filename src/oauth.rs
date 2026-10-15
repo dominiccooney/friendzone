@@ -309,12 +309,7 @@ fn store_cline_session(
         expires_at,
         api_base_url: api_base_url.to_owned(),
     };
-    settings.set_secret(
-        &ClineSession::secret_name(entry),
-        &serde_json::to_string(&session)?,
-    )?;
-    // Mirror for the synchronous substitution path.
-    settings.set_secret(entry, access)
+    settings.set_cline_session(entry, &session, access)
 }
 
 /// Background maintenance: refresh any Cline session nearing expiry so

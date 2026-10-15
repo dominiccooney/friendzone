@@ -266,25 +266,17 @@ async fn add_escrow(
         real_env: None,
         guest_env: request.guest_env,
     };
-    let real = request.real_value.filter(|v| !v.trim().is_empty());
-    if real.is_some() && crate::settings::is_cline_entry(&entry) {
-        return (StatusCode::UNPROCESSABLE_ENTITY, CLINE_STATIC_KEY_REJECTED).into_response();
-    }
     let entry = match state.settings.add_entry(entry) {
         Ok(entry) => entry,
         Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
     };
-    if let Some(real) = real
+    if let Some(real) = request.real_value.filter(|v| !v.trim().is_empty())
         && let Err(error) = state.settings.set_secret(&entry.name, real.trim())
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
     }
     (StatusCode::CREATED, Json(serde_json::json!(entry))).into_response()
 }
-
-/// Static Cline API keys were removed: they are never accepted, so a pasted
-/// key can neither shadow a broker-owned session nor revive the legacy path.
-const CLINE_STATIC_KEY_REJECTED: &str = "Cline credentials are OAuth-only: leave the key empty and use \"Sign in with Cline…\" on the entry's row";
 
 fn is_cline_entry_name(settings: &crate::settings::Settings, name: &str) -> bool {
     settings
@@ -313,14 +305,6 @@ async fn update_escrow(
     Path(name): Path<String>,
     Json(request): Json<UpdateEscrowRequest>,
 ) -> impl IntoResponse {
-    let real = request.real_value.filter(|v| !v.trim().is_empty());
-    let becomes_cline = request
-        .hosts
-        .iter()
-        .any(|host| crate::settings::host_matches(host, crate::policy::CLINE_API_HOST));
-    if real.is_some() && (becomes_cline || is_cline_entry_name(&state.settings, &name)) {
-        return (StatusCode::UNPROCESSABLE_ENTITY, CLINE_STATIC_KEY_REJECTED).into_response();
-    }
     let updated = match state.settings.update_entry(
         &name,
         request.hosts,
@@ -331,7 +315,7 @@ async fn update_escrow(
         Ok(entry) => entry,
         Err(error) => return (StatusCode::NOT_FOUND, error.to_string()).into_response(),
     };
-    if let Some(real) = real
+    if let Some(real) = request.real_value.filter(|v| !v.trim().is_empty())
         && let Err(error) = state.settings.set_secret(&name, real.trim())
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
@@ -360,10 +344,11 @@ async fn set_escrow_secret(
     Path(name): Path<String>,
     Json(request): Json<SecretRequest>,
 ) -> impl IntoResponse {
-    if is_cline_entry_name(&state.settings, &name) {
-        return (StatusCode::UNPROCESSABLE_ENTITY, CLINE_STATIC_KEY_REJECTED).into_response();
+    let value = request.value.trim();
+    if value.is_empty() {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "secret value cannot be empty").into_response();
     }
-    match state.settings.set_secret(&name, &request.value) {
+    match state.settings.set_secret(&name, value) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
@@ -4631,7 +4616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cline_entries_reject_static_keys_and_guests_get_a_durable_cline_access_mode() {
+    async fn cline_entries_accept_static_keys_and_guests_get_a_durable_cline_access_mode() {
         let settings = test_settings();
         let dir = settings.data_dir().to_path_buf();
         let app = AppState::load(&dir).unwrap();
@@ -4664,63 +4649,16 @@ mod tests {
             .unwrap()
         };
 
-        // Adding a Cline entry with a pasted key is refused before anything is stored.
+        // A Cline entry without a key starts disconnected; setting a static key
+        // or signing in with OAuth connects it, and setting a static key clears
+        // any previous OAuth session.
         let cline = serde_json::json!({"name":"cline","hosts":["API.cline.bot"],"header":"authorization","prefix":"Bearer ","guest_env":"CLINE_API_KEY"});
-        let mut with_key = cline.clone();
-        with_key["real_value"] = "sk-static".into();
         let response = ui
             .clone()
-            .oneshot(json("POST", "/api/escrow", with_key))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(text(response).await.contains("OAuth-only"));
-        assert!(settings.entries().is_empty());
-        // Without a key the entry is created, disconnected until sign-in.
-        let response = ui
-            .clone()
-            .oneshot(json("POST", "/api/escrow", cline))
+            .oneshot(json("POST", "/api/escrow", cline.clone()))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
-        for (method, path, body) in [
-            (
-                "POST",
-                "/api/escrow/cline/secret",
-                serde_json::json!({"value":"sk-static"}),
-            ),
-            (
-                "PUT",
-                "/api/escrow/cline",
-                serde_json::json!({"hosts":["api.cline.bot"],"header":"authorization","prefix":"Bearer ","guest_env":"CLINE_API_KEY","real_value":"sk-static"}),
-            ),
-        ] {
-            let response = ui.clone().oneshot(json(method, path, body)).await.unwrap();
-            assert_eq!(
-                response.status(),
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "{method} {path}"
-            );
-        }
-        assert!(
-            settings.secret("cline").is_none(),
-            "no static key may be stored"
-        );
-        // A non-Cline entry cannot be re-pointed at Cline while pasting a key either.
-        let response = ui
-            .clone()
-            .oneshot(json("POST", "/api/escrow", serde_json::json!({"name":"other","hosts":["api.example.com"],"header":"authorization","real_value":"real"})))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED);
-        let response = ui
-            .clone()
-            .oneshot(json("PUT", "/api/escrow/other", serde_json::json!({"hosts":["api.cline.bot"],"header":"authorization","real_value":"rotated"})))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(settings.secret("other").as_deref(), Some("real"));
-        // The UI never sees a Cline entry as connected without a session.
         let list = ui
             .clone()
             .oneshot(Request::get("/api/escrow").body(Body::empty()).unwrap())
@@ -4734,6 +4672,91 @@ mod tests {
             .find(|e| e["name"] == "cline")
             .unwrap();
         assert_eq!(entry["connected"], false);
+
+        // Simulate an active OAuth session, then replace it via `/secret` and `PUT`.
+        let session = crate::oauth::ClineSession {
+            refresh_token: "refresh".into(),
+            expires_at: 4_000_000_000,
+            api_base_url: "https://api.cline.bot".into(),
+        };
+        settings
+            .set_cline_session("cline", &session, "oauth-access")
+            .unwrap();
+        assert!(crate::oauth::ClineSession::load(&settings, "cline").is_some());
+        let response = ui
+            .clone()
+            .oneshot(json(
+                "POST",
+                "/api/escrow/cline/secret",
+                serde_json::json!({"value":"  sk-static  "}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(settings.secret("cline").as_deref(), Some("sk-static"));
+        assert!(crate::oauth::ClineSession::load(&settings, "cline").is_none());
+        let response = ui
+            .clone()
+            .oneshot(json(
+                "POST",
+                "/api/escrow/cline/secret",
+                serde_json::json!({"value":"   "}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(settings.secret("cline").as_deref(), Some("sk-static"));
+
+        let response = ui
+            .clone()
+            .oneshot(json(
+                "PUT",
+                "/api/escrow/cline",
+                serde_json::json!({"hosts":["api.cline.bot"],"header":"authorization","prefix":"Bearer ","guest_env":"CLINE_API_KEY","real_value":"sk-rotated"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(settings.secret("cline").as_deref(), Some("sk-rotated"));
+
+        // Adding a Cline entry with an initial static key also connects immediately.
+        let response = ui
+            .clone()
+            .oneshot(json(
+                "POST",
+                "/api/escrow",
+                serde_json::json!({"name":"cline-key","hosts":["api.cline.bot"],"header":"authorization","prefix":"Bearer ","guest_env":"CLINE_API_KEY","real_value":"sk-initial"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(settings.secret("cline-key").as_deref(), Some("sk-initial"));
+        let list = ui
+            .clone()
+            .oneshot(Request::get("/api/escrow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let list: serde_json::Value = serde_json::from_str(&text(list).await).unwrap();
+        for name in ["cline", "cline-key"] {
+            let entry = list["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == name)
+                .unwrap();
+            assert_eq!(entry["connected"], true, "{name}");
+        }
+
+        let response = ui
+            .clone()
+            .oneshot(json(
+                "POST",
+                "/api/escrow",
+                serde_json::json!({"name":"other","hosts":["api.example.com"],"header":"authorization","real_value":"real"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
         // Sign-in attaches the account to an entry, so it is refused for entries
         // that are not Cline entries: the account cannot be pointed elsewhere.
         let response = ui

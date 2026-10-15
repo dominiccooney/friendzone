@@ -62,16 +62,16 @@ Open <http://127.0.0.1:8081>.
   masked field, click Add. Hosts/header/env-var are prefilled by the
   preset; the fake key is broker-generated. The in-UI hint says where to
   get each key (for GitHub: a fine-grained PAT, or just `gh auth
-  token`). Cline is OAuth-only — there is no key to paste (the field is
-  disabled, and the broker rejects one): add the entry, then click
-  "Sign in with Cline…" — a short code appears, the admin page opens the
+  token`). For Cline, either leave the key empty, click Add, and click
+  "Sign in with Cline…" (a short code appears, the admin page opens the
   verification page in your current browser, you confirm the code, and the
-  broker picks up
-  the tokens in the background and auto-refreshes them. Edit fixes a wrong
+  broker picks up the tokens in the background and auto-refreshes them), or
+  paste a static key from `app.cline.bot → Settings → API Keys`. Edit fixes a wrong
   header/host without changing the fake; Delete removes the entry and
-  its stored key together. Rerun guest setup after sign-in: it then writes a
-  worthless OAuth-shaped facade into guest Cline settings, allowing account and
-  Cloud UI to recognize sign-in without copying access or refresh credentials.
+  its stored key together. Rerun guest setup after connecting: it writes a
+  worthless facade into guest Cline settings (`auth.accessToken` for OAuth
+  sign-in so account and Cloud UI recognize sign-in without copying access or
+  refresh credentials, or `apiKey` for a static key).
 - **Settings → Guests → Cline API access** — every guest starts as **basic**:
   inference, model catalog, and account/organization basics work; cloud
   sessions look empty and cannot be created or driven. Switch a trusted guest

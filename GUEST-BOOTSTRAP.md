@@ -154,16 +154,17 @@ are never automatically replayed. Rerunning setup removes the
 exact temporary 25-hour override written by Friendzone release `ebfa82b` when
 previous managed metadata proves ownership. User-authored values are preserved.
 
-If the broker holds a signed-in Cline session, the script merges a worthless
-OAuth-shaped facade into the guest's `.cline/data/settings/providers.json`.
-**Close guest Cline before running the script** because it writes this same
-file. The facade is a fake `auth.accessToken` with OAuth store metadata, but no
-refresh token or account ID. Cline credentials are OAuth-only: a Cline entry that
-is not signed in delivers no `CLINE_API_KEY` fake and writes nothing. The merge
-keeps model choice, other providers, and last-used provider and removes a stale
-static `apiKey` left by older setups. Invalid provider JSON fails before
+If a Cline credential is configured on the broker, the script merges a worthless
+facade into the guest's `.cline/data/settings/providers.json`. **Close guest Cline
+before running the script** because it writes this same file. A broker-owned
+Cline OAuth session writes a fake `auth.accessToken` with OAuth store metadata
+(no refresh token or account ID); a static Cline API key writes a fake `apiKey`
+with `tokenSource: "manual"`. A Cline entry that is not connected delivers no
+`CLINE_API_KEY` fake and writes nothing. The merge keeps model choice, other
+providers, and last-used provider and removes stale fields from the other
+presentation mode. Invalid provider JSON fails before
 environment/profile writes. Existing provider files get a backup. Restart Cline
-after setup. What the guest may do with the account on `api.cline.bot` is set per
+after setup. What the guest may do with the credential on `api.cline.bot` is set per
 guest under **Settings → Guests** (basic: inference and account basics; full:
 everything except API key management). Cloud Hub access additionally needs Full
 access and proxy-aware WebSocket support in the guest Cline build.

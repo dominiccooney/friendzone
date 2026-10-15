@@ -2921,6 +2921,55 @@ mod tests {
             ),
             StatusCode::FORBIDDEN
         );
+        // Switching the Cline entry from OAuth to a static API key keeps the
+        // exact same per-guest API gate and substitutes the static key without `workos:`.
+        _settings.set_secret("cline", "sk-cline-static").unwrap();
+        let static_req = |method: &str, path: &str| {
+            let mut req = request(method, &format!("https://api.cline.bot{path}"), Some("guest"));
+            req.headers_mut()
+                .insert("authorization", "Bearer fz-cline-facade".parse().unwrap());
+            req
+        };
+        state
+            .set_cline_access("guest", crate::state::ClineAccess::Basic)
+            .unwrap();
+        let RequestOrResponse::Request(forwarded) = handler
+            .handle_from_peer(peer, static_req("POST", "/api/v1/chat/completions"))
+            .await
+        else {
+            panic!("static Cline key inference should be forwarded in basic mode")
+        };
+        assert_eq!(forwarded.headers()["authorization"], "Bearer sk-cline-static");
+        drop(forwarded);
+        handler.pending = None;
+        assert_eq!(
+            status(
+                handler
+                    .handle_from_peer(peer, static_req("POST", "/api/v1/session"))
+                    .await
+            ),
+            StatusCode::FORBIDDEN
+        );
+        state
+            .set_cline_access("guest", crate::state::ClineAccess::Full)
+            .unwrap();
+        let RequestOrResponse::Request(forwarded) = handler
+            .handle_from_peer(peer, static_req("POST", "/api/v1/session"))
+            .await
+        else {
+            panic!("static Cline key session should be forwarded in full mode")
+        };
+        assert_eq!(forwarded.headers()["authorization"], "Bearer sk-cline-static");
+        drop(forwarded);
+        handler.pending = None;
+        assert_eq!(
+            status(
+                handler
+                    .handle_from_peer(peer, static_req("POST", "/api/v1/api-keys"))
+                    .await
+            ),
+            StatusCode::FORBIDDEN
+        );
         // Widening one guest does not widen another: an unknown/other name is basic.
         assert_eq!(state.cline_access("someone-else"), crate::state::ClineAccess::Basic);
         std::fs::remove_dir_all(dir).unwrap();

@@ -76,8 +76,9 @@ pub fn script(
     validate_container(container)?;
     let mut fakes = std::collections::BTreeMap::new();
     let mut git_github_auth = false;
-    // Cline credentials are OAuth-only. The guest fake is delivered only while
-    // the broker holds a session, so a disconnected entry writes no facade.
+    // The Cline guest fake is delivered only when the entry is connected (via
+    // a broker-owned OAuth session or a static API key), so a disconnected
+    // entry writes no provider configuration.
     let mut cline_oauth = false;
     // Routing, fake environment and Git configuration travel as one snapshot.
     let entries = settings.entries();
@@ -91,7 +92,7 @@ pub fn script(
                 .hosts
                 .iter()
                 .any(|host| crate::settings::host_matches(host, "github.com"));
-        if let Some(name) = entry.guest_env {
+        if let Some(ref name) = entry.guest_env {
             if name.is_empty()
                 || !name.bytes().enumerate().all(|(i, c)| {
                     c == b'_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
@@ -134,17 +135,17 @@ pub fn script(
                     })
                 || fakes
                     .keys()
-                    .any(|key: &String| key.eq_ignore_ascii_case(&name))
+                    .any(|key: &String| key.eq_ignore_ascii_case(name))
             {
                 bail!("invalid/conflicting guest environment variable {name}");
             }
             if name == "CLINE_API_KEY" {
-                if crate::oauth::ClineSession::load(settings, &entry.name).is_none() {
+                if settings.real_value(&entry).is_none() {
                     continue;
                 }
-                cline_oauth = true;
+                cline_oauth |= crate::oauth::ClineSession::load(settings, &entry.name).is_some();
             }
-            fakes.insert(name, entry.fake);
+            fakes.insert(name.clone(), entry.fake);
         }
     }
     let git_config = format!("{}{}", if git_github_auth {GITHUB_GIT_CONFIG} else {EMPTY_GIT_CONFIG}, crate::routing::git_proxy_config(&proxy_hosts, &proxy));
@@ -252,8 +253,8 @@ mod tests {
                 guest_env: Some("GITHUB_TOKEN".into()),
             })
             .unwrap();
-        // A Cline entry without a broker-owned session delivers no guest fake
-        // at all: there is no static-key mode for it to fall back to.
+        // A disconnected Cline entry (neither OAuth session nor static key)
+        // delivers no guest fake and writes no provider settings.
         settings
             .add_entry(crate::settings::EscrowEntry {
                 name: "cline".into(),
@@ -265,7 +266,6 @@ mod tests {
                 guest_env: Some("CLINE_API_KEY".into()),
             })
             .unwrap();
-        settings.set_secret("cline", "stale-static-key").unwrap();
         let authority = crate::ca::AuthorityFiles::load_or_create(&dir.join("script-ca")).unwrap();
         for shell in [Shell::Sh, Shell::Powershell] {
             let powershell = matches!(shell, Shell::Powershell);
@@ -356,6 +356,32 @@ mod tests {
         assert_eq!(payload["proxy_hosts"], serde_json::json!(["api.cline.bot"]));
         assert_eq!(payload["infrastructure_no_proxy"], serde_json::json!(crate::infrastructure::no_proxy()));
         assert!(payload["fakes"].get("GITHUB_TOKEN").is_none());
+        // Once a static Cline key is set, the fake is delivered with cline_oauth = false.
+        settings.set_secret("cline", "static-cline-key").unwrap();
+        let static_text = script(
+            Shell::Sh,
+            "http://[::1]:9082",
+            "guest",
+            &authority.cert_pem,
+            9080,
+            &settings,
+        )
+        .unwrap();
+        let static_encoded = static_text
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("python3 - '")
+                    .and_then(|line| line.split('\'').next())
+            })
+            .unwrap();
+        let static_payload: serde_json::Value =
+            serde_json::from_slice(&STANDARD.decode(static_encoded).unwrap()).unwrap();
+        assert_eq!(static_payload["cline_oauth"], false);
+        assert_eq!(
+            static_payload["fakes"]["CLINE_API_KEY"],
+            "fz-disconnected-cline"
+        );
+        assert!(!static_text.contains("static-cline-key"));
         let cmds = commands("http://host:9082", "guest").unwrap();
         assert!(cmds["sh"].as_str().unwrap().starts_with("curl "));
         assert!(

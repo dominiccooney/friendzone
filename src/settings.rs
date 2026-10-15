@@ -146,6 +146,26 @@ impl Settings {
         let mut secrets = self.0.secrets.write().expect("settings lock");
         let mut updated = secrets.values.clone();
         updated.insert(name.to_owned(), value.to_owned());
+        // Setting a static secret on an entry replaces any broker-owned Cline
+        // OAuth session in the same write, so neither background refresh nor
+        // the `workos:` prefix can outlive the switch to a static key.
+        updated.remove(&crate::oauth::ClineSession::secret_name(name));
+        secrets.save(updated)
+    }
+
+    /// Writes a broker-owned Cline OAuth session and its mirrored access token
+    /// in one atomic secret-store update.
+    pub fn set_cline_session(
+        &self,
+        entry: &str,
+        session: &crate::oauth::ClineSession,
+        access: &str,
+    ) -> Result<()> {
+        let session_json = serde_json::to_string(session)?;
+        let mut secrets = self.0.secrets.write().expect("settings lock");
+        let mut updated = secrets.values.clone();
+        updated.insert(crate::oauth::ClineSession::secret_name(entry), session_json);
+        updated.insert(entry.to_owned(), access.to_owned());
         secrets.save(updated)
     }
 
@@ -168,23 +188,20 @@ impl Settings {
 
     /// Real value for an entry: secrets store first, then env fallback.
     ///
-    /// Cline entries are OAuth-only. Their real value is the access token
-    /// mirrored by the broker-owned session, always carrying Cline's `workos:`
-    /// prefix. Without a session there is no value, so a stale static API key
-    /// left in the secrets store cannot quietly keep the legacy path alive.
+    /// A broker-owned Cline OAuth session mirrors its access token into the
+    /// entry's secret and carries Cline's `workos:` prefix; static API keys
+    /// remain unchanged.
     pub fn real_value(&self, entry: &EscrowEntry) -> Option<String> {
         let cline_session = crate::oauth::ClineSession::load(self, &entry.name).is_some();
-        if is_cline_entry(entry) && !cline_session {
-            return None;
-        }
         let value = self.secret(&entry.name).or_else(|| {
             entry
                 .real_env
                 .as_ref()
                 .and_then(|var| std::env::var(var).ok())
         })?;
-        // Cline's auth adapter prefixes OAuth access tokens with workos:. Handle
-        // sessions stored before the prefix was mirrored, without a new login.
+        // Cline's auth adapter prefixes OAuth access tokens with workos:.
+        // Static API keys remain unchanged. Handle existing stored sessions
+        // too, without requiring a new login after upgrading the broker.
         Some(
             if cline_session && !value.to_ascii_lowercase().starts_with("workos:") {
                 format!("workos:{value}")
@@ -219,10 +236,10 @@ pub enum Substitution {
     Block(String),
 }
 
-/// An entry that carries the broker's Cline account: pinned to Cline's
-/// production API host, or holding a broker-owned Cline OAuth session. Such
-/// entries are OAuth-only, and every host they pin is governed by the
-/// per-container Cline gate.
+/// An entry that carries a Cline credential: pinned to Cline's production API
+/// host, or holding a broker-owned Cline OAuth session. Every host such an
+/// entry pins is governed by the per-container Cline gate, whether the
+/// credential comes from OAuth sign-in or a static API key.
 pub fn is_cline_entry(entry: &EscrowEntry) -> bool {
     entry
         .hosts
@@ -609,12 +626,21 @@ mod tests {
         let entry = settings.entries().pop().unwrap();
         settings.set_secret(&entry.name, "access").unwrap();
         assert_eq!(settings.real_value(&entry).as_deref(), Some("access"));
-        settings.set_secret(&crate::oauth::ClineSession::secret_name(&entry.name), &serde_json::json!({"refresh_token":"refresh", "expires_at":4_000_000_000_i64, "api_base_url":"https://api.cline.bot"}).to_string()).unwrap();
+        let session = crate::oauth::ClineSession {
+            refresh_token: "refresh".into(),
+            expires_at: 4_000_000_000,
+            api_base_url: "https://api.cline.bot".into(),
+        };
+        settings
+            .set_cline_session(&entry.name, &session, "access")
+            .unwrap();
         assert_eq!(
             settings.real_value(&entry).as_deref(),
             Some("workos:access")
         );
-        settings.set_secret(&entry.name, "workos:access").unwrap();
+        settings
+            .set_cline_session(&entry.name, &session, "workos:access")
+            .unwrap();
         assert_eq!(
             settings.real_value(&entry).as_deref(),
             Some("workos:access")
@@ -623,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn cline_entries_are_oauth_only_and_a_stale_static_key_is_inert() {
+    fn cline_entries_support_static_keys_and_oauth_sessions() {
         let dir = std::env::temp_dir().join(format!("fz-cline-static-{}", Uuid::new_v4()));
         let settings = Settings::load(&dir).unwrap();
         let entry = settings
@@ -642,11 +668,8 @@ mod tests {
             hosts: vec!["API.Cline.Bot".into()],
             ..entry.clone()
         }));
-        // A static key pasted into the secrets store, or one supplied through
-        // the env fallback, is not a Cline credential: no session, no value.
-        settings.set_secret(&entry.name, "static-api-key").unwrap();
-        // SAFETY: test-scoped variable name, no concurrent reader.
-        unsafe { std::env::set_var("FZ_TEST_CLINE_STATIC_KEY", "env-static-key") };
+        // Without a secret or env fallback, the entry is disconnected.
+        unsafe { std::env::remove_var("FZ_TEST_CLINE_STATIC_KEY") };
         assert_eq!(settings.real_value(&entry), None);
         assert!(matches!(
             settings.substitute("api.cline.bot", "/api/v1/chat/completions", |name| {
@@ -654,12 +677,51 @@ mod tests {
             }),
             Substitution::Block(reason) if reason.contains("connect it in settings")
         ));
-        // Connecting the broker-owned session makes the mirrored token usable.
-        settings.set_secret(&crate::oauth::ClineSession::secret_name(&entry.name), &serde_json::json!({"refresh_token":"refresh", "expires_at":4_000_000_000_i64, "api_base_url":"https://api.cline.bot"}).to_string()).unwrap();
-        settings.set_secret(&entry.name, "access").unwrap();
-        assert_eq!(settings.real_value(&entry).as_deref(), Some("workos:access"));
-        // Deleting the entry takes the session with it; nothing is left behind.
+        // Env fallback and static stored keys work without a `workos:` prefix.
+        // SAFETY: test-scoped variable name, no concurrent reader.
+        unsafe { std::env::set_var("FZ_TEST_CLINE_STATIC_KEY", "env-static-key") };
+        assert_eq!(
+            settings.real_value(&entry).as_deref(),
+            Some("env-static-key")
+        );
+        settings.set_secret(&entry.name, "static-api-key").unwrap();
+        assert_eq!(
+            settings.real_value(&entry).as_deref(),
+            Some("static-api-key")
+        );
+        assert!(matches!(
+            settings.substitute("api.cline.bot", "/api/v1/chat/completions", |name| {
+                (name == "authorization").then(|| "Bearer fz-cline-fake".into())
+            }),
+            Substitution::Replace { value, .. } if value == "Bearer static-api-key"
+        ));
+        // Connecting the broker-owned session switches to the `workos:` token.
+        let session = crate::oauth::ClineSession {
+            refresh_token: "refresh".into(),
+            expires_at: 4_000_000_000,
+            api_base_url: "https://api.cline.bot".into(),
+        };
+        settings
+            .set_cline_session(&entry.name, &session, "access")
+            .unwrap();
+        assert_eq!(
+            settings.real_value(&entry).as_deref(),
+            Some("workos:access")
+        );
+        // Setting a static secret atomically clears the OAuth session so neither
+        // refresh nor the `workos:` prefix survives switching back to a key.
+        settings.set_secret(&entry.name, "rotated-static-key").unwrap();
+        assert!(crate::oauth::ClineSession::load(&settings, &entry.name).is_none());
+        assert_eq!(
+            settings.real_value(&entry).as_deref(),
+            Some("rotated-static-key")
+        );
+        // Re-sign-in and delete: deleting the entry takes both secrets with it.
+        settings
+            .set_cline_session(&entry.name, &session, "access")
+            .unwrap();
         settings.remove_entry(&entry.name).unwrap();
+        assert!(settings.secret(&entry.name).is_none());
         assert!(settings.secret(&crate::oauth::ClineSession::secret_name(&entry.name)).is_none());
         unsafe { std::env::remove_var("FZ_TEST_CLINE_STATIC_KEY") };
         fs::remove_dir_all(dir).unwrap();
@@ -742,7 +804,8 @@ mod tests {
             .unwrap();
         settings.set_secret(&entry.name, "host-access").unwrap();
 
-        // Without a broker-owned session the entry has no credential at all.
+        // A static Cline API key substitutes the literal fake, and must not
+        // reinterpret an OAuth-shaped `workos:<fake>` facade.
         assert!(matches!(
             settings.substitute("api.cline.bot", "/api/v1/users/me", |name| {
                 (name == "authorization").then(|| "Bearer workos:fz-cline-fake".into())
@@ -753,7 +816,7 @@ mod tests {
             settings.substitute("api.cline.bot", "/api/v1/users/me", |name| {
                 (name == "authorization").then(|| "Bearer fz-cline-fake".into())
             }),
-            Substitution::Block(_)
+            Substitution::Replace { value, .. } if value == "Bearer host-access"
         ));
 
         settings.set_secret(&crate::oauth::ClineSession::secret_name(&entry.name), &serde_json::json!({"refresh_token":"host-refresh", "expires_at":4_000_000_000_i64, "api_base_url":"https://api.cline.bot"}).to_string()).unwrap();

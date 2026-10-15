@@ -685,32 +685,33 @@ key is always broker-generated, never typed. Entries can be edited
 (fixing hosts/header keeps the fake, so guests keep working; pasting a
 key rotates it) and deleted (the stored real key goes with the entry).
 
-Cline credentials are **OAuth-only**. Add the entry with the key field empty
-(the UI disables it for the Cline preset, and the broker rejects a pasted key
-for any entry pinned to `api.cline.bot`), then click "Sign in with Cline…".
+For Cline, you can either sign in with your Cline account or paste a static API
+key (`app.cline.bot → Settings → API Keys`). To sign in, add the entry with the
+key field empty and click "Sign in with Cline…".
 The broker uses the device-code flow:
 it shows a short code, the admin UI opens the verification page in the browser
 you are using, and the broker polls until you confirm it — no broker-local
 browser, display server, callback, or editor redirect. Tokens are registered
-with Cline's backend and auto-refresh from then on. Static Cline API keys
-(`app.cline.bot → Settings → API Keys`) are not supported: a Cline entry has no
-usable credential until it is signed in, a static key left in an older
-secret store is ignored, and the guest never receives the entry's fake while
-the entry is disconnected. Per-guest limits on what that account may do live on
-the guest, not the credential (see Containers above).
+with Cline's backend and auto-refresh from then on. Setting or rotating a static
+key on a Cline entry replaces any stored OAuth session; a disconnected Cline
+entry delivers no fake to the guest. Per-guest limits on what a guest may do on
+`api.cline.bot` (and any other host the Cline entry pins) live on the guest, not
+the credential (see Containers above), and apply equally to OAuth sessions and
+static API keys.
 
 The guest setup script saves the fakes as `friendzone-env.sh` (or `.ps1` on Windows);
 source it in the agent's shell. When the fakes include `CLINE_API_KEY`,
 setup also writes `~/.cline/data/settings/providers.json` (the settings
-file Cline's CLI, IDE extension, and SDK share) as an OAuth-shaped facade: `auth.accessToken`
-contains only `workos:<fake>`, its local expiry is far in the future, and
-`tokenSource` is `"oauth"`. No real access token, refresh token or account ID
-enters the guest. This lets account/Cloud UI take Cline's OAuth path while the
-broker substitutes its current host token. Guest refresh is blocked because
-refresh remains host-owned. The write is merge-safe: other providers, model
-choice, and `lastUsedProvider` are preserved; a stale static `apiKey` from an
-older setup is removed so it cannot shadow the facade. Run setup while guest
-Cline is stopped, then restart it.
+file Cline's CLI, IDE extension, and SDK share). A broker-owned OAuth session
+writes an OAuth-shaped facade (`auth.accessToken` set to `workos:<fake>`, a
+far-future local expiry, and `tokenSource: "oauth"`) so account/Cloud UI takes
+Cline's OAuth path while the broker substitutes its current host token and
+keeps refresh host-owned. A static API key writes `apiKey` set to `<fake>` with
+`tokenSource: "manual"`. No real access token, refresh token, account ID, or API
+key enters the guest. The write is merge-safe: other providers, model choice,
+and `lastUsedProvider` are preserved, and stale fields from the other
+presentation mode are removed. Run setup while guest Cline is stopped, then
+restart it.
 
 Cline Cloud's REST calls use the normal proxy. Its Hub connection also requires
 a Cline build whose `NodeHubClient` sends `ws:`/`wss:` through the configured
@@ -763,7 +764,7 @@ parsed GitHub GraphQL reads, one-shot write review with desktop notifications,
 reviewed durable Git branch-bundle publication, and narrow per-guest issue/PR
 comment permissions; per-guest Cline API access (basic/full) with API key
 management always denied; live MCP configuration,
-tool/guest allowlists and host-side OAuth; OAuth-only Cline sign-in and token refresh;
+tool/guest allowlists and host-side OAuth; Cline OAuth sign-in (with token refresh) and static API keys;
 script-only guest setup with persistent Linux profiles or Windows user
 environment. Settings is organized into Guests, Credentials and MCP servers.
 

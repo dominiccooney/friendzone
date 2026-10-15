@@ -152,6 +152,7 @@ $data | Add-Member -NotePropertyName infrastructure_no_proxy -NotePropertyValue 
 $data | Add-Member -NotePropertyName proxy_hosts -NotePropertyValue $payload.proxy_hosts
 $data.ca=[string]$payload.ca
 if($payload.cline_oauth -ne $true){throw 'bootstrap payload for a connected Cline session must advertise cline_oauth'}
+$data | Add-Member -NotePropertyName cline_oauth -NotePropertyValue ([bool]$payload.cline_oauth)
 $data | Add-Member -NotePropertyName git_credential_config -NotePropertyValue ([string]$payload.git_credential_config)
 $data.fakes | Add-Member -NotePropertyName GITHUB_TOKEN -NotePropertyValue ([string]$payload.fakes.GITHUB_TOKEN)
 # Model ebfa82b's exact managed value/metadata, then verify this upgrade removes
@@ -227,11 +228,15 @@ if([IO.File]::ReadAllText($EnvironmentFile) -cne $beforeEnv -or (ConvertTo-Json 
 Write-FzFile $plugin ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload.plugin)))
 $root=Get-Content -Raw -Encoding UTF8 -LiteralPath $provider | ConvertFrom-Json
 if($root.providers.cline.settings.model -ne 'keep' -or $root.providers.cline.settings.apiKey -or $root.providers.cline.settings.auth.accessToken -cne "workos:fake'`$(not-a-command)" -or $root.providers.cline.settings.auth.expiresAt -ne 253402300799000 -or $root.providers.cline.settings.auth.refreshToken -or $root.providers.cline.settings.auth.accountId -or $root.providers.cline.tokenSource -cne 'oauth' -or $root.providers.other.settings.key -ne 'preserved' -or $root.lastUsedProvider -ne 'other'){throw 'OAuth provider facade merge failed'}
-# Legacy static keys are never written; a rerun keeps the OAuth facade stable.
+# Both presentation transitions remove the other mode's stale credential fields.
+$data.cline_oauth=$false
+$null=Invoke-FzConfigure $data $homeDir $configDir
+$manual=Get-Content -Raw -Encoding UTF8 -LiteralPath $provider | ConvertFrom-Json
+if($manual.providers.cline.settings.apiKey -cne "fake'`$(not-a-command)" -or $manual.providers.cline.settings.auth -or $manual.providers.cline.tokenSource -cne 'manual'){throw 'OAuth-to-manual provider transition failed'}
+$data.cline_oauth=$true
 $null=Invoke-FzConfigure $data $homeDir $configDir
 $root=Get-Content -Raw -Encoding UTF8 -LiteralPath $provider | ConvertFrom-Json
-if($root.providers.cline.settings.apiKey -or $root.providers.cline.settings.auth.accessToken -cne "workos:fake'`$(not-a-command)" -or $root.providers.cline.settings.auth.refreshToken -or $root.providers.cline.tokenSource -cne 'oauth'){throw 'OAuth facade did not survive a rerun'}
-if((Get-Content -Raw -LiteralPath $provider) -match '"manual"|legacy-static-key'){throw 'legacy static Cline key representation was written'}
+if($root.providers.cline.settings.apiKey -or $root.providers.cline.settings.auth.accessToken -cne "workos:fake'`$(not-a-command)" -or $root.providers.cline.settings.auth.refreshToken -or $root.providers.cline.tokenSource -cne 'oauth'){throw 'Manual-to-OAuth provider transition failed'}
 $beforeEnv=[IO.File]::ReadAllText($EnvironmentFile)
 [IO.File]::WriteAllText($provider,'{"version":99}')
 try {Invoke-FzConfigure $data $homeDir $configDir;throw 'expected invalid provider failure'} catch {if($_.Exception.Message -eq 'expected invalid provider failure'){throw}}

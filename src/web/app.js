@@ -688,7 +688,7 @@ const PROVIDER_PRESETS = {
   },
   cline: {
     name: "cline", hosts: "api.cline.bot", header: "authorization", prefix: "Bearer ", guest: "CLINE_API_KEY",
-    hint: "Leave the key field empty and click Add, then click 'Sign in with Cline…' on its row — the broker signs in with your Cline account and refreshes tokens automatically. Static Cline API keys are not supported. Guests receive the fake through CLINE_API_KEY and an OAuth-shaped facade in their Cline settings; each guest's Cline API access (basic or full) is set under Settings → Guests.",
+    hint: "Recommended: leave the key field empty, click Add, then click 'Sign in with Cline…' on its row — the broker signs in with your Cline account and refreshes tokens automatically. Or paste a key from app.cline.bot → Settings → API Keys. Guests receive the fake through CLINE_API_KEY and their Cline provider settings; each guest's Cline API access (basic or full) is set under Settings → Guests.",
   },
   github: {
     name: "github", hosts: "api.github.com,github.com,codeload.github.com,uploads.github.com", header: "authorization", prefix: "Bearer ", guest: "GITHUB_TOKEN",
@@ -709,10 +709,6 @@ $("#e-provider").onchange = () => {
   $("#e-guest").value = preset.guest;
   $("#e-hint").textContent = preset.hint;
   $("#e-advanced").open = $("#e-provider").value === "custom";
-  // Cline is OAuth-only: there is no real key to paste.
-  const cline = $("#e-provider").value === "cline";
-  $("#e-real").disabled = cline; if (cline) $("#e-real").value = "";
-  $("#e-real").placeholder = cline ? "no key: use 'Sign in with Cline…' after adding" : "paste the REAL API key here (stays on the host)";
 };
 
 async function renderSettings() {
@@ -737,10 +733,9 @@ async function renderSettings() {
   loadMcpConnection();
   window._escrowEntries = escrow.entries;
   $("#escrow-list").innerHTML = escrow.entries.map(e=>{
-    // Cline entries are OAuth-only: no "Set key…", sign-in is the only connector.
     const cline = e.hosts.some(h=>h.toLowerCase()==="api.cline.bot");
     const clineBtn = cline ? ` <button class="quiet" data-cline-oauth="${esc(e.name)}">${e.connected?"Sign in again…":"Sign in with Cline…"}</button>` : "";
-    const status = e.connected ? '<span class="verdict allowed">connected</span>' : cline ? '<span class="verdict failed">not signed in</span>' : `<button class="quiet" data-secret="${esc(e.name)}">Set key…</button>`;
+    const status = e.connected ? '<span class="verdict allowed">connected</span>' : `<button class="quiet" data-secret="${esc(e.name)}">Set key…</button>`;
     return `<div class="log-row"><span>${esc(e.name)}</span><span>${esc(e.hosts.join(", "))}</span><span class="request">${esc(e.header)}${e.prefix?` · prefix '${esc(e.prefix)}'`:""} · fake <code>${esc(e.fake)}</code> <button type="button" class="quiet copy-fake-key" data-escrow-copy="${esc(e.name)}">Copy fake key</button></span><span>${status}${clineBtn} <button class="quiet" data-escrow-edit="${esc(e.name)}">Edit</button> <button class="quiet" data-escrow-delete="${esc(e.name)}">Delete</button></span></div>`;
   }).join("") || '<div class="log-row">No escrow entries yet.</div>';
   // Keep the single connection form alive while rebuilding server rows.
@@ -820,7 +815,6 @@ async function renderSettings() {
   document.querySelectorAll("[data-escrow-edit]").forEach(b=>b.onclick=()=>{
     const entry = window._escrowEntries.find(e=>e.name===b.dataset.escrowEdit);
     if (!entry) return;
-    const cline = entry.hosts.some(h=>h.toLowerCase()==="api.cline.bot");
     $("#e-provider").value = PROVIDER_PRESETS[entry.name] ? entry.name : "custom";
     $("#e-name").value = entry.name; $("#e-hosts").value = entry.hosts.join(",");
     $("#e-header").value = entry.header; $("#e-prefix").value = entry.prefix || "";
@@ -828,11 +822,8 @@ async function renderSettings() {
     $("#e-advanced").open = true;
     editingEntry = entry.name;
     $("#escrow-form button[type=submit]").textContent = "Save changes";
-    $("#e-real").disabled = cline; if (cline) $("#e-real").value = "";
-    $("#e-hint").textContent = cline
-      ? `Editing '${entry.name}' — the fake key stays the same, so guests keep working. Cline credentials come only from 'Sign in with Cline…'; there is no key to paste.`
-      : `Editing '${entry.name}' — the fake key stays the same, so guests keep working. Leave the key field empty to keep the current real key, or paste a new one to rotate it.`;
-    if (!cline) $("#e-real").focus();
+    $("#e-hint").textContent = `Editing '${entry.name}' — the fake key stays the same, so guests keep working. Leave the key field empty to keep the current credential, or paste a new key to replace it.`;
+    $("#e-real").focus();
   });
   document.querySelectorAll("[data-escrow-delete]").forEach(b=>b.onclick=async()=>{
     if (!confirm(`Delete escrow entry '${b.dataset.escrowDelete}' and its stored real key? Containers holding its fake lose access.`)) return;
@@ -1259,13 +1250,10 @@ $("#escrow-form").onsubmit = async (e) => {
     header: $("#e-header").value.trim().toLowerCase(),
     prefix: $("#e-prefix").value,
     guest_env: $("#e-guest").value.trim() || null,
-    real_value: $("#e-real").disabled ? null : ($("#e-real").value || null),
+    real_value: $("#e-real").value || null,
   };
   if (!body.name || !body.hosts.length || !body.header) {
     alert("Missing name/hosts/header — open Advanced and fill them in."); return;
-  }
-  if (body.hosts.some(h=>h.toLowerCase()==="api.cline.bot") && body.real_value) {
-    alert("Cline credentials are OAuth-only: leave the key empty and use 'Sign in with Cline…' after adding the entry."); return;
   }
   const r = editingEntry
     ? await fetch(`/api/escrow/${encodeURIComponent(editingEntry)}`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify(body)})
@@ -1273,7 +1261,7 @@ $("#escrow-form").onsubmit = async (e) => {
   if (!r.ok) { alert(await r.text()); return; }
   editingEntry = null;
   $("#escrow-form button[type=submit]").textContent = "Add";
-  e.target.reset(); $("#e-hint").textContent = ""; $("#e-real").disabled = false; $("#e-real").placeholder = "paste the REAL API key here (stays on the host)"; renderSettings();
+  e.target.reset(); $("#e-hint").textContent = ""; renderSettings();
 };
 
 function currentView() {
